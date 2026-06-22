@@ -1,0 +1,34 @@
+# AWS S3 access
+boto3>=1.34.0
+
+# Data handling
+pandas>=2.2.0
+pyarrow>=15.0.0          # fast parquet/CSV IO
+
+# SoH analysis / plotting
+matplotlib>=3.8.0
+
+# Environment / config
+python-dotenv>=1.0.0
+
+# Notebook support
+jupyter>=1.0.0
+ipykernel>=6.29.0
+
+# Progress bars for large downloads
+tqdm>=4.66.0
+
+# Modeling — SoH estimation + forecasting
+scikit-learn>=1.4.0
+lightgbm>=4.3.0
+
+# GPU forecasting stack (RTX 5090 / CUDA 12.8). torch from the cu128 index:
+#   pip install torch --index-url https://download.pytorch.org/whl/cu128
+torch>=2.7.0
+gpytorch>=1.13            # GPU Gaussian-process regression (uncertainty)
+chronos-forecasting>=1.4  # Amazon time-series foundation model (forecasting)
+
+# Optional: GPU dataframes for the data pipeline (heavy; from pypi.nvidia.com)
+#   pip install --extra-index-url=https://pypi.nvidia.com cudf-cu12 cuml-cu12
+# cudf-cu12
+# cuml-cu12
