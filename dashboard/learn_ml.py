@@ -85,10 +85,17 @@ def diagnostics(oem_key):
     drop = (g["soh"].first() - g["soh"].last())
     TR, VA, TE = _split(list(m["vin"].unique()), drop)
     t_tr = mod.build_transitions(m[m["vin"].isin(TR)])
-    if hasattr(mod, "train"):                       # Euler rate model
+    if hasattr(mod, "train"):                       # Euler rate model (XGBoost regression)
         reg = mod.train(t_tr); bias = float(getattr(reg, "_cal_bias", 0.0))
-    else:                                           # Mahindra quantile model -> take the median
-        reg = mod.train_quantiles(t_tr, alphas=(0.5,))[0.5]; bias = 0.0
+    else:
+        # Mahindra: use a plain regression model (the kind build_mahindra uses), NOT the quantile-0.5
+        # model — the loss target is zero-inflated, so the median quantile degenerates to predicting 0
+        # everywhere and never splits (all-zero feature importance). Squared-error regression splits fine.
+        import xgboost as xgb
+        reg = xgb.XGBRegressor(n_estimators=300, learning_rate=0.03, max_depth=4, subsample=0.8,
+                               colsample_bytree=0.8, n_jobs=8, verbosity=0).fit(
+            t_tr[FEATS].to_numpy(), t_tr["loss"].to_numpy(), sample_weight=t_tr["w"].to_numpy())
+        bias = 0.0
 
     def rmse(vs):
         t = mod.build_transitions(m[m["vin"].isin(vs)])
