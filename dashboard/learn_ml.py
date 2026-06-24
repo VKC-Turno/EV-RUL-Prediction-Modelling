@@ -162,6 +162,7 @@ def forecast_demo(oem_key, m):
 # Representative warranty term (years) per OEM — drawn as the warranty deadline on the prediction plots.
 # (Euler 5 yr; Mahindra Treo 3 yr = the cohort majority; Bajaj ~3 yr.)
 WARRANTY_YR = {"Euler": 5, "Mahindra": 3, "Bajaj": 3}
+EOL_PCT = {"Euler": 80, "Mahindra": 80, "Bajaj": 70}   # end-of-life SoH threshold per OEM (Bajaj = 70%)
 
 # vin -> registration date (= age 0 on the SoH curves), per OEM's registration file
 REG_FILES = {
@@ -224,9 +225,9 @@ def test_predictions(oem_key):
         else:
             sim = mod.simulate(hist, fmodel, H_MAX)
             p10, p50, p90 = sim["q10"].to_numpy(), sim["q50"].to_numpy(), sim["q90"].to_numpy()
-        # extend the x-axis until the P50 forecast reaches the 80% EoL line (even past the warranty line);
-        # if it never does, stop a little past the warranty deadline. Always show through the warranty line.
-        hit = np.where(np.asarray(p50) <= 80)[0]
+        # extend the x-axis until the P50 forecast reaches the end-of-life line (even past warranty); if it
+        # never does, stop a little past the warranty deadline. Always show through the warranty line.
+        hit = np.where(np.asarray(p50) <= EOL_PCT[oem_key])[0]
         end = (int(hit[0]) + 4) if len(hit) else int(round(warr_age - cut_age)) + 6
         end = int(np.clip(max(end, round(warr_age - cut_age) + 2), 3, H_MAX))
         p10, p50, p90 = p10[:end], p50[:end], p90[:end]
@@ -247,6 +248,7 @@ def takeaway(t): st.success("✅ **Takeaway** — " + t)
 st.sidebar.title("🎓 Learn ML")
 oem = st.sidebar.selectbox("Which fleet's model?", list(OEMS.keys()))
 CFG = OEMS[oem]
+EOL = EOL_PCT[oem]                                      # end-of-life SoH threshold for this fleet
 FEAT = load_ft(CFG["ft"])
 SMOOTH = st.sidebar.checkbox("Smooth SoH curves", value=True,
                              help="Round the staircase from the monotonic SoH envelope into a curve "
@@ -299,12 +301,12 @@ elif step == STEPS[1]:
                 "the percentage of the battery's *original* capacity that remains.")
     c = st.columns(3)
     c[0].metric("Brand-new", "100% SoH", "full range")
-    c[1].metric("End of first life", "80% SoH", "range noticeably down")
-    c[2].metric("End of life", "~60% SoH", "needs replacing")
-    concept("A battery at **80% SoH** delivers ~80% of its original range. **80%** is the industry line for "
-            "'end of first life'. Our job: predict **when** each vehicle crosses it — its **Remaining "
-            "Useful Life (RUL)**.")
-    st.markdown("**Why it matters:** warranty (will it drop below 80% in time?), resale value, and "
+    c[1].metric(f"End of life ({oem})", f"{EOL}% SoH", "the line we predict")
+    c[2].metric("Truly spent", "~50% SoH", "scrap / recycle")
+    concept(f"A battery at **{EOL}% SoH** delivers ~{EOL}% of its original range. For **{oem}** we treat "
+            f"**{EOL}%** as end-of-life — the line we predict each vehicle to cross. Months until then = its "
+            "**Remaining Useful Life (RUL)**.")
+    st.markdown(f"**Why it matters:** warranty (will it drop below {EOL}% in time?), resale value, and "
                 "planning replacements / second-life use.")
     takeaway("We predict a number — **future SoH** — for each vehicle. Predicting a number is a "
              "**regression** problem in ML.")
@@ -340,15 +342,15 @@ elif step == STEPS[3]:
         ax = [0] + g.age_months.tolist(); sy = [100.0] + smooth(g.soh).tolist()  # anchor 100% at registration
         fig.add_scatter(x=ax, y=sy, mode="lines",
                         line=dict(color=RED if deg else GREY, width=1), opacity=0.5, showlegend=False)
-    fig.add_hline(y=80, line=dict(color=AMBER, dash="dash"), annotation_text="80% — end of first life")
+    fig.add_hline(y=EOL, line=dict(color=AMBER, dash="dash"), annotation_text=f"{EOL}% — end of life")
     fig.update_xaxes(title="age (months since registration)", **AX)
-    fig.update_yaxes(title="SoH (%)", range=[55, 101], **AX)
+    fig.update_yaxes(title="SoH (%)", range=[min(EOL - 5, 55), 101], **AX)
     fig.update_layout(**lay(height=420)); st.plotly_chart(fig, use_container_width=True)
     o = ov(); c = st.columns(3)
     c[0].metric("Degraders (lost ≥2%)", f"{int((o.s0-o.s1>=2).sum())} of {len(o)}")
-    c[1].metric("Reached 80%", f"{int((o.smin<=80).sum())}")
+    c[1].metric(f"Reached {EOL}%", f"{int((o.smin<=EOL).sum())}")
     c[2].metric("Median history", f"{int(o.months.median())} months")
-    takeaway("Most lines are still **above 80%** — most batteries haven't worn out yet. The few that have "
+    takeaway(f"Most lines are still **above {EOL}%** — most batteries haven't worn out yet. The few that have "
              "are the most valuable examples, because they show the model what real aging looks like.")
 
 # ═════════════════════════════════ STEP 4 ═════════════════════════════════
@@ -406,8 +408,8 @@ elif step == STEPS[5]:
             ax = [0] + gg.age_months.tolist(); sy = [100.0] + smooth(gg.soh).tolist()
             fig.add_scatter(x=ax, y=sy, mode="lines", line=dict(color=colmap[key], width=1),
                             opacity=0.45, row=1, col=ci, showlegend=False)
-    fig.add_hline(y=80, line=dict(color=AMBER, width=1, dash="dot"), row="all", col="all")
-    fig.update_yaxes(range=[55, 101], **AX); fig.update_xaxes(title="age (months)", **AX)
+    fig.add_hline(y=EOL, line=dict(color=AMBER, width=1, dash="dot"), row="all", col="all")
+    fig.update_yaxes(range=[min(EOL - 5, 55), 101], **AX); fig.update_xaxes(title="age (months)", **AX)
     fig.update_annotations(font_size=12)
     fig.update_layout(**lay(height=320, showlegend=False, margin=dict(l=30, r=12, t=30, b=36)))
     st.plotly_chart(fig, use_container_width=True)
@@ -525,7 +527,7 @@ elif step == STEPS[10]:
         fig.add_scatter(x=xc, y=c10, name="uncertainty range", fill="tonexty",
                         fillcolor="rgba(46,193,107,.18)", line=dict(color=GREY, width=0))
         fig.add_scatter(x=xc, y=c50, name="best estimate", line=dict(color=GREEN, width=3, dash="dash"))
-        fig.add_hline(y=80, line=dict(color=AMBER, dash="dash"), annotation_text="80% EoFL")
+        fig.add_hline(y=EOL, line=dict(color=AMBER, dash="dash"), annotation_text=f"{EOL}% EoL")
         _wdef, _wmap = warranty_map(oem); _wyr = _wmap.get(g.vin.iloc[0], _wdef)
         fig.add_vline(x=_wyr * 12, line=dict(color="#9aa7b6", dash="dashdot"),
                       annotation_text=f"{_wyr}-yr warranty", annotation_position="top")
@@ -541,14 +543,14 @@ elif step == STEPS[10]:
     concept("The dashed line is the **best single estimate**; the shaded band says 'we're ~80% sure the "
             "truth lands in here'. Honest uncertainty is essential — a confident-but-wrong forecast is "
             "dangerous for warranty decisions.")
-    takeaway("Where the forecast crosses 80% gives each vehicle its **Remaining Useful Life**. This is "
+    takeaway(f"Where the forecast crosses {EOL}% gives each vehicle its **Remaining Useful Life**. This is "
              "exactly what powers the main SoH dashboard.")
 
     st.markdown("---")
     st.markdown("### 📋 Prediction vs actual — every held-out **test** vehicle")
     st.caption("For each test vehicle (never seen in training): measured SoH (teal, anchored to **100% at "
                "registration**) vs the model's forecast from 60% of its history (green dashed + band), out "
-               "to its warranty deadline. Title = **registration date**. Amber dotted = 80% EoFL · grey "
+               f"to its warranty deadline. Title = **registration date**. Amber dotted = {EOL}% EoL · grey "
                "dash-dot = warranty (registration + term).")
     try:
         preds = test_predictions(oem)
@@ -573,13 +575,13 @@ elif step == STEPS[10]:
                 fig.add_scatter(x=p["fage"], y=p["p50"], mode="lines",
                                 line=dict(color=GREEN, width=1.6, dash="dash"), row=r, col=c, showlegend=False)
                 fig.add_vline(x=p["warr_age"], line=dict(color="#9aa7b6", width=1, dash="dashdot"), row=r, col=c)
-            fig.add_hline(y=80, line=dict(color=AMBER, width=1, dash="dot"), row="all", col="all")
-            fig.update_yaxes(range=[45, 101], **AX); fig.update_xaxes(**AX)
+            fig.add_hline(y=EOL, line=dict(color=AMBER, width=1, dash="dot"), row="all", col="all")
+            fig.update_yaxes(range=[min(EOL - 10, 45), 101], **AX); fig.update_xaxes(**AX)
             fig.update_annotations(font_size=10)
             fig.update_layout(**lay(height=max(nrows * 175, 320), showlegend=False,
                                     margin=dict(l=30, r=12, t=26, b=24)))
             st.plotly_chart(fig, use_container_width=True)
-            st.caption(f"{len(preds)} test vehicles. Where green (forecast) stays above the amber 80% line "
+            st.caption(f"{len(preds)} test vehicles. Where green (forecast) stays above the amber {EOL}% line "
                        f"at the warranty deadline = predicted to survive warranty; where it dips below = at-risk.")
     except Exception as ex:
         st.warning(f"Test-vehicle grid unavailable ({ex}).")
@@ -589,10 +591,10 @@ elif step == STEPS[11]:
     st.title("11 · Limits, honesty & retraining")
     st.markdown("Good ML is **honest about what it doesn't know.** Our model's real limitations:")
     o = ov(); c = st.columns(3)
-    c[0].metric("Batteries that reached 80%", f"{int((o.smin<=80).sum())} of {len(o)}")
-    c[1].metric("Full 100→80 journeys seen", f"{int(((o.s0>=99)&(o.smin<=80)).sum())}")
+    c[0].metric(f"Batteries that reached {EOL}%", f"{int((o.smin<=EOL).sum())} of {len(o)}")
+    c[1].metric(f"Full 100→{EOL} journeys seen", f"{int(((o.s0>=99)&(o.smin<=EOL)).sum())}")
     c[2].metric("Median history", f"{int(o.months.median())} months")
-    st.markdown("- **Few complete journeys:** very few batteries have aged all the way to 80% yet, so "
+    st.markdown(f"- **Few complete journeys:** very few batteries have aged all the way to {EOL}% yet, so "
                 "far-future predictions are *extrapolation* — educated guesses beyond what we've seen.\n"
                 "- **Young fleet:** most vehicles are still near-new, limiting 'end-game' examples.\n"
                 "- This is a **data** limit, not a model flaw — it improves only as batteries age.")
