@@ -29,6 +29,10 @@ QUAL = {"Euler": dict(min_months=6, min_span=9.0),
         "Mahindra": dict(min_months=6, min_span=9.0),
         "Bajaj": dict(min_months=6, min_span=0.0)}   # Bajaj feed is ~9 mo for all -> no span bar
 DEG = 2.0
+# A vehicle that reached end-of-life, OR dropped >= EXEMPT_DROP pp, has PROVEN a real degradation trend —
+# it is never "thin" no matter how short the window (the span rule only exists to confirm a trend exists).
+EOL = {"Euler": 80, "Mahindra": 80, "Bajaj": 70}
+EXEMPT_DROP = 5.0
 
 
 def reg_dates(oem):
@@ -58,11 +62,18 @@ for oem, ft in FT.items():
     for vin, g in m.sort_values("month").groupby("vin"):
         months = len(g); fa = float(g.age_months.min()); la = float(g.age_months.max()); span = la - fa
         s0, s1 = float(g.soh.iloc[0]), float(g.soh.iloc[-1]); drop = s0 - s1
-        reasons = []
+        thin = []
         if months < q["min_months"]:
-            reasons.append(f"<{q['min_months']}_valid_months")
+            thin.append(f"<{q['min_months']}_valid_months")
         if span < q["min_span"]:
-            reasons.append(f"<{q['min_span']:.0f}mo_span")
+            thin.append(f"<{q['min_span']:.0f}mo_span")
+        proven = drop >= EXEMPT_DROP or s1 <= EOL.get(oem, 80)   # big drop / reached EoL => keep regardless
+        if thin and proven:
+            quality, reasons = "trainable", "proven-degrader(overrides:" + ";".join(thin) + ")"
+        elif thin:
+            quality, reasons = "thin", ";".join(thin)
+        else:
+            quality, reasons = "trainable", ""
         rd = reg.get(vin)
         rows.append(dict(
             oem=oem, vin=vin, model=VMODEL.get(vin, "").strip(),
@@ -71,7 +82,7 @@ for oem, ft in FT.items():
             current_age_mo=round(la, 1), obs_per_month=(int(g[dens].median()) if dens else ""),
             soh_first=round(s0, 1), soh_last=round(s1, 1), soh_drop=round(drop, 1),
             vehicle_class=("degrader" if drop >= DEG else "flat"),
-            quality=("thin" if reasons else "trainable"), reasons=";".join(reasons),
+            quality=quality, reasons=reasons,
             dense_file=f"data/{oem.lower()}/dense/{vin}.parquet"))
 
 df = pd.DataFrame(rows).sort_values(["oem", "quality", "vehicle_class", "vin"])
