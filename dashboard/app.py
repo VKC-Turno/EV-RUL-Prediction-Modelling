@@ -154,6 +154,18 @@ with tab_main:
         m[2].metric("Warranty", f"{v['wyr']} yr")
         m[3].markdown(f"Status<br><span style='color:{STATUS_COL[status]};font-size:1.6rem;font-weight:700'>"
                       f"{status}</span>", unsafe_allow_html=True)
+        if v.get("rated_km"):
+            st.caption(f"🛣️ Est. range now ≈ **{v['range_now']} km/charge** — rated ~{v['rated_km']} km "
+                       f"× {v['now']}% SoH (energy-based, degradation-corrected; see euler_variant_map.csv)")
+        rk_head = v.get("rem_km_head")
+        if rk_head is not None:
+            st.caption(f"🔋 Remaining battery life ≈ **{rk_head:,} km** to {v['rem_km_label']} SoH "
+                       f"· at ~{v.get('km_month') or 0:,} km/month (degradation forecast × usage rate)")
+        elif v.get("km_month") is None:
+            st.caption("🔋 Remaining-km to EoL: n/a — odometer too sparse for this vehicle")
+        else:
+            st.caption(f"🔋 Projected to stay above its EoL threshold beyond the forecast horizon "
+                       f"(~{v.get('km_month') or 0:,} km/month).")
         if status == "AT-RISK":
             fac = ""
             if v.get("risk_factors"):

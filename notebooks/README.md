@@ -61,6 +61,8 @@ the operational extract runbook, see [`../docs/PROCEDURE.md`](../docs/PROCEDURE.
 | `mahindra_forecast_report.ipynb` | Mahindra | Multi-page PDF: actual vs model vs √t to warranty, one page per vehicle. |
 | `euler_resold_cohorts.ipynb` | Euler | Resale-date cohorts (≥3 well-observed vehicles), forecast to the in-house warranty window. |
 | `predictions_june2023.ipynb` | Both | SoH predictions for the June-2023 registration cohort (Euler + Mahindra). |
+| `bajaj_warranty_km_cycle_rul.ipynb` | Bajaj | km-warranty runway + cycle-based RUL. For Bajaj the **km limit binds** (high-mileage) — opposite of Mahindra. |
+| `remaining_km_to_eol.ipynb` | All | **RUL in km** — remaining km = km/month × months-to-EoL (80/70/60% SoH). Mahindra n/a (sparse odometer). |
 
 ### `05_insights/` — the substantive findings (Playbook §7)
 | Notebook | OEM | What it shows |
@@ -68,6 +70,7 @@ the operational extract runbook, see [`../docs/PROCEDURE.md`](../docs/PROCEDURE.
 | `degradation_vs_km.ipynb` | Both | **Same km ≠ same degradation** (~9–15 pp spread); why Mahindra's odometer is unusable for this. |
 | `euler_soh_vs_usage_proof.ipynb` | Euler | Lines up SoH drops against usage — steep drops = heavy use, flat = idle. |
 | `euler_degraders.ipynb` | Euler | Well-observed degraders grouped by 100%-SoH start month. |
+| `cycle_features_rejected.ipynb` | Bajaj+ | **Why charge cycles aren't a health signal** — and the age-control re-check that caught a +0.88 artifact. |
 
 ---
 

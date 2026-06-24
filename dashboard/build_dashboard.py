@@ -16,7 +16,7 @@ import numpy as np, pandas as pd
 
 os.chdir(Path(__file__).resolve().parent.parent)            # repo root
 sys.path.insert(0, "src")
-import model, config
+import model, config, rul_km
 import xgboost as xgb
 
 FEATS, STATE, STRESS = model.FEATS, model.STATE, model.STRESS
@@ -110,10 +110,15 @@ def build_mahindra():
         warr_ms = ms(warr)
         proj_warr = round(soh_at(obs_l, fc_l, warr_ms), 1)
         rr, rfac = risk_reason(vin)
+        now_soh = round(float(g["soh"].iloc[-1]), 1)
+        kmpm = rul_km.km_per_month(g["age_months"], g["odo_max"])           # None if odo too sparse
+        rem = rul_km.remaining_km(obs_l, fc_l, kmpm)
+        rem_head, rem_label = rul_km.headline(rem, now_soh)
         out[vin] = dict(
             label=f"{vin[-6:]} · {mdln}", method="coulomb", model=mdln, wyr=wyr,
             obs=obs_l, fc=fc_l, warranty=warr_ms, reg_anchor=ms(reg_eff), reg_known=bool(has_reg),
-            now=round(float(g["soh"].iloc[-1]), 1), proj_warr=proj_warr,
+            now=now_soh, proj_warr=proj_warr,
+            km_month=(round(kmpm) if kmpm else None), rem_km=rem, rem_km_head=rem_head, rem_km_label=rem_label,
             status=status_of(proj_warr), at_risk=bool(proj_warr < EOFL - RISK_MARGIN),
             risk_reason=rr, risk_factors=rfac)
     # well-observed vehicles first, lowest CURRENT SoH first -> default is a genuine degrader,
@@ -167,6 +172,13 @@ def build_euler():
     rdf = pd.read_csv("data/euler/Euler_Regd_Details.csv")
     rdf["reg"] = pd.to_datetime(rdf["regd_date"], format="%d/%m/%y", errors="coerce")
     REG = dict(zip(rdf["vin"], rdf["reg"]))
+    # per-VIN rated full-charge range (km), energy-based & degradation-corrected (near-new capacity);
+    # see data/manifests/euler_variant_map.csv. Used for "est. range now ≈ rated_km × SoH".
+    RATED = {}
+    _vp = Path("data/manifests/euler_variant_map.csv")
+    if _vp.exists():
+        _vm = pd.read_csv(_vp)
+        RATED = dict(zip(_vm["vin"], pd.to_numeric(_vm["rated_km"], errors="coerce")))
     REPORTED_NOTE = "Reported-SoH only — operating-stress attribution needs current/voltage (dense pipeline)"
     BMS_NOTE = "BMS remaining-capacity SoH (validated vs coulomb/reported)."
     MODEL_NOTE = "BMS-capacity SoH + condition-aware degradation model (2023+ dense cohort; preliminary, n=6)."
@@ -189,6 +201,7 @@ def build_euler():
             # cohort vehicle: validated BMS-capacity SoH + condition-aware model forecast
             import euler_model as em
             eg = EFT[EFT["vin"] == vin].sort_values("month")
+            kmpm = rul_km.km_per_month(eg["age_months"], eg["odo_max"])
             idx = pd.DatetimeIndex(eg["month"]); sm_values = eg["soh"].to_numpy()
             last_age = float(eg["age_months"].iloc[-1]); H = max(int(round(60 - last_age)), 1)
             ffc = np.array(em.free_run(eg, EMDL, H))
@@ -196,6 +209,7 @@ def build_euler():
             method, mlabel, note = "bms", "BMS capacity + model", MODEL_NOTE
         else:
             p = feed_vins[vin]
+            kmpm = None                                          # 2022 reported-only batch: no feature/odo row
             bms = bms_soh_dense(vin)                             # validated method when dense data exists
             if bms is not None and len(bms) >= 6:
                 sm = bms; method, mlabel, note = "bms", "BMS capacity", BMS_NOTE
@@ -235,10 +249,17 @@ def build_euler():
         fc_l = [[ms(t), round(float(s), 2)] for t, s in zip(fcm, ffc)]
         warr_ms = ms(warr)
         proj_warr = round(soh_at(obs_l, fc_l, warr_ms), 1)
+        now_soh = round(float(sm_values[-1]), 1)
+        _r = RATED.get(vin)
+        rated_km = int(_r) if _r is not None and pd.notna(_r) else None
+        range_now = int(round(rated_km * now_soh / 100.0)) if rated_km else None   # est. real range now
+        rem = rul_km.remaining_km(obs_l, fc_l, kmpm)
+        rem_head, rem_label = rul_km.headline(rem, now_soh)
         out[vin] = dict(
             label=f"{vin[-6:]} · Euler ({mlabel})", method=method, model="Euler", wyr=wyr,
             obs=obs_l, fc=fc_l, warranty=warr_ms, reg_anchor=ms(reg_eff), reg_known=bool(has_reg),
-            now=round(float(sm_values[-1]), 1), proj_warr=proj_warr,
+            now=now_soh, proj_warr=proj_warr, rated_km=rated_km, range_now=range_now,
+            km_month=(round(kmpm) if kmpm else None), rem_km=rem, rem_km_head=rem_head, rem_km_label=rem_label,
             status=status_of(proj_warr), at_risk=bool(proj_warr < EOFL - RISK_MARGIN),
             risk_reason=note, risk_factors=[])
     return {v: out[v] for v in sorted(out, key=lambda v: (0 if len(out[v]["obs"]) >= 8 else 1, out[v]["now"]))}

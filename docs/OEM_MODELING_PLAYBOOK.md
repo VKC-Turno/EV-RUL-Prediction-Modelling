@@ -196,6 +196,10 @@ indicative, not calibrated** — confounded by season/driving and tends to under
 vehicle also appears in intellicar, **cross-validate against coulomb SoH** (`notebooks/01_soh_target/mahindra_soh_method_compare.ipynb`;
 agreed within ~3 pp on the shared vehicle).
 
+> **Rejected: cycle-count health signals.** We tested two ideas — *km/cycle* (and its efficiency-removed
+> form *Wh/cycle*) as a range-health metric, and *charge cycles as model features*. **Both were rejected**
+> after an age-controlled re-check. Do not re-attempt without reading §7 insight 8.
+
 ---
 
 ## 4. Data selection (cohort, training, validation, testing)
@@ -376,6 +380,21 @@ that looks plausible and one that is honest.
 7. **Coulomb counting is treacherous on field data** (gap-sessions span whole cycles). It works for
    intellicar *with* the ΔSoC-weighted-pooled correction, and is **broken** as-is for Euler 2023+. When in
    doubt, prefer a BMS-capacity or reported target and use coulomb only as a corroborator.
+
+8. **Charge cycles add nothing here — and a short-window correlation will lie to you about it.** We tested
+   cycles two ways and rejected both:
+   - **As model features:** adding cycle features *worsens* Bajaj LOVO RMSE (age-only **2.89 pp** →
+     age+cycles **3.12 pp**, ±0.02 over 8 seeds), and the equiv-cycle proxy is null for Euler/Mahindra
+     (cycle-rate ↔ monthly loss ρ≈0). Calendar age already captures the aging; cycles are collinear and
+     just add overfit. Keep models age-based.
+   - **As a range-health signal:** *km/cycle* — and its efficiency-removed form *Wh/cycle* — looked like a
+     strong health signal (within-vehicle ρ vs reported SoH up to **+0.88** on Bajaj). **It was an
+     artifact.** Both SoH and Wh/cycle merely decline over the same ~10-month window, so the naive
+     within-vehicle correlation is inflated by the shared age trend. **Age-controlled** (correlate the
+     age-residuals) or **month-to-month-Δ**, it collapses to ρ≈**−0.06 / +0.10**, and the efficiency
+     decomposition actually did *worse* than raw km/cycle (+0.26). ⚠ **Methodological rule: never trust a
+     "tracks SoH" claim from a within-vehicle correlation over a short, monotone window — age-control it
+     first.** Use cycles only for warranty-km projection / cycle-RUL, not for health.
 
 ---
 
