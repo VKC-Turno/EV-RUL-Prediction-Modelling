@@ -12,3 +12,6 @@ data/
 
 # Jupyter
 .ipynb_checkpoints/
+
+# Model binaries (registry.json/diagnostics.json stay tracked)
+*.pkl

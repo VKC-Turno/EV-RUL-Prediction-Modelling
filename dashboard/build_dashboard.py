@@ -187,9 +187,11 @@ def build_euler():
     EFT = EMDL = None
     if Path("data/euler/features/feature_table.parquet").exists():
         try:
-            import euler_model as em
+            import euler_model as em, euler_train
             EFT = pd.read_parquet("data/euler/features/feature_table.parquet").sort_values(["vin", "month"])
-            EMDL = em.train(em.build_transitions(EFT))
+            _b = euler_train.load_latest()                      # persisted model from src/euler_train.py
+            EMDL = _b["rate_model"] if _b and _b.get("rate_model") is not None \
+                else em.train(em.build_transitions(EFT))        # fall back to on-demand training
         except Exception:
             EFT = EMDL = None
 
