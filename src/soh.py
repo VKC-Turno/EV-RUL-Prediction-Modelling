@@ -76,7 +76,48 @@ def vehicle_anchor(cap_month, reg):
     return out
 
 
-def capacity_to_soh(cap_month, reg=None, max_drop=MAX_DROP_PER_MONTH):
+def _greedy_envelope(raw, gap, max_drop=MAX_DROP_PER_MONTH):
+    """Original SoH envelope: greedy cumulative-min (monotone non-increasing) with a per-month
+    drop-rate cap. Bias-free downward, but a single noisy low month sets a new running minimum
+    the curve then sits flat on — the step-then-plateau staircase. Kept for A/B and rollback;
+    select via `capacity_to_soh(..., method="greedy")`."""
+    soh = np.empty(len(raw)); soh[0] = min(raw[0], 100.0)
+    for i in range(1, len(raw)):
+        target = min(raw[i], soh[i - 1])                       # monotonic non-increasing
+        floor = soh[i - 1] - max_drop * max(gap[i], 1e-9)      # cap the drop rate
+        soh[i] = max(target, floor)
+    return soh
+
+
+def _robust_isotonic(age, raw, max_drop=MAX_DROP_PER_MONTH):
+    """SoH envelope via **robust isotonic regression** (PAVA) instead of greedy cumulative-min.
+
+    Greedy cummin freezes SoH at the running minimum, so one noisy low month carves a permanent
+    flat plateau (the step-then-flat staircase the field curves show). Isotonic (pool-adjacent-
+    violators) instead fits the least-squares best monotone-non-increasing curve over the whole
+    series, averaging local violators into a smooth continuous decline. 'Robust' = first clip each
+    point to a Hampel band (rolling median +/- 3*1.4826*MAD) so a wild capacity reading can't drag
+    the fit. A light per-elapsed-month drop-rate cap (max_drop) is applied last as an artifact
+    guard. Matches Euler's isotonic SoH treatment."""
+    raw = np.asarray(raw, float)
+    if len(raw) == 1:
+        return np.clip(raw, None, 100.0)
+    from sklearn.isotonic import IsotonicRegression
+    r = pd.Series(raw)
+    med = r.rolling(5, min_periods=1, center=True).median()
+    mad = (r - med).abs().rolling(5, min_periods=1, center=True).median().clip(lower=1e-6)
+    band = 3.0 * 1.4826 * mad
+    rc = r.clip(lower=med - band, upper=med + band).to_numpy()
+    fit = IsotonicRegression(increasing=False, y_max=100.0,
+                             out_of_bounds="clip").fit_transform(age, rc)
+    out = np.asarray(fit, float)
+    for i in range(1, len(out)):
+        gp = max(age[i] - age[i - 1], 1e-9)
+        out[i] = max(min(out[i], out[i - 1]), out[i - 1] - max_drop * gp)
+    return np.clip(out, None, 100.0)
+
+
+def capacity_to_soh(cap_month, reg=None, max_drop=MAX_DROP_PER_MONTH, method="isotonic"):
     """Per-VIN SoH curve with **SoH = 100% anchored at the registration date** (age 0).
 
     `reg`: dict vin -> registration Timestamp. Age is measured from registration (true calendar
@@ -108,11 +149,8 @@ def capacity_to_soh(cap_month, reg=None, max_drop=MAX_DROP_PER_MONTH):
         cap0 = early_base * (1.0 + rate * max(amin, 0.0))
         raw = np.clip(100.0 * cap / cap0, None, 100.0)
         gap = (g["month"].diff().dt.days / 30.4).fillna(1.0).to_numpy()
-        soh = np.empty(len(raw)); soh[0] = min(raw[0], 100.0)
-        for i in range(1, len(raw)):
-            target = min(raw[i], soh[i - 1])                       # monotonic non-increasing
-            floor = soh[i - 1] - max_drop * max(gap[i], 1e-9)      # cap the drop rate
-            soh[i] = max(target, floor)
-        g["soh"] = soh
+        g["soh_raw"] = raw                                          # pre-envelope (physical) SoH
+        g["soh"] = (_robust_isotonic(age, raw, max_drop) if method == "isotonic"
+                    else _greedy_envelope(raw, gap, max_drop))
         parts.append(g)
     return pd.concat(parts, ignore_index=True)
