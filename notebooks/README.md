@@ -44,6 +44,7 @@ the operational extract runbook, see [`../docs/PROCEDURE.md`](../docs/PROCEDURE.
 | `mahindra_degradation_model.ipynb` | Mahindra | Condition-aware monthly-fade model (the production rate model, `src/model.py`). |
 | `mahindra_feature_analysis.ipynb` | Mahindra | Feature pruning + SHAP — which drivers the model actually uses. |
 | `euler_forecast_model.ipynb` | Euler | Condition-aware SoH forecast with **P10–P90** bands (`src/euler_model.py`). |
+| `euler_training_data_quality.ipynb` | Euler | **Examine the training data** — cohort, SoH trajectories, per-vehicle quality scorecard, the dirty `batteryRemainingCapacity` channel, `examine(vin)` drill-down. |
 
 ### `03_validation/` — does the model generalize? (Playbook §4.3)
 | Notebook | OEM | What it does |
