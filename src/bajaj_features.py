@@ -97,6 +97,7 @@ def main():
     if not REG:
         print("  WARNING: no Bajaj_Regd_Details.csv found — age falls back to first-telemetry month")
     parts = []
+    first_month, reg_known = {}, {}     # for imputing age of VINs that have no registration record
     for fp in sorted(glob.glob("data/bajaj/dense/*.parquet")):
         vin = Path(fp).stem
         df = load_clean(fp)
@@ -106,9 +107,13 @@ def main():
             continue
         feat = monthly_features(df)
         m = soh.merge(feat, on="month", how="inner").sort_values("month")
-        # calendar age from registration where available (reg must predate first telemetry), else first month
+        # calendar age from registration where available (reg must predate first telemetry). VINs with NO
+        # registration record are NOT anchored at first telemetry (that falsely shows them brand-new at
+        # age 0); their age is imputed below from the cohort's median reg->telemetry gap, with reg_known=False.
         r = REG.get(vin)
-        base = r if (r is not None and pd.notna(r) and r <= m["month"].iloc[0]) else m["month"].iloc[0]
+        used_reg = r is not None and pd.notna(r) and r <= m["month"].iloc[0]
+        first_month[vin] = m["month"].iloc[0]; reg_known[vin] = used_reg
+        base = r if used_reg else m["month"].iloc[0]
         m["age_months"] = ((m["month"] - base).dt.days / 30.4).round(1)
         # monthly km from odometer (charge-cycle delta is a parallel usage signal)
         m["km_month"] = m["odo_max"].diff().clip(lower=0).fillna(0.0)
@@ -124,6 +129,17 @@ def main():
         print("NO vehicles yielded usable reported SoH — aborting (nothing written).")
         return
     out = pd.concat(parts, ignore_index=True)
+    # impute age for VINs with no registration date: shift them by the cohort's MEDIAN reg->first-telemetry
+    # gap so they aren't stuck at age 0 (the feed starts ~2025-09 but vehicles registered ~17 mo earlier).
+    out["reg_known"] = out["vin"].map(reg_known)
+    gaps = [(first_month[v] - REG[v]).days / 30.4 for v in reg_known if reg_known[v]]
+    miss = [v for v in reg_known if not reg_known[v]]
+    if gaps and miss:
+        mg = round(float(np.median(gaps)), 1)
+        out.loc[out["vin"].isin(miss), "age_months"] = (
+            out.loc[out["vin"].isin(miss), "age_months"] + mg).round(1)
+        print(f"  imputed +{mg} mo age for {len(miss)} VIN(s) with no registration record "
+              f"(cohort median reg->telemetry gap)")
     Path("data/bajaj/features").mkdir(parents=True, exist_ok=True)
     out.to_parquet("data/bajaj/features/feature_table.parquet", index=False)
     print(f"\nwrote data/bajaj/features/feature_table.parquet: {len(out)} rows, "
