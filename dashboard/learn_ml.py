@@ -330,10 +330,12 @@ elif step == STEPS[3]:
     fig = go.Figure()
     for vin, g in FEAT.groupby("vin"):
         deg = (g.soh.iloc[0] - g.soh.iloc[-1]) >= 2
-        fig.add_scatter(x=g.age_months, y=smooth(g.soh), mode="lines",
+        ax = [0] + g.age_months.tolist(); sy = [100.0] + smooth(g.soh).tolist()  # anchor 100% at registration
+        fig.add_scatter(x=ax, y=sy, mode="lines",
                         line=dict(color=RED if deg else GREY, width=1), opacity=0.5, showlegend=False)
     fig.add_hline(y=80, line=dict(color=AMBER, dash="dash"), annotation_text="80% — end of first life")
-    fig.update_xaxes(title="age (months)", **AX); fig.update_yaxes(title="SoH (%)", range=[55, 101], **AX)
+    fig.update_xaxes(title="age (months since registration)", **AX)
+    fig.update_yaxes(title="SoH (%)", range=[55, 101], **AX)
     fig.update_layout(**lay(height=420)); st.plotly_chart(fig, use_container_width=True)
     o = ov(); c = st.columns(3)
     c[0].metric("Degraders (lost ≥2%)", f"{int((o.s0-o.s1>=2).sum())} of {len(o)}")
@@ -359,8 +361,11 @@ elif step == STEPS[4]:
             "pattern *easier* for the model to see. `inv_sqrt_age`, for instance, encodes the known fact "
             "that batteries fade quickly at first, then level off.")
     vin = ov().sort_values("s1").index[0]; g = FEAT[FEAT.vin == vin]
+    sm4 = smooth(g.soh)
     fig = go.Figure()
-    fig.add_scatter(x=g.age_months, y=smooth(g.soh), name="SoH (target)", line=dict(color=TEAL, width=3))
+    fig.add_scatter(x=[0, g.age_months.iloc[0]], y=[100, sm4.iloc[0]], mode="lines",
+                    line=dict(color=TEAL, width=1.5, dash="dot"), showlegend=False)  # 100% at registration
+    fig.add_scatter(x=g.age_months, y=sm4, name="SoH (target)", line=dict(color=TEAL, width=3))
     if "temp_max" in g:
         fig.add_scatter(x=g.age_months, y=g.temp_max, name="temperature (a feature)", yaxis="y2",
                         line=dict(color=RED, width=2, dash="dot"))
@@ -488,6 +493,8 @@ elif step == STEPS[10]:
         c10 = np.concatenate([[sm.iloc[-1]], p10]); c50 = np.concatenate([[sm.iloc[-1]], p50])
         c90 = np.concatenate([[sm.iloc[-1]], p90])
         fig = go.Figure()
+        fig.add_scatter(x=[0, g.age_months.iloc[0]], y=[100, sm.iloc[0]], mode="lines",
+                        name="100% at registration", line=dict(color=TEAL, width=1.4, dash="dot"))
         fig.add_scatter(x=g.age_months, y=sm, name="measured so far", mode="markers+lines",
                         line=dict(color=TEAL, width=2), marker=dict(size=4))
         fig.add_scatter(x=xc, y=c90, name="optimistic", line=dict(color=GREY, width=0), showlegend=False)
@@ -515,10 +522,10 @@ elif step == STEPS[10]:
 
     st.markdown("---")
     st.markdown("### 📋 Prediction vs actual — every held-out **test** vehicle")
-    st.caption("For each test vehicle (never seen in training): measured SoH (teal) vs the model's forecast "
-               "from 60% of its history (green dashed + uncertainty band), out to its warranty deadline. "
-               "Subplot title shows the **registration date**. Dotted = 80% EoFL · dash-dot = warranty "
-               "(registration + term).")
+    st.caption("For each test vehicle (never seen in training): measured SoH (teal, anchored to **100% at "
+               "registration**) vs the model's forecast from 60% of its history (green dashed + band), out "
+               "to its warranty deadline. Title = **registration date**. Amber dotted = 80% EoFL · grey "
+               "dash-dot = warranty (registration + term).")
     try:
         preds = test_predictions(oem)
         if not preds:
@@ -530,7 +537,10 @@ elif step == STEPS[10]:
                                 vertical_spacing=0.06, horizontal_spacing=0.04)
             for i, p in enumerate(preds):
                 r, c = i // ncols + 1, i % ncols + 1
-                fig.add_scatter(x=p["age"], y=smooth(pd.Series(p["soh"])).tolist(), mode="lines",
+                sm = smooth(pd.Series(p["soh"]))
+                fig.add_scatter(x=[0, p["age"][0]], y=[100, sm.iloc[0]], mode="lines",       # 100% at registration
+                                line=dict(color=TEAL, width=1, dash="dot"), row=r, col=c, showlegend=False)
+                fig.add_scatter(x=p["age"], y=sm.tolist(), mode="lines",
                                 line=dict(color=TEAL, width=1.4), row=r, col=c, showlegend=False)
                 fig.add_scatter(x=p["fage"], y=p["p90"], mode="lines", line=dict(width=0, color=GREY),
                                 row=r, col=c, showlegend=False)
