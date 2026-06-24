@@ -217,13 +217,19 @@ def test_predictions(oem_key):
         cut = n - max(1, min(int(round(n * 0.4)), n - 4))
         hist = gg.iloc[:cut]; cut_age = float(gg["age_months"].iloc[cut - 1])
         warr_age = wmap.get(vin, wdef) * 12                     # registration + warranty term, on the age axis
-        H = int(np.clip(round(warr_age - cut_age), 3, 40))      # forecast out to the warranty deadline (capped)
+        H_MAX = 120                                             # cap (months) to avoid absurd extrapolation
         if euler:
-            fc = mod.forecast(hist, fmodel, H); p10, p50, p90 = fc[0.1], fc[0.5], fc[0.9]
+            fc = mod.forecast(hist, fmodel, H_MAX); p10, p50, p90 = fc[0.1], fc[0.5], fc[0.9]
         else:
-            sim = mod.simulate(hist, fmodel, H)
+            sim = mod.simulate(hist, fmodel, H_MAX)
             p10, p50, p90 = sim["q10"].to_numpy(), sim["q50"].to_numpy(), sim["q90"].to_numpy()
-        fage = cut_age + np.arange(1, H + 1)
+        # extend the x-axis until the P50 forecast reaches the 80% EoL line (even past the warranty line);
+        # if it never does, stop a little past the warranty deadline. Always show through the warranty line.
+        hit = np.where(np.asarray(p50) <= 80)[0]
+        end = (int(hit[0]) + 4) if len(hit) else int(round(warr_age - cut_age)) + 6
+        end = int(np.clip(max(end, round(warr_age - cut_age) + 2), 3, H_MAX))
+        p10, p50, p90 = p10[:end], p50[:end], p90[:end]
+        fage = cut_age + np.arange(1, end + 1)
         rd = reg.get(vin)
         out.append(dict(vin=vin[-6:], reg=(rd.strftime("%b '%y") if pd.notna(rd) else "?"),
                         warr_age=warr_age, age=gg["age_months"].to_numpy().tolist(),
@@ -550,7 +556,7 @@ elif step == STEPS[10]:
                                 line=dict(color=GREEN, width=1.6, dash="dash"), row=r, col=c, showlegend=False)
                 fig.add_vline(x=p["warr_age"], line=dict(color="#9aa7b6", width=1, dash="dashdot"), row=r, col=c)
             fig.add_hline(y=80, line=dict(color=AMBER, width=1, dash="dot"), row="all", col="all")
-            fig.update_yaxes(range=[55, 101], **AX); fig.update_xaxes(**AX)
+            fig.update_yaxes(range=[45, 101], **AX); fig.update_xaxes(**AX)
             fig.update_annotations(font_size=10)
             fig.update_layout(**lay(height=max(nrows * 175, 320), showlegend=False,
                                     margin=dict(l=30, r=12, t=26, b=24)))
