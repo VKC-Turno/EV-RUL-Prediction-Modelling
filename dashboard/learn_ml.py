@@ -162,11 +162,42 @@ def forecast_demo(oem_key, m):
 # (Euler 5 yr; Mahindra Treo 3 yr = the cohort majority; Bajaj ~3 yr.)
 WARRANTY_YR = {"Euler": 5, "Mahindra": 3, "Bajaj": 3}
 
+# vin -> registration date (= age 0 on the SoH curves), per OEM's registration file
+REG_FILES = {
+    "Euler": ("data/euler/Euler_Regd_Details.csv", "regd_date", "%d/%m/%y"),
+    "Mahindra": ("Mh_Regd_Date.csv", "vehicle_registration_date", None),
+    "Bajaj": ("Bajaj_Regd_Details.csv", "regd_date", None),
+}
+
+
+@st.cache_data(show_spinner=False)
+def reg_dates(oem_key):
+    f, col, fmt = REG_FILES[oem_key]
+    if not Path(f).exists():
+        return {}
+    r = pd.read_csv(f)
+    d = pd.to_datetime(r[col], format=fmt, errors="coerce") if fmt else pd.to_datetime(r[col], errors="coerce")
+    return dict(zip(r["vin"], d))
+
+
+@st.cache_data(show_spinner=False)
+def warranty_map(oem_key):
+    """(default_years, {vin: years}). Warranty term per vehicle — Mahindra varies by model
+    (Treo 3 yr / Zor Grand 5 yr); Euler/Bajaj use a single term. The warranty *date* = registration +
+    these years, which on the registration-anchored age axis is simply `years × 12 months`."""
+    import config
+    default = WARRANTY_YR[oem_key]
+    vmp = "data/manifests/mahindra_vin_model.csv"
+    if oem_key == "Mahindra" and Path(vmp).exists():
+        vm = dict(pd.read_csv(vmp).values)
+        return default, {v: config.warranty_for("mahindra", m)[0] for v, m in vm.items()}
+    return default, {}
+
 
 @st.cache_data(show_spinner="Forecasting every test vehicle…")
-def test_predictions(oem_key, warr_age):
+def test_predictions(oem_key):
     """Train on the NON-test vehicles, then for each TEST vehicle forecast from its 60% history out to
-    the warranty horizon. Returns per-vehicle actual + forecast (P10/P50/P90) — the held-out validation."""
+    its own warranty deadline (= registration + warranty term). Returns per-vehicle actual + forecast."""
     cfg = OEMS[oem_key]
     m = load_ft(cfg["ft"])
     mod = importlib.import_module(cfg["module"])
@@ -177,6 +208,7 @@ def test_predictions(oem_key, warr_age):
     euler = oem_key == "Euler"
     fmodel = (mod.train_traj(mod.build_traj_samples(train)) if euler
               else mod.train_quantiles(mod.build_transitions(train)))
+    reg = reg_dates(oem_key); wdef, wmap = warranty_map(oem_key)
     out = []
     for vin in sorted(TE):
         gg = m[m["vin"] == vin].sort_values("month").reset_index(drop=True); n = len(gg)
@@ -184,14 +216,17 @@ def test_predictions(oem_key, warr_age):
             continue
         cut = n - max(1, min(int(round(n * 0.4)), n - 4))
         hist = gg.iloc[:cut]; cut_age = float(gg["age_months"].iloc[cut - 1])
-        H = int(np.clip(round(warr_age - cut_age), 3, 40))      # forecast to warranty (capped)
+        warr_age = wmap.get(vin, wdef) * 12                     # registration + warranty term, on the age axis
+        H = int(np.clip(round(warr_age - cut_age), 3, 40))      # forecast out to the warranty deadline (capped)
         if euler:
             fc = mod.forecast(hist, fmodel, H); p10, p50, p90 = fc[0.1], fc[0.5], fc[0.9]
         else:
             sim = mod.simulate(hist, fmodel, H)
             p10, p50, p90 = sim["q10"].to_numpy(), sim["q50"].to_numpy(), sim["q90"].to_numpy()
         fage = cut_age + np.arange(1, H + 1)
-        out.append(dict(vin=vin[-6:], age=gg["age_months"].to_numpy().tolist(),
+        rd = reg.get(vin)
+        out.append(dict(vin=vin[-6:], reg=(rd.strftime("%b '%y") if pd.notna(rd) else "?"),
+                        warr_age=warr_age, age=gg["age_months"].to_numpy().tolist(),
                         soh=gg["soh"].to_numpy().tolist(), fage=fage.tolist(),
                         p10=p10.tolist(), p50=p50.tolist(), p90=p90.tolist()))
     return out
@@ -273,7 +308,10 @@ elif step == STEPS[2]:
     st.markdown("Each vehicle streams battery telemetry, which we summarise to **one row per vehicle per "
                 "month**. A real slice:")
     show = [c for c in ["vin", "month", "soh", "age_months", "temp_max", "soc_mean", "odo_max"] if c in FEAT]
-    st.dataframe(FEAT[show].head(8).reset_index(drop=True), use_container_width=True)
+    sample = FEAT[show].head(8).copy()
+    _rd = reg_dates(oem)
+    sample.insert(1, "registered", sample["vin"].map(lambda v: (_rd.get(v).date() if pd.notna(_rd.get(v)) else None)))
+    st.dataframe(sample.reset_index(drop=True), use_container_width=True)
     concept("Two kinds of columns:\n\n• **The target** (`soh`) — the 'answer' we predict.\n\n"
             "• **Features** (everything else) — the *clues* the model uses.")
     c = st.columns(3)
@@ -457,12 +495,15 @@ elif step == STEPS[10]:
                         fillcolor="rgba(46,193,107,.18)", line=dict(color=GREY, width=0))
         fig.add_scatter(x=xc, y=c50, name="best estimate", line=dict(color=GREEN, width=3, dash="dash"))
         fig.add_hline(y=80, line=dict(color=AMBER, dash="dash"), annotation_text="80% EoFL")
-        fig.add_vline(x=WARRANTY_YR[oem] * 12, line=dict(color="#9aa7b6", dash="dashdot"),
-                      annotation_text=f"{WARRANTY_YR[oem]}-yr warranty", annotation_position="top")
-        fig.update_xaxes(title="age (months)", **AX); fig.update_yaxes(title="SoH %", **AX)
+        _wdef, _wmap = warranty_map(oem); _wyr = _wmap.get(g.vin.iloc[0], _wdef)
+        fig.add_vline(x=_wyr * 12, line=dict(color="#9aa7b6", dash="dashdot"),
+                      annotation_text=f"{_wyr}-yr warranty", annotation_position="top")
+        fig.update_xaxes(title="age (months since registration)", **AX); fig.update_yaxes(title="SoH %", **AX)
         fig.update_layout(**lay(height=420))
-        st.caption(f"Vehicle {g.vin.iloc[0][-6:]}: measured history (solid) + {len(p50)}-month forecast "
-                   f"(dashed) with its uncertainty band.")
+        _rd = reg_dates(oem).get(g.vin.iloc[0])
+        _reg = f" · registered {_rd:%b %Y}" if pd.notna(_rd) else ""
+        st.caption(f"Vehicle {g.vin.iloc[0][-6:]}{_reg}: measured history (solid) + {len(p50)}-month forecast "
+                   f"(dashed) with its band. Warranty line = registration + {_wyr} years.")
         st.plotly_chart(fig, use_container_width=True)
     except Exception as ex:
         st.warning(f"Forecast demo unavailable ({ex}).")
@@ -475,16 +516,17 @@ elif step == STEPS[10]:
     st.markdown("---")
     st.markdown("### 📋 Prediction vs actual — every held-out **test** vehicle")
     st.caption("For each test vehicle (never seen in training): measured SoH (teal) vs the model's forecast "
-               "from 60% of its history (green dashed + uncertainty band), out to the warranty deadline. "
-               "Dotted = 80% EoFL · dash-dot = warranty horizon.")
+               "from 60% of its history (green dashed + uncertainty band), out to its warranty deadline. "
+               "Subplot title shows the **registration date**. Dotted = 80% EoFL · dash-dot = warranty "
+               "(registration + term).")
     try:
-        warr_age = WARRANTY_YR[oem] * 12
-        preds = test_predictions(oem, warr_age)
+        preds = test_predictions(oem)
         if not preds:
             st.info("No test vehicles with enough history to forecast.")
         else:
             ncols = 4; nrows = int(np.ceil(len(preds) / ncols))
-            fig = make_subplots(rows=nrows, cols=ncols, subplot_titles=[p["vin"] for p in preds],
+            titles = [f"{p['vin']} · reg {p['reg']}" for p in preds]
+            fig = make_subplots(rows=nrows, cols=ncols, subplot_titles=titles,
                                 vertical_spacing=0.06, horizontal_spacing=0.04)
             for i, p in enumerate(preds):
                 r, c = i // ncols + 1, i % ncols + 1
@@ -496,8 +538,8 @@ elif step == STEPS[10]:
                                 fillcolor="rgba(46,193,107,.15)", line=dict(width=0), row=r, col=c, showlegend=False)
                 fig.add_scatter(x=p["fage"], y=p["p50"], mode="lines",
                                 line=dict(color=GREEN, width=1.6, dash="dash"), row=r, col=c, showlegend=False)
+                fig.add_vline(x=p["warr_age"], line=dict(color="#9aa7b6", width=1, dash="dashdot"), row=r, col=c)
             fig.add_hline(y=80, line=dict(color=AMBER, width=1, dash="dot"), row="all", col="all")
-            fig.add_vline(x=warr_age, line=dict(color="#9aa7b6", width=1, dash="dashdot"), row="all", col="all")
             fig.update_yaxes(range=[55, 101], **AX); fig.update_xaxes(**AX)
             fig.update_annotations(font_size=10)
             fig.update_layout(**lay(height=max(nrows * 175, 320), showlegend=False,
