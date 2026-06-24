@@ -153,6 +153,13 @@ st.sidebar.title("🎓 Learn ML")
 oem = st.sidebar.selectbox("Which fleet's model?", list(OEMS.keys()))
 CFG = OEMS[oem]
 FEAT = load_ft(CFG["ft"])
+SMOOTH = st.sidebar.checkbox("Smooth SoH curves", value=True,
+                             help="Round the staircase from the monotonic SoH envelope into a curve "
+                                  "(display only — the model still uses the raw monthly SoH).")
+
+
+def smooth(s, win=5):
+    return s.rolling(win, center=True, min_periods=1).mean() if SMOOTH else s
 st.sidebar.caption(f"How our **{oem}** battery-health model is built — explained from scratch.")
 STEPS = ["👋 Start here", "1 · The problem", "2 · The data", "3 · The target (SoH)", "4 · Features",
          "5 · Train / Validation / Test", "6 · Training the model", "7 · Which clues matter?",
@@ -232,7 +239,7 @@ elif step == STEPS[3]:
     fig = go.Figure()
     for vin, g in FEAT.groupby("vin"):
         deg = (g.soh.iloc[0] - g.soh.iloc[-1]) >= 2
-        fig.add_scatter(x=g.age_months, y=g.soh, mode="lines",
+        fig.add_scatter(x=g.age_months, y=smooth(g.soh), mode="lines",
                         line=dict(color=RED if deg else GREY, width=1), opacity=0.5, showlegend=False)
     fig.add_hline(y=80, line=dict(color=AMBER, dash="dash"), annotation_text="80% — end of first life")
     fig.update_xaxes(title="age (months)", **AX); fig.update_yaxes(title="SoH (%)", range=[55, 101], **AX)
@@ -262,7 +269,7 @@ elif step == STEPS[4]:
             "that batteries fade quickly at first, then level off.")
     vin = ov().sort_values("s1").index[0]; g = FEAT[FEAT.vin == vin]
     fig = go.Figure()
-    fig.add_scatter(x=g.age_months, y=g.soh, name="SoH (target)", line=dict(color=TEAL, width=3))
+    fig.add_scatter(x=g.age_months, y=smooth(g.soh), name="SoH (target)", line=dict(color=TEAL, width=3))
     if "temp_max" in g:
         fig.add_scatter(x=g.age_months, y=g.temp_max, name="temperature (a feature)", yaxis="y2",
                         line=dict(color=RED, width=2, dash="dot"))
@@ -383,14 +390,19 @@ elif step == STEPS[10]:
                 "and not as one over-confident number, but as a **range**.")
     try:
         g, p10, p50, p90 = forecast_demo(oem, FEAT)
+        sm = smooth(g.soh)
         a0 = g.age_months.iloc[-1]; fa = np.arange(a0 + 1, a0 + len(p50) + 1)
+        # connect the forecast to the (smoothed) end of the measured line so there's no visual jump
+        xc = np.concatenate([[a0], fa])
+        c10 = np.concatenate([[sm.iloc[-1]], p10]); c50 = np.concatenate([[sm.iloc[-1]], p50])
+        c90 = np.concatenate([[sm.iloc[-1]], p90])
         fig = go.Figure()
-        fig.add_scatter(x=g.age_months, y=g.soh, name="measured so far", mode="markers+lines",
-                        line=dict(color=TEAL, width=2), marker=dict(size=5))
-        fig.add_scatter(x=fa, y=p90, name="optimistic", line=dict(color=GREY, width=0), showlegend=False)
-        fig.add_scatter(x=fa, y=p10, name="uncertainty range", fill="tonexty",
+        fig.add_scatter(x=g.age_months, y=sm, name="measured so far", mode="markers+lines",
+                        line=dict(color=TEAL, width=2), marker=dict(size=4))
+        fig.add_scatter(x=xc, y=c90, name="optimistic", line=dict(color=GREY, width=0), showlegend=False)
+        fig.add_scatter(x=xc, y=c10, name="uncertainty range", fill="tonexty",
                         fillcolor="rgba(46,193,107,.18)", line=dict(color=GREY, width=0))
-        fig.add_scatter(x=fa, y=p50, name="best estimate", line=dict(color=GREEN, width=3, dash="dash"))
+        fig.add_scatter(x=xc, y=c50, name="best estimate", line=dict(color=GREEN, width=3, dash="dash"))
         fig.add_hline(y=80, line=dict(color=AMBER, dash="dash"), annotation_text="80% EoFL")
         fig.update_xaxes(title="age (months)", **AX); fig.update_yaxes(title="SoH %", **AX)
         fig.update_layout(**lay(height=420))
