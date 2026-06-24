@@ -16,6 +16,7 @@ import numpy as np
 import pandas as pd
 import streamlit as st
 import plotly.graph_objects as go
+from plotly.subplots import make_subplots
 
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / "src")); sys.path.insert(0, str(ROOT))
@@ -155,6 +156,45 @@ def forecast_demo(oem_key, m):
         if res[2][-1] >= 50:                             # P50 doesn't cliff to ~0 — a clean teaching arc
             return res
     return run(order[0])
+
+
+# Representative warranty term (years) per OEM — drawn as the warranty deadline on the prediction plots.
+# (Euler 5 yr; Mahindra Treo 3 yr = the cohort majority; Bajaj ~3 yr.)
+WARRANTY_YR = {"Euler": 5, "Mahindra": 3, "Bajaj": 3}
+
+
+@st.cache_data(show_spinner="Forecasting every test vehicle…")
+def test_predictions(oem_key, warr_age):
+    """Train on the NON-test vehicles, then for each TEST vehicle forecast from its 60% history out to
+    the warranty horizon. Returns per-vehicle actual + forecast (P10/P50/P90) — the held-out validation."""
+    cfg = OEMS[oem_key]
+    m = load_ft(cfg["ft"])
+    mod = importlib.import_module(cfg["module"])
+    g = m.groupby("vin")
+    drop = g["soh"].first() - g["soh"].last()
+    TR, VA, TE = _split(list(m["vin"].unique()), drop)
+    train = m[m["vin"].isin(TR | VA)]
+    euler = oem_key == "Euler"
+    fmodel = (mod.train_traj(mod.build_traj_samples(train)) if euler
+              else mod.train_quantiles(mod.build_transitions(train)))
+    out = []
+    for vin in sorted(TE):
+        gg = m[m["vin"] == vin].sort_values("month").reset_index(drop=True); n = len(gg)
+        if n < 6:
+            continue
+        cut = n - max(1, min(int(round(n * 0.4)), n - 4))
+        hist = gg.iloc[:cut]; cut_age = float(gg["age_months"].iloc[cut - 1])
+        H = int(np.clip(round(warr_age - cut_age), 3, 40))      # forecast to warranty (capped)
+        if euler:
+            fc = mod.forecast(hist, fmodel, H); p10, p50, p90 = fc[0.1], fc[0.5], fc[0.9]
+        else:
+            sim = mod.simulate(hist, fmodel, H)
+            p10, p50, p90 = sim["q10"].to_numpy(), sim["q50"].to_numpy(), sim["q90"].to_numpy()
+        fage = cut_age + np.arange(1, H + 1)
+        out.append(dict(vin=vin[-6:], age=gg["age_months"].to_numpy().tolist(),
+                        soh=gg["soh"].to_numpy().tolist(), fage=fage.tolist(),
+                        p10=p10.tolist(), p50=p50.tolist(), p90=p90.tolist()))
+    return out
 
 
 def concept(t): st.info("💡 **Concept** — " + t)
@@ -417,6 +457,8 @@ elif step == STEPS[10]:
                         fillcolor="rgba(46,193,107,.18)", line=dict(color=GREY, width=0))
         fig.add_scatter(x=xc, y=c50, name="best estimate", line=dict(color=GREEN, width=3, dash="dash"))
         fig.add_hline(y=80, line=dict(color=AMBER, dash="dash"), annotation_text="80% EoFL")
+        fig.add_vline(x=WARRANTY_YR[oem] * 12, line=dict(color="#9aa7b6", dash="dashdot"),
+                      annotation_text=f"{WARRANTY_YR[oem]}-yr warranty", annotation_position="top")
         fig.update_xaxes(title="age (months)", **AX); fig.update_yaxes(title="SoH %", **AX)
         fig.update_layout(**lay(height=420))
         st.caption(f"Vehicle {g.vin.iloc[0][-6:]}: measured history (solid) + {len(p50)}-month forecast "
@@ -429,6 +471,44 @@ elif step == STEPS[10]:
             "dangerous for warranty decisions.")
     takeaway("Where the forecast crosses 80% gives each vehicle its **Remaining Useful Life**. This is "
              "exactly what powers the main SoH dashboard.")
+
+    st.markdown("---")
+    st.markdown("### 📋 Prediction vs actual — every held-out **test** vehicle")
+    st.caption("For each test vehicle (never seen in training): measured SoH (teal) vs the model's forecast "
+               "from 60% of its history (green dashed + uncertainty band), out to the warranty deadline. "
+               "Dotted = 80% EoFL · dash-dot = warranty horizon."
+               + (" ⚠ Bajaj age is measured from first telemetry, so its warranty line is approximate."
+                  if oem == "Bajaj" else ""))
+    try:
+        warr_age = WARRANTY_YR[oem] * 12
+        preds = test_predictions(oem, warr_age)
+        if not preds:
+            st.info("No test vehicles with enough history to forecast.")
+        else:
+            ncols = 4; nrows = int(np.ceil(len(preds) / ncols))
+            fig = make_subplots(rows=nrows, cols=ncols, subplot_titles=[p["vin"] for p in preds],
+                                vertical_spacing=0.06, horizontal_spacing=0.04)
+            for i, p in enumerate(preds):
+                r, c = i // ncols + 1, i % ncols + 1
+                fig.add_scatter(x=p["age"], y=smooth(pd.Series(p["soh"])).tolist(), mode="lines",
+                                line=dict(color=TEAL, width=1.4), row=r, col=c, showlegend=False)
+                fig.add_scatter(x=p["fage"], y=p["p90"], mode="lines", line=dict(width=0, color=GREY),
+                                row=r, col=c, showlegend=False)
+                fig.add_scatter(x=p["fage"], y=p["p10"], mode="lines", fill="tonexty",
+                                fillcolor="rgba(46,193,107,.15)", line=dict(width=0), row=r, col=c, showlegend=False)
+                fig.add_scatter(x=p["fage"], y=p["p50"], mode="lines",
+                                line=dict(color=GREEN, width=1.6, dash="dash"), row=r, col=c, showlegend=False)
+            fig.add_hline(y=80, line=dict(color=AMBER, width=1, dash="dot"), row="all", col="all")
+            fig.add_vline(x=warr_age, line=dict(color="#9aa7b6", width=1, dash="dashdot"), row="all", col="all")
+            fig.update_yaxes(range=[55, 101], **AX); fig.update_xaxes(**AX)
+            fig.update_annotations(font_size=10)
+            fig.update_layout(**lay(height=max(nrows * 175, 320), showlegend=False,
+                                    margin=dict(l=30, r=12, t=26, b=24)))
+            st.plotly_chart(fig, use_container_width=True)
+            st.caption(f"{len(preds)} test vehicles. Where green (forecast) stays above the amber 80% line "
+                       f"at the warranty deadline = predicted to survive warranty; where it dips below = at-risk.")
+    except Exception as ex:
+        st.warning(f"Test-vehicle grid unavailable ({ex}).")
 
 # ═════════════════════════════════ STEP 11 ═════════════════════════════════
 elif step == STEPS[11]:
