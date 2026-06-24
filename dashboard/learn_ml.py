@@ -23,7 +23,7 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / "src")); sys.path.insert(0, str(ROOT))
 os.chdir(ROOT)
 
-st.set_page_config(page_title="Learn ML — Battery SoH", layout="wide", page_icon="🎓")
+st.set_page_config(page_title="Turno · EV SoH Prediction Modeling", layout="wide", page_icon="🔋")
 
 TEAL, AMBER, RED, GREEN, GREY = "#1f9e8f", "#e0922b", "#d4504e", "#2ec16b", "#9fb3c8"
 AX = dict(gridcolor="#1c2738", zerolinecolor="#1c2738", color="#8aa0b6", linecolor="#27374e")
@@ -162,8 +162,11 @@ def forecast_demo(oem_key, m):
 
 # Representative warranty term (years) per OEM — drawn as the warranty deadline on the prediction plots.
 # (Euler 5 yr; Mahindra Treo 3 yr = the cohort majority; Bajaj ~3 yr.)
-WARRANTY_YR = {"Euler": 5, "Mahindra": 3, "Bajaj": 3}
+WARRANTY_YR = {"Euler": 5, "Mahindra": 3, "Bajaj": 5}   # Bajaj RE/Maxima = 5 yr/120k km (verified spec sheet)
 EOL_PCT = {"Euler": 80, "Mahindra": 80, "Bajaj": 70}   # end-of-life SoH threshold per OEM (Bajaj = 70%)
+# Euler/Mahindra SoH is renormalised to 100% at registration (so we anchor the curve at 100 there); Bajaj
+# uses the ABSOLUTE BMS-reported SoH, so it legitimately starts below 100 — no 100% anchor (no fake drop).
+RENORM100 = {"Euler": True, "Mahindra": True, "Bajaj": False}
 
 # vin -> registration date (= age 0 on the SoH curves), per OEM's registration file
 REG_FILES = {
@@ -217,8 +220,10 @@ def test_predictions(oem_key):
         gg = m[m["vin"] == vin].sort_values("month").reset_index(drop=True); n = len(gg)
         if n < 6:
             continue
-        cut = n - max(1, min(int(round(n * 0.4)), n - 4))
-        hist = gg.iloc[:cut]; cut_age = float(gg["age_months"].iloc[cut - 1])
+        # Forecast from the LATEST (present) data point using the vehicle's FULL observed history — not
+        # from a 60% cut. Operationally we want "where is it now and where is it heading", so the green
+        # forecast begins exactly where the measured (teal) line ends.
+        hist = gg; cut_age = float(gg["age_months"].iloc[-1])
         warr_age = wmap.get(vin, wdef) * 12                     # registration + warranty term, on the age axis
         H_MAX = 120                                             # cap (months) to avoid absurd extrapolation
         if euler:
@@ -231,8 +236,10 @@ def test_predictions(oem_key):
         hit = np.where(np.asarray(p50) <= EOL_PCT[oem_key])[0]
         end = (int(hit[0]) + 4) if len(hit) else int(round(warr_age - cut_age)) + 6
         end = int(np.clip(max(end, round(warr_age - cut_age) + 2), 3, H_MAX))
-        p10, p50, p90 = p10[:end], p50[:end], p90[:end]
-        fage = cut_age + np.arange(1, end + 1)
+        last = float(gg["soh"].iloc[-1])                        # anchor the forecast to the present SoH
+        fage = np.concatenate([[cut_age], cut_age + np.arange(1, end + 1)])
+        p10 = np.concatenate([[last], p10[:end]]); p50 = np.concatenate([[last], p50[:end]])
+        p90 = np.concatenate([[last], p90[:end]])
         rd = reg.get(vin)
         out.append(dict(vin=vin[-6:], reg=(rd.strftime("%b '%y") if pd.notna(rd) else "?"),
                         warr_age=warr_age, age=gg["age_months"].to_numpy().tolist(),
@@ -246,7 +253,11 @@ def takeaway(t): st.success("✅ **Takeaway** — " + t)
 
 
 # ───────────────────────────── sidebar / navigation ─────────────────────────────
-st.sidebar.title("🎓 Learn ML")
+_logo = next((p for p in (ROOT / "image.png", ROOT / "dashboard" / "image.png",
+                           ROOT / "assets" / "image.png") if p.exists()), None)
+if _logo:
+    st.sidebar.image(str(_logo), width=150)
+st.sidebar.title("EV SoH Prediction Modeling")
 st.sidebar.caption("How our battery-health models are built — explained from scratch, **comparing all "
                    "three fleets side by side.**")
 SMOOTH = st.sidebar.checkbox("Smooth SoH curves", value=True,
@@ -306,16 +317,19 @@ def availability_df():
 
 
 # ── small per-OEM plot panels (compact, sized to sit three-across) ──
-def _soh_fig(oem, h=300):
-    F = FEATS_BY[oem]; eol = EOL_PCT[oem]
+def _soh_fig(oem, h=300, which="all"):
+    F = FEATS_BY[oem]; eol = EOL_PCT[oem]; anch = RENORM100[oem]
     fig = go.Figure()
     for vin, g in F.groupby("vin"):
         deg = (g.soh.iloc[0] - g.soh.iloc[-1]) >= 2
-        ax = [0] + g.age_months.tolist(); sy = [100.0] + smooth(g.soh).tolist()
+        if (which == "deg" and not deg) or (which == "flat" and deg):
+            continue
+        ax = ([0.0] if anch else []) + (g.age_months / 12).tolist()
+        sy = ([100.0] if anch else []) + smooth(g.soh).tolist()
         fig.add_scatter(x=ax, y=sy, mode="lines", line=dict(color=RED if deg else GREY, width=1),
                         opacity=0.45, showlegend=False)
     fig.add_hline(y=eol, line=dict(color=AMBER, dash="dash"))
-    fig.update_xaxes(title="age (months)", **AX)
+    fig.update_xaxes(title="age (years)", dtick=1, **AX)
     fig.update_yaxes(range=[min(eol - 5, 55), 101], **AX)
     fig.update_layout(**lay(height=h, margin=dict(l=42, r=8, t=22, b=34)))
     return fig
@@ -350,34 +364,18 @@ def _lovo_fig(oem, h=300):
     return fig
 
 
-def _split_fig(oem, h=300):
-    d = diagnostics(oem); sp = d["splits"]; F = FEATS_BY[oem]
-    colmap = {"train": GREEN, "validation": AMBER, "test": RED}
-    fig = go.Figure()
-    for key in ["train", "validation", "test"]:
-        for vin in sp[key]:
-            gg = F[F.vin == vin].sort_values("age_months")
-            ax = [0] + gg.age_months.tolist(); sy = [100.0] + smooth(gg.soh).tolist()
-            fig.add_scatter(x=ax, y=sy, mode="lines", line=dict(color=colmap[key], width=1),
-                            opacity=0.4, showlegend=False)
-    fig.add_hline(y=EOL_PCT[oem], line=dict(color=AMBER, width=1, dash="dot"))
-    fig.update_yaxes(range=[min(EOL_PCT[oem] - 5, 55), 101], **AX)
-    fig.update_xaxes(title="age (months)", **AX)
-    fig.update_layout(**lay(height=h, margin=dict(l=42, r=8, t=20, b=34)))
-    return fig
-
-
 def _forecast_fig(oem, h=330):
     F = FEATS_BY[oem]
     g, p10, p50, p90 = forecast_demo(oem, F)
     sm = smooth(g.soh); a0 = g.age_months.iloc[-1]; fa = np.arange(a0 + 1, a0 + len(p50) + 1)
-    xc = np.concatenate([[a0], fa])
+    xc = np.concatenate([[a0], fa]) / 12.0                      # months -> years for the age axis
     c10 = np.concatenate([[sm.iloc[-1]], p10]); c50 = np.concatenate([[sm.iloc[-1]], p50])
     c90 = np.concatenate([[sm.iloc[-1]], p90])
     fig = go.Figure()
-    fig.add_scatter(x=[0, g.age_months.iloc[0]], y=[100, sm.iloc[0]], mode="lines",
-                    line=dict(color=TEAL, width=1.2, dash="dot"), showlegend=False)
-    fig.add_scatter(x=g.age_months, y=sm, mode="markers+lines", line=dict(color=TEAL, width=2),
+    if RENORM100[oem]:
+        fig.add_scatter(x=[0, g.age_months.iloc[0] / 12], y=[100, sm.iloc[0]], mode="lines",
+                        line=dict(color=TEAL, width=1.2, dash="dot"), showlegend=False)
+    fig.add_scatter(x=g.age_months / 12, y=sm, mode="markers+lines", line=dict(color=TEAL, width=2),
                     marker=dict(size=3), showlegend=False)
     fig.add_scatter(x=xc, y=c90, line=dict(width=0, color=GREY), showlegend=False)
     fig.add_scatter(x=xc, y=c10, fill="tonexty", fillcolor="rgba(46,193,107,.18)",
@@ -385,8 +383,8 @@ def _forecast_fig(oem, h=330):
     fig.add_scatter(x=xc, y=c50, line=dict(color=GREEN, width=2.5, dash="dash"), showlegend=False)
     fig.add_hline(y=EOL_PCT[oem], line=dict(color=AMBER, dash="dash"))
     wdef, wmap = warranty_map(oem); wyr = wmap.get(g.vin.iloc[0], wdef)
-    fig.add_vline(x=wyr * 12, line=dict(color="#9aa7b6", dash="dashdot"))
-    fig.update_xaxes(title="age (months)", **AX)
+    fig.add_vline(x=wyr, line=dict(color="#9aa7b6", dash="dashdot"))
+    fig.update_xaxes(title="age (years)", dtick=1, **AX)
     fig.update_yaxes(range=[60, 101], **AX)            # common 60–100% scale across all fleets
     fig.update_layout(**lay(height=h, margin=dict(l=40, r=8, t=22, b=34)))
     return fig, g.vin.iloc[0], len(p50), wyr
@@ -403,23 +401,52 @@ def _testgrid_fig(oem):
     for i, p in enumerate(preds):
         r, c = i // ncols + 1, i % ncols + 1
         sm = smooth(pd.Series(p["soh"]))
-        fig.add_scatter(x=[0, p["age"][0]], y=[100, sm.iloc[0]], mode="lines",
-                        line=dict(color=TEAL, width=1, dash="dot"), row=r, col=c, showlegend=False)
-        fig.add_scatter(x=p["age"], y=sm.tolist(), mode="lines",
+        age = np.array(p["age"]) / 12.0; fage = np.array(p["fage"]) / 12.0   # months -> years
+        if RENORM100[oem]:
+            fig.add_scatter(x=[0, age[0]], y=[100, sm.iloc[0]], mode="lines",
+                            line=dict(color=TEAL, width=1, dash="dot"), row=r, col=c, showlegend=False)
+        fig.add_scatter(x=age, y=sm.tolist(), mode="lines",
                         line=dict(color=TEAL, width=1.4), row=r, col=c, showlegend=False)
-        fig.add_scatter(x=p["fage"], y=p["p90"], mode="lines", line=dict(width=0, color=GREY),
+        fig.add_scatter(x=fage, y=p["p90"], mode="lines", line=dict(width=0, color=GREY),
                         row=r, col=c, showlegend=False)
-        fig.add_scatter(x=p["fage"], y=p["p10"], mode="lines", fill="tonexty",
+        fig.add_scatter(x=fage, y=p["p10"], mode="lines", fill="tonexty",
                         fillcolor="rgba(46,193,107,.15)", line=dict(width=0), row=r, col=c, showlegend=False)
-        fig.add_scatter(x=p["fage"], y=p["p50"], mode="lines",
+        fig.add_scatter(x=fage, y=p["p50"], mode="lines",
                         line=dict(color=GREEN, width=1.6, dash="dash"), row=r, col=c, showlegend=False)
-        fig.add_vline(x=p["warr_age"], line=dict(color="#9aa7b6", width=1, dash="dashdot"), row=r, col=c)
+        fig.add_vline(x=p["warr_age"] / 12, line=dict(color="#9aa7b6", width=1, dash="dashdot"), row=r, col=c)
     fig.add_hline(y=EOL_PCT[oem], line=dict(color=AMBER, width=1, dash="dot"), row="all", col="all")
-    fig.update_yaxes(range=[min(EOL_PCT[oem] - 10, 45), 101], **AX); fig.update_xaxes(**AX)
+    fig.update_yaxes(range=[min(EOL_PCT[oem] - 10, 45), 101], **AX); fig.update_xaxes(dtick=1, **AX)
     fig.update_annotations(font_size=10)
     fig.update_layout(**lay(height=max(nrows * 175, 300), showlegend=False,
                             margin=dict(l=30, r=12, t=26, b=24)))
     return fig, len(preds)
+
+
+def _feature_grid_fig(oem):
+    """Small-multiples: every engineered feature (plus SoH first) vs age, for the most-degraded vehicle."""
+    F = FEATS_BY[oem]
+    vin = ov(F).sort_values("s1").index[0]
+    g = F[F.vin == vin].sort_values("age_months")
+    ageyr = (g["age_months"] / 12).to_numpy()
+    exclude = {"vin", "month", "soh", "soh_raw", "reg_known", "age_months"}
+    feats = [c for c in g.columns if c not in exclude and pd.api.types.is_numeric_dtype(g[c])]
+    panels = ["soh"] + feats
+    ncols = 4; nrows = int(np.ceil(len(panels) / ncols))
+    fig = make_subplots(rows=nrows, cols=ncols, subplot_titles=panels,
+                        vertical_spacing=max(0.04, 0.30 / nrows), horizontal_spacing=0.05)
+    for i, name in enumerate(panels):
+        r, c = i // ncols + 1, i % ncols + 1
+        y = smooth(g["soh"]) if name == "soh" else g[name]
+        fig.add_scatter(x=ageyr, y=y, mode="lines",
+                        line=dict(color=TEAL if name == "soh" else GREY, width=1.6),
+                        row=r, col=c, showlegend=False)
+    fig.update_xaxes(dtick=1, **AX); fig.update_yaxes(**AX)
+    for cc in range(1, ncols + 1):
+        fig.update_xaxes(title_text="age (yr)", row=nrows, col=cc)
+    fig.update_annotations(font_size=10)
+    fig.update_layout(**lay(height=max(nrows * 150, 300), showlegend=False,
+                            margin=dict(l=34, r=10, t=26, b=30)))
+    return fig, vin, len(feats)
 
 
 # ═════════════════════════════════ STEP 0 ═════════════════════════════════
@@ -486,21 +513,27 @@ elif step == STEPS[2]:
 # ═════════════════════════════════ STEP 3 ═════════════════════════════════
 elif step == STEPS[3]:
     st.title("3 · The target — State of Health over time")
-    st.markdown("Each line below is one vehicle's SoH as it ages. **Red** = clearly degraded (lost ≥2%); "
-                "**grey** = still near-new. *This is what each model learns to reproduce and extend.*")
+    st.markdown("Each line is one vehicle's SoH as it ages. We split the two populations the model must "
+                "handle into separate rows: **degraders** (lost ≥2% — real aging) and **still-near-new** "
+                "(flat) vehicles.")
+    st.markdown("##### 🔴 Degraders — what real aging looks like")
     cols = st.columns(3)
     for col, oem in zip(cols, OEM_KEYS):
-        col.markdown(f"**{oem}** · _{OEMS[oem]['soh_method']}_")
-        col.plotly_chart(_soh_fig(oem), use_container_width=True)
         o = ov(FEATS_BY[oem]); eol = EOL_PCT[oem]
-        col.caption(f"{int((o.s0-o.s1>=2).sum())}/{len(o)} degraders · reached {eol}%: "
-                    f"{int((o.smin<=eol).sum())} · median {int(o.months.median())} mo")
+        col.markdown(f"**{oem}** · _{OEMS[oem]['soh_method']}_ · {int((o.s0-o.s1>=2).sum())} degraders")
+        col.plotly_chart(_soh_fig(oem, which="deg"), use_container_width=True)
+        col.caption(f"reached {eol}%: {int((o.smin<=eol).sum())} · median history {int(o.months.median())} mo")
+    st.markdown("##### ⚪ Still near-new — flat (lost <2%)")
+    cols2 = st.columns(3)
+    for col, oem in zip(cols2, OEM_KEYS):
+        o = ov(FEATS_BY[oem])
+        col.markdown(f"**{oem}** · {int((o.s0-o.s1<2).sum())} flat vehicles")
+        col.plotly_chart(_soh_fig(oem, which="flat"), use_container_width=True)
     concept("How SoH is *measured* differs per fleet — Euler reads BMS remaining-capacity, Mahindra "
-            "coulomb-counts current, Bajaj trusts the BMS-reported value. Same curve shape, three methods. "
-            "(Euler/Mahindra are anchored to 100% at registration; Bajaj uses the absolute reported value, "
-            "so its lines can start below 100%.)")
-    takeaway("Most lines sit **above the end-of-life line** — most batteries haven't worn out yet. The few "
-             "that have are the most valuable examples: they show the model what real aging looks like.")
+            "coulomb-counts current, Bajaj trusts the BMS-reported value. (Euler/Mahindra are anchored to "
+            "100% at registration; Bajaj uses the absolute reported value, so its lines start below 100%.)")
+    takeaway("Most vehicles sit in the **grey (flat) row** — still healthy. The **degraders** are fewer but "
+             "the most valuable examples: they show the model what real aging looks like.")
 
 # ═════════════════════════════════ STEP 4 ═════════════════════════════════
 elif step == STEPS[4]:
@@ -521,21 +554,15 @@ elif step == STEPS[4]:
     concept("**Feature engineering** = turning raw data into meaningful clues. `inv_sqrt_age` encodes the "
             "known fact that batteries fade fast early, then level off. The key cross-fleet point: Bajaj "
             "must predict aging **without** the electrical signals Euler/Mahindra rely on.")
-    st.markdown("#### Target (SoH) vs one feature (temperature) — most-degraded vehicle in each fleet")
-    cols2 = st.columns(3)
-    for col, oem in zip(cols2, OEM_KEYS):
-        F = FEATS_BY[oem]; vin = ov(F).sort_values("s1").index[0]; g = F[F.vin == vin]; sm4 = smooth(g.soh)
-        fig = go.Figure()
-        fig.add_scatter(x=[0, g.age_months.iloc[0]], y=[100, sm4.iloc[0]], mode="lines",
-                        line=dict(color=TEAL, width=1.2, dash="dot"), showlegend=False)
-        fig.add_scatter(x=g.age_months, y=sm4, line=dict(color=TEAL, width=2.5), showlegend=False)
-        if "temp_max" in g:
-            fig.add_scatter(x=g.age_months, y=g.temp_max, yaxis="y2",
-                            line=dict(color=RED, width=1.5, dash="dot"), showlegend=False)
-            fig.update_layout(yaxis2=dict(overlaying="y", side="right", showgrid=False, color="#8aa0b6"))
-        fig.update_layout(**lay(height=250, margin=dict(l=36, r=28, t=14, b=30)))
-        fig.update_xaxes(title="age (mo)", **AX); fig.update_yaxes(**AX)
-        col.markdown(f"**{oem}** · {vin[-6:]}"); col.plotly_chart(fig, use_container_width=True)
+    st.markdown("#### Every feature vs age — for the most-degraded vehicle in each fleet")
+    st.caption("Each small panel is one clue the model sees, over the vehicle's life (SoH first, in teal). "
+               "Pick a fleet's tab — the *set* of panels differs because the feeds differ.")
+    tabs = st.tabs(OEM_KEYS)
+    for tab, oem in zip(tabs, OEM_KEYS):
+        with tab:
+            fig, vin, nf = _feature_grid_fig(oem)
+            st.caption(f"**{oem}** · vehicle {vin[-6:]} · {nf} features")
+            st.plotly_chart(fig, use_container_width=True)
     takeaway("Each model receives the features its feed allows and learns which combinations predict SoH "
              "loss. Step 7 reveals *which* it actually relied on — and it differs per fleet.")
 
@@ -561,13 +588,15 @@ elif step == STEPS[5]:
         for ri, key in enumerate(splitnames, start=1):
             for vin in sp[key]:
                 gg = F[F.vin == vin].sort_values("age_months")
-                ax = [0] + gg.age_months.tolist(); sy = [100.0] + smooth(gg.soh).tolist()
+                a100 = RENORM100[oem]
+                ax = ([0.0] if a100 else []) + (gg.age_months / 12).tolist()
+                sy = ([100.0] if a100 else []) + smooth(gg.soh).tolist()
                 fig.add_scatter(x=ax, y=sy, mode="lines", line=dict(color=colmap[key], width=1),
                                 opacity=0.5, row=ri, col=ci, showlegend=False)
             fig.add_hline(y=EOL_PCT[oem], line=dict(color=AMBER, width=1, dash="dot"), row=ri, col=ci)
-    fig.update_yaxes(range=[55, 101], **AX); fig.update_xaxes(**AX)
+    fig.update_yaxes(range=[55, 101], **AX); fig.update_xaxes(dtick=1, **AX)
     for ci in range(1, 4):
-        fig.update_xaxes(title_text="age (months)", row=3, col=ci)
+        fig.update_xaxes(title_text="age (years)", row=3, col=ci)
     fig.update_annotations(font_size=12)
     fig.update_layout(**lay(height=640, showlegend=False, margin=dict(l=42, r=44, t=44, b=40)))
     st.plotly_chart(fig, use_container_width=True)
@@ -677,10 +706,12 @@ elif step == STEPS[10]:
              "Life**. This is exactly what powers the main SoH dashboard.")
 
     st.markdown("---")
-    st.markdown("### 📋 Prediction vs actual — every held-out **test** vehicle")
-    st.caption("Pick a fleet's tab. For each test vehicle (never seen in training): measured SoH (teal, "
-               "anchored to **100% at registration**) vs the model's forecast from 60% of its history "
-               "(green dashed + band), out to its warranty deadline. Title = **registration date**.")
+    st.markdown("### 📋 Forecast from today — every held-out **test** vehicle")
+    st.caption("Pick a fleet's tab. For each test vehicle (never seen in training): its **full measured "
+               "history** (teal — Euler/Mahindra anchored to 100% at registration; Bajaj shows the absolute "
+               "reported SoH, so it starts below 100) plus the model's forecast **from its latest (present) "
+               "data point onward** (green dashed + band), out to the warranty deadline. Title = "
+               "registration date · age in years.")
     tabs = st.tabs(OEM_KEYS)
     for tab, oem in zip(tabs, OEM_KEYS):
         with tab:
