@@ -23,7 +23,11 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / "src")); sys.path.insert(0, str(ROOT))
 os.chdir(ROOT)
 
-st.set_page_config(page_title="Turno · EV SoH Prediction Modeling", layout="wide", page_icon="🔋")
+import data_quality                                     # shared data-quality gate (drops data-thin vehicles)
+
+_ico = ROOT / "turno_logo.png"
+st.set_page_config(page_title="Turno · EV SoH Prediction Modeling", layout="wide",
+                   page_icon=str(_ico) if _ico.exists() else "🔋")
 
 TEAL, AMBER, RED, GREEN, GREY = "#1f9e8f", "#e0922b", "#d4504e", "#2ec16b", "#9fb3c8"
 AX = dict(gridcolor="#1c2738", zerolinecolor="#1c2738", color="#8aa0b6", linecolor="#27374e")
@@ -74,6 +78,15 @@ def load_ft(path):
     return pd.read_parquet(path).sort_values(["vin", "month"])
 
 
+def deg_filter(m, on):
+    """When `on`, keep only DEGRADER vehicles (>=2 pp total SoH drop), excluding flat/near-new ones from
+    the train/validation/test sets. Off (default) uses the full dataset."""
+    if not on:
+        return m
+    d = m.groupby("vin")["soh"].agg(lambda s: s.iloc[0] - s.iloc[-1])
+    return m[m["vin"].isin(d[d >= 2].index)]
+
+
 def _split(vins, drop, seed=0):
     """By-vehicle 60/20/20 split, stratified so each split keeps degraders and flat vehicles."""
     rng = np.random.RandomState(seed)
@@ -87,16 +100,17 @@ def _split(vins, drop, seed=0):
 
 
 @st.cache_data(show_spinner="Training the model for this lesson…")
-def diagnostics(oem_key):
+def diagnostics(oem_key, deg_only=False):
     """Train one model on the TRAIN split; report per-transition RMSE on each split + feature importance."""
     cfg = OEMS[oem_key]
-    m = load_ft(cfg["ft"])
+    m = data_quality.apply_quality(load_ft(cfg["ft"]), oem_key)   # drop data-thin; split FIXED regardless of deg_only
     mod = importlib.import_module(cfg["module"])
     FEATS = mod.FEATS
     g = m.groupby("vin")
     drop = (g["soh"].first() - g["soh"].last())
     TR, VA, TE = _split(list(m["vin"].unique()), drop)
-    t_tr = mod.build_transitions(m[m["vin"].isin(TR)])
+    tr = {v for v in TR if drop[v] >= 2} if deg_only else TR   # toggle filters TRAIN only (val/test fixed)
+    t_tr = mod.build_transitions(m[m["vin"].isin(tr)])
     if hasattr(mod, "train"):                       # Euler rate model (XGBoost regression)
         reg = mod.train(t_tr); bias = float(getattr(reg, "_cal_bias", 0.0))
     else:
@@ -117,28 +131,32 @@ def diagnostics(oem_key):
         return round(float(np.sqrt(np.mean((t["loss"].to_numpy() - pred) ** 2))), 4)
 
     fi = sorted(zip(FEATS, [float(x) for x in reg.feature_importances_]), key=lambda x: -x[1])
-    return {"sizes": {"train": len(TR), "validation": len(VA), "test": len(TE)},
-            "errors": {"train": rmse(TR), "validation": rmse(VA), "test": rmse(TE)},
+    return {"sizes": {"train": len(tr), "validation": len(VA), "test": len(TE)},
+            "errors": {"train": rmse(tr), "validation": rmse(VA), "test": rmse(TE)},
             "fi": fi,
-            "splits": {"train": sorted(TR), "validation": sorted(VA), "test": sorted(TE)}}
+            "splits": {"train": sorted(tr), "validation": sorted(VA), "test": sorted(TE)}}
 
 
 @st.cache_resource(show_spinner=False)
-def forecaster(oem_key):
+def forecaster(oem_key, deg_only=False):
     cfg = OEMS[oem_key]
     mod = importlib.import_module(cfg["module"])
-    m = load_ft(cfg["ft"])
+    m = deg_filter(data_quality.apply_quality(load_ft(cfg["ft"]), oem_key), deg_only)
     if oem_key == "Euler":
-        import euler_train
-        b = euler_train.load_latest()
-        return mod, b["traj_model"] if (b and b.get("traj_model")) else mod.train_traj(mod.build_traj_samples(m))
+        if not deg_only:                                  # use the persisted all-vehicle model
+            import euler_train
+            b = euler_train.load_latest()
+            if b and b.get("traj_model"):
+                return mod, b["traj_model"]
+        return mod, mod.train_traj(mod.build_traj_samples(m))
     return mod, mod.train_quantiles(mod.build_transitions(m))
 
 
-def forecast_demo(oem_key, m):
+def forecast_demo(oem_key, m, deg_only=False):
     """Pick a clear teaching example (decent history, real decline, sensible non-cliff forecast)."""
-    mod, fmodel = forecaster(oem_key)
+    mod, fmodel = forecaster(oem_key, deg_only)          # model trained on degraders only when toggled
     H = 18 if oem_key == "Bajaj" else 30                  # Bajaj: short history + fast, steady decline
+    m = data_quality.apply_quality(m, oem_key)           # never forecast a data-thin vehicle
     grp = m.groupby("vin")
     o = pd.DataFrame({"months": grp.size(), "s0": grp.soh.first(), "s1": grp.soh.last()})
     o["dropp"] = o.s0 - o.s1
@@ -201,16 +219,17 @@ def warranty_map(oem_key):
 
 
 @st.cache_data(show_spinner="Forecasting every test vehicle…")
-def test_predictions(oem_key):
-    """Train on the NON-test vehicles, then for each TEST vehicle forecast from its 60% history out to
+def test_predictions(oem_key, deg_only=False):
+    """Train on the NON-test vehicles, then for each TEST vehicle forecast from its latest data out to
     its own warranty deadline (= registration + warranty term). Returns per-vehicle actual + forecast."""
     cfg = OEMS[oem_key]
-    m = load_ft(cfg["ft"])
+    m = data_quality.apply_quality(load_ft(cfg["ft"]), oem_key)   # drop data-thin; TEST set FIXED regardless of deg_only
     mod = importlib.import_module(cfg["module"])
     g = m.groupby("vin")
     drop = g["soh"].first() - g["soh"].last()
     TR, VA, TE = _split(list(m["vin"].unique()), drop)
-    train = m[m["vin"].isin(TR | VA)]
+    tr_vins = {v for v in (TR | VA) if drop[v] >= 2} if deg_only else (TR | VA)  # filter TRAIN only
+    train = m[m["vin"].isin(tr_vins)]
     euler = oem_key == "Euler"
     fmodel = (mod.train_traj(mod.build_traj_samples(train)) if euler
               else mod.train_quantiles(mod.build_transitions(train)))
@@ -253,16 +272,23 @@ def takeaway(t): st.success("✅ **Takeaway** — " + t)
 
 
 # ───────────────────────────── sidebar / navigation ─────────────────────────────
-_logo = next((p for p in (ROOT / "turno.gif", ROOT / "image.png", ROOT / "dashboard" / "image.png",
-                           ROOT / "assets" / "image.png") if p.exists()), None)
+_logo = next((p for p in (ROOT / "turno_logo.png", ROOT / "turno.gif", ROOT / "image.png",
+                           ROOT / "dashboard" / "image.png", ROOT / "assets" / "image.png") if p.exists()), None)
 if _logo:
-    st.sidebar.image(str(_logo), width=170)
+    st.sidebar.image(str(_logo), width=110)
 st.sidebar.title("EV SoH Prediction Modeling")
 st.sidebar.caption("How our battery-health models are built — explained from scratch, **comparing all "
                    "three fleets side by side.**")
 SMOOTH = st.sidebar.checkbox("Smooth SoH curves", value=True,
                              help="Round the staircase from the monotonic SoH envelope into a curve "
                                   "(display only — the model still uses the raw monthly SoH).")
+DEG_ONLY = st.sidebar.checkbox("Train on degraders only", value=False,
+                               help="Exclude flat/near-new vehicles (lost <2% SoH) from the TRAINING set "
+                                    "only — the validation/test vehicles stay the SAME, so the warranty-risk "
+                                    "counts are a fair with-vs-without-flat comparison on identical "
+                                    "vehicles. Affects Steps 5/7/8/10. OFF is the default.")
+if DEG_ONLY:
+    st.sidebar.warning("⚠️ Degraders-only TRAINING (validation/test vehicles held fixed).")
 
 
 def smooth(s, win=5):
@@ -272,7 +298,7 @@ def smooth(s, win=5):
 STEPS = ["👋 Start here", "1 · The problem", "2 · The data", "3 · The target (SoH)", "4 · Features",
          "5 · Train / Validation / Test", "6 · Training the model", "7 · Which clues matter?",
          "8 · Errors & overfitting", "9 · A tougher test (LOVO)", "10 · Predicting the future",
-         "11 · Limits & retraining"]
+         "11 · Data quality", "12 · Limits & retraining"]
 step = st.sidebar.radio("Steps", STEPS, label_visibility="collapsed")
 st.sidebar.markdown("---")
 
@@ -336,7 +362,7 @@ def _soh_fig(oem, h=300, which="all"):
 
 
 def _fi_fig(oem, h=330):
-    fi = pd.DataFrame(diagnostics(oem)["fi"], columns=["feature", "importance"]).head(10)
+    fi = pd.DataFrame(diagnostics(oem, DEG_ONLY)["fi"], columns=["feature", "importance"]).head(10)
     fig = go.Figure(go.Bar(x=fi.importance[::-1], y=fi.feature[::-1], orientation="h", marker_color=TEAL))
     fig.update_xaxes(**AX); fig.update_yaxes(**AX)
     fig.update_layout(**lay(height=h, margin=dict(l=8, r=8, t=20, b=28)))
@@ -344,7 +370,7 @@ def _fi_fig(oem, h=330):
 
 
 def _err_fig(oem, h=300):
-    e = diagnostics(oem)["errors"]
+    e = diagnostics(oem, DEG_ONLY)["errors"]
     fig = go.Figure(go.Bar(x=["Train", "Val", "Test"], y=[e["train"], e["validation"], e["test"]],
                            marker_color=[GREEN, AMBER, RED],
                            text=[f"{e['train']:.2f}", f"{e['validation']:.2f}", f"{e['test']:.2f}"],
@@ -359,14 +385,14 @@ def _lovo_fig(oem, h=300):
     fig = go.Figure(go.Bar(x=["Model", "Persist", "Trend"], y=[L["model"], L["persist"], L["trend"]],
                            marker_color=[GREEN, GREY, AMBER],
                            text=[L["model"], L["persist"], L["trend"]], textposition="outside"))
-    fig.update_yaxes(**AX); fig.update_xaxes(**AX)
+    fig.update_yaxes(title="forecast error · RMSE pp (↓ better)", **AX); fig.update_xaxes(**AX)
     fig.update_layout(**lay(height=h, margin=dict(l=36, r=8, t=22, b=28)))
     return fig
 
 
 def _forecast_fig(oem, h=330):
     F = FEATS_BY[oem]
-    g, p10, p50, p90 = forecast_demo(oem, F)
+    g, p10, p50, p90 = forecast_demo(oem, F, DEG_ONLY)
     sm = smooth(g.soh); a0 = g.age_months.iloc[-1]; fa = np.arange(a0 + 1, a0 + len(p50) + 1)
     xc = np.concatenate([[a0], fa]) / 12.0                      # months -> years for the age axis
     c10 = np.concatenate([[sm.iloc[-1]], p10]); c50 = np.concatenate([[sm.iloc[-1]], p50])
@@ -377,10 +403,11 @@ def _forecast_fig(oem, h=330):
                         line=dict(color=TEAL, width=1.2, dash="dot"), showlegend=False)
     fig.add_scatter(x=g.age_months / 12, y=sm, mode="markers+lines", line=dict(color=TEAL, width=2),
                     marker=dict(size=3), showlegend=False)
-    fig.add_scatter(x=xc, y=c90, line=dict(width=0, color=GREY), showlegend=False)
-    fig.add_scatter(x=xc, y=c10, fill="tonexty", fillcolor="rgba(46,193,107,.18)",
+    fig.add_scatter(x=xc, y=c90, mode="lines", line=dict(width=0, color=GREY), showlegend=False)
+    fig.add_scatter(x=xc, y=c10, mode="lines", fill="tonexty", fillcolor="rgba(46,193,107,.18)",
                     line=dict(width=0, color=GREY), showlegend=False)
-    fig.add_scatter(x=xc, y=c50, line=dict(color=GREEN, width=2.5, dash="dash"), showlegend=False)
+    fig.add_scatter(x=xc, y=c50, mode="lines", line=dict(color=GREEN, width=2.5, dash="dash"),
+                    showlegend=False)
     fig.add_hline(y=EOL_PCT[oem], line=dict(color=AMBER, dash="dash"))
     wdef, wmap = warranty_map(oem); wyr = wmap.get(g.vin.iloc[0], wdef)
     fig.add_vline(x=wyr, line=dict(color="#9aa7b6", dash="dashdot"))
@@ -391,15 +418,19 @@ def _forecast_fig(oem, h=330):
 
 
 def _testgrid_fig(oem):
-    preds = test_predictions(oem)
+    preds = test_predictions(oem, DEG_ONLY)
     if not preds:
         return None, 0
     ncols = 4; nrows = int(np.ceil(len(preds) / ncols))
     titles = [f"{p['vin']} · reg {p['reg']}" for p in preds]
     fig = make_subplots(rows=nrows, cols=ncols, subplot_titles=titles,
                         vertical_spacing=0.06, horizontal_spacing=0.04)
+    eol = EOL_PCT[oem]; risk = []
     for i, p in enumerate(preds):
         r, c = i // ncols + 1, i % ncols + 1
+        atrisk = _fc_at_warranty(p, "p50") < eol; risk.append(atrisk)   # below EoL at warranty = at-risk
+        clr = RED if atrisk else GREEN
+        fillc = "rgba(212,80,78,.16)" if atrisk else "rgba(46,193,107,.15)"
         sm = smooth(pd.Series(p["soh"]))
         age = np.array(p["age"]) / 12.0; fage = np.array(p["fage"]) / 12.0   # months -> years
         if RENORM100[oem]:
@@ -410,13 +441,16 @@ def _testgrid_fig(oem):
         fig.add_scatter(x=fage, y=p["p90"], mode="lines", line=dict(width=0, color=GREY),
                         row=r, col=c, showlegend=False)
         fig.add_scatter(x=fage, y=p["p10"], mode="lines", fill="tonexty",
-                        fillcolor="rgba(46,193,107,.15)", line=dict(width=0), row=r, col=c, showlegend=False)
+                        fillcolor=fillc, line=dict(width=0), row=r, col=c, showlegend=False)
         fig.add_scatter(x=fage, y=p["p50"], mode="lines",
-                        line=dict(color=GREEN, width=1.6, dash="dash"), row=r, col=c, showlegend=False)
+                        line=dict(color=clr, width=1.8, dash="dash"), row=r, col=c, showlegend=False)
         fig.add_vline(x=p["warr_age"] / 12, line=dict(color="#9aa7b6", width=1, dash="dashdot"), row=r, col=c)
-    fig.add_hline(y=EOL_PCT[oem], line=dict(color=AMBER, width=1, dash="dot"), row="all", col="all")
-    fig.update_yaxes(range=[min(EOL_PCT[oem] - 10, 45), 101], **AX); fig.update_xaxes(dtick=1, **AX)
+    fig.add_hline(y=eol, line=dict(color=AMBER, width=1, dash="dot"), row="all", col="all")
+    fig.update_yaxes(range=[min(eol - 10, 45), 101], **AX); fig.update_xaxes(dtick=1, **AX)
     fig.update_annotations(font_size=10)
+    for i, flag in enumerate(risk):                       # red subplot title for at-risk vehicles
+        if flag and i < len(fig.layout.annotations):
+            fig.layout.annotations[i].font.color = RED
     fig.update_layout(**lay(height=max(nrows * 175, 300), showlegend=False,
                             margin=dict(l=30, r=12, t=26, b=24)))
     return fig, len(preds)
@@ -447,6 +481,12 @@ def _feature_grid_fig(oem):
     fig.update_layout(**lay(height=max(nrows * 150, 300), showlegend=False,
                             margin=dict(l=34, r=10, t=26, b=30)))
     return fig, vin, len(feats)
+
+
+def _fc_at_warranty(p, q="p50"):
+    """Forecast quantile value at (the point closest to) the vehicle's warranty deadline."""
+    fage = np.asarray(p["fage"])
+    return float(np.asarray(p[q])[int(np.argmin(np.abs(fage - p["warr_age"])))])
 
 
 # ═════════════════════════════════ STEP 0 ═════════════════════════════════
@@ -575,7 +615,7 @@ elif step == STEPS[5]:
                 "groups** (each shown on its own so you can see who's in it):")
     cols = st.columns(3)
     for col, oem in zip(cols, OEM_KEYS):
-        s = diagnostics(oem)["sizes"]
+        s = diagnostics(oem, DEG_ONLY)["sizes"]
         col.markdown(f"**{oem}** — 🟢 {s['train']} · 🟡 {s['validation']} · 🔴 {s['test']}")
     splitnames = ["train", "validation", "test"]
     rowlab = {"train": "🟢 Training", "validation": "🟡 Validation", "test": "🔴 Test"}
@@ -584,7 +624,7 @@ elif step == STEPS[5]:
                         row_titles=[rowlab[k] for k in splitnames],
                         vertical_spacing=0.05, horizontal_spacing=0.05)
     for ci, oem in enumerate(OEM_KEYS, start=1):
-        sp = diagnostics(oem)["splits"]; F = FEATS_BY[oem]
+        sp = diagnostics(oem, DEG_ONLY)["splits"]; F = FEATS_BY[oem]
         for ri, key in enumerate(splitnames, start=1):
             for vin in sp[key]:
                 gg = F[F.vin == vin].sort_values("age_months")
@@ -655,7 +695,7 @@ elif step == STEPS[8]:
                 "per fleet — the Test ÷ Train gap reveals overfitting:")
     cols = st.columns(3)
     for col, oem in zip(cols, OEM_KEYS):
-        e = diagnostics(oem)["errors"]; gap = e["test"] / max(e["train"], 1e-9)
+        e = diagnostics(oem, DEG_ONLY)["errors"]; gap = e["test"] / max(e["train"], 1e-9)
         col.markdown(f"**{oem}** — test **{e['test']:.2f}** · gap {gap:.1f}×")
         col.plotly_chart(_err_fig(oem), use_container_width=True)
     concept("**Training error is always optimistically low** — the model has seen that data. The **test "
@@ -671,7 +711,9 @@ elif step == STEPS[9]:
                 "out one whole vehicle, train on the rest, forecast it — repeat for *every* vehicle. We "
                 "compare each fleet's model against two lazy baselines:")
     st.markdown("- **Persistence:** 'assume SoH stays exactly where it is.'\n"
-                "- **Trend line:** 'fit a simple curve and extend it.'")
+                "- **Trend line:** 'fit a simple curve and extend it.'\n\n"
+                "Each bar below is **forecast error** — RMSE in SoH percentage-points, on the batteries that "
+                "actually decline. **Lower is better.**")
     cols = st.columns(3)
     for col, oem in zip(cols, OEM_KEYS):
         L = OEMS[oem]["lovo"]
@@ -716,20 +758,62 @@ elif step == STEPS[10]:
     for tab, oem in zip(tabs, OEM_KEYS):
         with tab:
             try:
+                preds = test_predictions(oem, DEG_ONLY); eol = EOL_PCT[oem]
                 fig, n = _testgrid_fig(oem)
                 if not fig:
                     st.info("No test vehicles with enough history to forecast.")
                 else:
+                    ar50 = sum(1 for p in preds if _fc_at_warranty(p, "p50") < eol)
+                    ar10 = sum(1 for p in preds if _fc_at_warranty(p, "p10") < eol)
+                    cc = st.columns(3)
+                    cc[0].metric(f"{oem} test vehicles", n)
+                    cc[1].metric(f"🔴 At-risk by warranty (P50 < {eol}%)", f"{ar50} / {n}")
+                    cc[2].metric("Worst-case at-risk (P10)", f"{ar10} / {n}")
                     st.plotly_chart(fig, use_container_width=True)
-                    st.caption(f"{n} {oem} test vehicles. Green (forecast) above the amber {EOL_PCT[oem]}% "
-                               f"line at the warranty deadline = predicted to survive; dipping below = "
-                               f"at-risk.")
+                    st.caption(f"At-risk = forecast below the amber {eol}% line at the warranty deadline. "
+                               f"Flip **Train on degraders only** in the sidebar to see how the count moves.")
             except Exception as ex:
                 st.warning(f"Test-vehicle grid unavailable ({ex}).")
 
 # ═════════════════════════════════ STEP 11 ═════════════════════════════════
 elif step == STEPS[11]:
-    st.title("11 · Limits, honesty & retraining")
+    st.title("11 · Data quality — which vehicles can we trust?")
+    st.markdown("Not every vehicle has **enough data to prove** how it's aging. A battery with only a few "
+                "valid months, or a short observation window, can look 'flat' just because we haven't "
+                "watched it long enough — training on it would teach the model a trend that isn't really "
+                "there. So we **document each vehicle's data quality** and train only on the trustworthy ones.")
+    concept("A vehicle is **trainable** only with enough valid SoH months AND a long enough age span to "
+            "confirm its trend; otherwise it's **data-thin** — excluded from training, and a candidate to "
+            "delete and re-download as a better-observed vehicle.")
+    dq = Path("data/manifests/vehicle_data_quality.csv")
+    if dq.exists():
+        q = pd.read_csv(dq)
+        cols = st.columns(3)
+        for col, oem in zip(cols, OEM_KEYS):
+            d = q[q["oem"] == oem]; thin = d[d["quality"] == "thin"]
+            col.markdown(f"### {oem}")
+            col.metric("Trainable vehicles", int((d["quality"] == "trainable").sum()))
+            col.metric("🚫 Data-thin (excluded)", int(len(thin)))
+            col.caption(f"{int((thin['vehicle_class']=='degrader').sum())} degraders + "
+                        f"{int((thin['vehicle_class']=='flat').sum())} flat too thin to trust")
+        st.markdown("#### The data-thin vehicles — free this space and re-import better-observed ones")
+        cc = ["oem", "vin", "model", "months", "span_months", "current_age_mo", "soh_drop",
+              "vehicle_class", "reasons"]
+        st.dataframe(q[q["quality"] == "thin"][cc].reset_index(drop=True), hide_index=True,
+                     use_container_width=True)
+        st.caption(f"Manifest `{dq}` — {int((q['quality']=='trainable').sum())} trainable / "
+                   f"{int((q['quality']=='thin').sum())} thin of {len(q)}; built by "
+                   "`src/build_data_quality.py`.")
+    else:
+        st.info("Run `python src/build_data_quality.py` to generate the data-quality manifest.")
+    st.warning("⚠️ This is a **data** decision, not a model one: we keep well-observed *flat* vehicles "
+               "(valuable negative examples) and only drop vehicles whose trend is **unprovable**. A "
+               "backtest showed this beats both 'use everything' and 'drop all flat vehicles'.")
+    takeaway("Documenting data quality stops us training on unprovable vehicles by mistake — and tells us "
+             "exactly which dense files to delete and replace with more useful, longer-history vehicles.")
+
+elif step == STEPS[12]:
+    st.title("12 · Limits, honesty & retraining")
     st.markdown("Good ML is **honest about what it doesn't know.** Each fleet's real data limits:")
     cols = st.columns(3)
     for col, oem in zip(cols, OEM_KEYS):
