@@ -91,6 +91,10 @@ def main(fast=False):
     m = pd.read_parquet(FT)
     m["month"] = pd.to_datetime(m["month"])
     m = m.sort_values(["vin", "month"])
+    import data_quality                                 # manifest-driven gate: never train on data-thin vehicles
+    before = m["vin"].nunique(); m = data_quality.apply_quality(m, "Euler")
+    if m["vin"].nunique() < before:
+        print(f"  data-quality gate: dropped {before - m['vin'].nunique()} thin vehicle(s)")
     g = m.groupby("vin")
     n_veh = int(m["vin"].nunique())
     n_deg = int((g["soh"].first() - g["soh"].last() >= 2).sum())
