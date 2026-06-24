@@ -47,6 +47,16 @@ OEMS = {
                    "several confidence levels)",
         lovo=dict(overall=3.15, model=4.62, persist=5.37, trend=4.85, band=None),
         label="Mahindra Treo / Zor electric-3-wheelers"),
+    "Bajaj": dict(
+        ft="data/bajaj/features/feature_table.parquet", module="bajaj_model",
+        soh_method="BMS-reported SoH",
+        soh_explain="Bajaj's battery management system reports its own SoH estimate directly — the feed "
+                    "has no current or voltage, so we can't measure capacity ourselves. We just clean the "
+                    "reported value (monthly median, kept non-increasing) and trust it.",
+        model_desc="**gradient-boosted decision trees** (LightGBM rate model). With no current/voltage, "
+                   "it leans on age, temperature, charge habits and mileage",
+        lovo=dict(overall=1.03, model=0.90, persist=3.08, trend=3.00, band=None),
+        label="Bajaj RE / cargo electric-3-wheelers"),
 }
 
 
@@ -123,25 +133,28 @@ def forecaster(oem_key):
 
 
 def forecast_demo(oem_key, m):
-    """Pick a clear teaching example (long history, moderate decline, sensible non-cliff forecast)."""
+    """Pick a clear teaching example (decent history, real decline, sensible non-cliff forecast)."""
     mod, fmodel = forecaster(oem_key)
-    g = m.groupby("vin")
-    o = pd.DataFrame({"months": g.size(), "s0": g.soh.first(), "s1": g.soh.last()})
+    H = 18 if oem_key == "Bajaj" else 30                  # Bajaj: short history + fast, steady decline
+    grp = m.groupby("vin")
+    o = pd.DataFrame({"months": grp.size(), "s0": grp.soh.first(), "s1": grp.soh.last()})
     o["dropp"] = o.s0 - o.s1
-    cand = o[(o.months >= 15) & (o.s1.between(83, 92)) & (o.dropp.between(3, 15))].sort_values("months", ascending=False)
+    min_mo = min(15, int(o.months.median()))
+    cand = o[(o.months >= min_mo) & (o.dropp >= 2)].sort_values("months", ascending=False)
     order = list(cand.index) or list(o.sort_values("months", ascending=False).index)
-    for vin in order:
+
+    def run(vin):
         gg = m[m["vin"] == vin].sort_values("month").reset_index(drop=True)
         if oem_key == "Euler":
-            fc = mod.forecast(gg, fmodel, 30); p10, p50, p90 = fc[0.1], fc[0.5], fc[0.9]
-        else:
-            sim = mod.simulate(gg, fmodel, 30); p10, p50, p90 = sim["q10"].to_numpy(), sim["q50"].to_numpy(), sim["q90"].to_numpy()
-        if 58 <= p50[-1] <= 83:
-            return gg, p10, p50, p90
-    gg = m[m["vin"] == order[0]].sort_values("month").reset_index(drop=True)
-    if oem_key == "Euler":
-        fc = mod.forecast(gg, fmodel, 30); return gg, fc[0.1], fc[0.5], fc[0.9]
-    sim = mod.simulate(gg, fmodel, 30); return gg, sim["q10"].to_numpy(), sim["q50"].to_numpy(), sim["q90"].to_numpy()
+            fc = mod.forecast(gg, fmodel, H); return gg, fc[0.1], fc[0.5], fc[0.9]
+        sim = mod.simulate(gg, fmodel, H)
+        return gg, sim["q10"].to_numpy(), sim["q50"].to_numpy(), sim["q90"].to_numpy()
+
+    for vin in order:
+        res = run(vin)
+        if res[2][-1] >= 50:                             # P50 doesn't cliff to ~0 — a clean teaching arc
+            return res
+    return run(order[0])
 
 
 def concept(t): st.info("💡 **Concept** — " + t)
@@ -406,8 +419,8 @@ elif step == STEPS[10]:
         fig.add_hline(y=80, line=dict(color=AMBER, dash="dash"), annotation_text="80% EoFL")
         fig.update_xaxes(title="age (months)", **AX); fig.update_yaxes(title="SoH %", **AX)
         fig.update_layout(**lay(height=420))
-        st.caption(f"Vehicle {g.vin.iloc[0][-6:]}: measured history (solid) + 30-month forecast (dashed) "
-                   f"with its uncertainty band.")
+        st.caption(f"Vehicle {g.vin.iloc[0][-6:]}: measured history (solid) + {len(p50)}-month forecast "
+                   f"(dashed) with its uncertainty band.")
         st.plotly_chart(fig, use_container_width=True)
     except Exception as ex:
         st.warning(f"Forecast demo unavailable ({ex}).")
