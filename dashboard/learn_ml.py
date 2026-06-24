@@ -253,10 +253,10 @@ def takeaway(t): st.success("✅ **Takeaway** — " + t)
 
 
 # ───────────────────────────── sidebar / navigation ─────────────────────────────
-_logo = next((p for p in (ROOT / "image.png", ROOT / "dashboard" / "image.png",
+_logo = next((p for p in (ROOT / "turno.gif", ROOT / "image.png", ROOT / "dashboard" / "image.png",
                            ROOT / "assets" / "image.png") if p.exists()), None)
 if _logo:
-    st.sidebar.image(str(_logo), width=150)
+    st.sidebar.image(str(_logo), width=170)
 st.sidebar.title("EV SoH Prediction Modeling")
 st.sidebar.caption("How our battery-health models are built — explained from scratch, **comparing all "
                    "three fleets side by side.**")
