@@ -232,7 +232,7 @@ def build_euler():
                 if len(mser) < 4:
                     continue
                 sm = mser.rolling(3, min_periods=1, center=True).median()
-                method, mlabel, note = "reported", "Mean of min_soh", REPORTED_NOTE
+                method, mlabel, note = "reported", "2022 batch · reported SoH", REPORTED_NOTE
             idx = pd.DatetimeIndex(sm.index); sm_values = sm.values
             age = (idx - idx[0]).days / 365.25
             a, b = np.polyfit(np.sqrt(age), sm_values, 1)[::-1]          # sqrt-time fade trend
@@ -262,7 +262,12 @@ def build_euler():
             km_month=(round(kmpm) if kmpm else None), rem_km=rem, rem_km_head=rem_head, rem_km_label=rem_label,
             status=status_of(proj_warr), at_risk=bool(proj_warr < EOFL - RISK_MARGIN),
             risk_reason=note, risk_factors=[])
-    return {v: out[v] for v in sorted(out, key=lambda v: (0 if len(out[v]["obs"]) >= 8 else 1, out[v]["now"]))}
+    # Representative method first: the BMS-capacity (+condition-aware model) cohort, then the 6 older
+    # 2022 reported-only vehicles LAST — so the dashboard defaults to a validated-method vehicle, not a
+    # reported-SoH one. Within each group: well-observed first, then lowest current SoH (real degraders).
+    return {v: out[v] for v in sorted(out, key=lambda v: (
+        1 if out[v]["method"] == "reported" else 0,
+        0 if len(out[v]["obs"]) >= 8 else 1, out[v]["now"]))}
 
 
 # ───────────────────────── Second life: fixed cubic ────────────────────────────────────────
