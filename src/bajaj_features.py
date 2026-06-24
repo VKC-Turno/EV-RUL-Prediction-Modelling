@@ -84,6 +84,18 @@ def monthly_features(df):
 
 
 def main():
+    # registration dates -> TRUE calendar age (months since registration), like Euler/Mahindra.
+    # The Bajaj feed only spans ~2025-09+, but vehicles registered earlier; without this, age would be
+    # measured from first telemetry (understating real age). regd_date is ISO (YYYY-MM-DD).
+    REG = {}
+    for rp in ("Bajaj_Regd_Details.csv", "data/bajaj/Bajaj_Regd_Details.csv"):
+        if Path(rp).exists():
+            r = pd.read_csv(rp); r["reg"] = pd.to_datetime(r["regd_date"], errors="coerce")
+            REG = dict(zip(r["vin"], r["reg"]))
+            print(f"  using registration dates from {rp} ({r['reg'].notna().sum()} dated VINs)")
+            break
+    if not REG:
+        print("  WARNING: no Bajaj_Regd_Details.csv found — age falls back to first-telemetry month")
     parts = []
     for fp in sorted(glob.glob("data/bajaj/dense/*.parquet")):
         vin = Path(fp).stem
@@ -94,8 +106,9 @@ def main():
             continue
         feat = monthly_features(df)
         m = soh.merge(feat, on="month", how="inner").sort_values("month")
-        # calendar age relative to first observed month (no reg-date feed for Bajaj telemetry)
-        base = m["month"].iloc[0]
+        # calendar age from registration where available (reg must predate first telemetry), else first month
+        r = REG.get(vin)
+        base = r if (r is not None and pd.notna(r) and r <= m["month"].iloc[0]) else m["month"].iloc[0]
         m["age_months"] = ((m["month"] - base).dt.days / 30.4).round(1)
         # monthly km from odometer (charge-cycle delta is a parallel usage signal)
         m["km_month"] = m["odo_max"].diff().clip(lower=0).fillna(0.0)

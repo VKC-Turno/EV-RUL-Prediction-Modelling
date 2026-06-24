@@ -56,7 +56,7 @@ OEMS = {
                     "reported value (monthly median, kept non-increasing) and trust it.",
         model_desc="**gradient-boosted decision trees** (LightGBM rate model). With no current/voltage, "
                    "it leans on age, temperature, charge habits and mileage",
-        lovo=dict(overall=1.03, model=0.90, persist=3.08, trend=3.00, band=None),
+        lovo=dict(overall=1.14, model=1.04, persist=3.08, trend=2.06, band=None),
         label="Bajaj RE / cargo electric-3-wheelers"),
 }
 
@@ -476,9 +476,7 @@ elif step == STEPS[10]:
     st.markdown("### 📋 Prediction vs actual — every held-out **test** vehicle")
     st.caption("For each test vehicle (never seen in training): measured SoH (teal) vs the model's forecast "
                "from 60% of its history (green dashed + uncertainty band), out to the warranty deadline. "
-               "Dotted = 80% EoFL · dash-dot = warranty horizon."
-               + (" ⚠ Bajaj age is measured from first telemetry, so its warranty line is approximate."
-                  if oem == "Bajaj" else ""))
+               "Dotted = 80% EoFL · dash-dot = warranty horizon.")
     try:
         warr_age = WARRANTY_YR[oem] * 12
         preds = test_predictions(oem, warr_age)
