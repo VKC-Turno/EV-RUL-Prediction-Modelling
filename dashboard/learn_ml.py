@@ -118,7 +118,8 @@ def diagnostics(oem_key):
     fi = sorted(zip(FEATS, [float(x) for x in reg.feature_importances_]), key=lambda x: -x[1])
     return {"sizes": {"train": len(TR), "validation": len(VA), "test": len(TE)},
             "errors": {"train": rmse(TR), "validation": rmse(VA), "test": rmse(TE)},
-            "fi": fi}
+            "fi": fi,
+            "splits": {"train": sorted(TR), "validation": sorted(VA), "test": sorted(TE)}}
 
 
 @st.cache_resource(show_spinner=False)
@@ -393,6 +394,23 @@ elif step == STEPS[5]:
     c[0].metric("🟢 Training set", f"{s['train']} vehicles", "the model LEARNS from these")
     c[1].metric("🟡 Validation set", f"{s['validation']} vehicles", "used to TUNE the model")
     c[2].metric("🔴 Test set", f"{s['test']} vehicles", "final UNSEEN exam")
+    st.caption("**The actual vehicles in each split** — observed SoH only (no forecast). They're *different* "
+               "vehicles in each group, each anchored to 100% at registration.")
+    sp = d["splits"]; colmap = {"train": GREEN, "validation": AMBER, "test": RED}
+    fig = make_subplots(rows=1, cols=3, horizontal_spacing=0.035,
+                        subplot_titles=[f"Training ({len(sp['train'])})",
+                                        f"Validation ({len(sp['validation'])})", f"Test ({len(sp['test'])})"])
+    for ci, key in enumerate(["train", "validation", "test"], start=1):
+        for vin in sp[key]:
+            gg = FEAT[FEAT.vin == vin].sort_values("age_months")
+            ax = [0] + gg.age_months.tolist(); sy = [100.0] + smooth(gg.soh).tolist()
+            fig.add_scatter(x=ax, y=sy, mode="lines", line=dict(color=colmap[key], width=1),
+                            opacity=0.45, row=1, col=ci, showlegend=False)
+    fig.add_hline(y=80, line=dict(color=AMBER, width=1, dash="dot"), row="all", col="all")
+    fig.update_yaxes(range=[55, 101], **AX); fig.update_xaxes(title="age (months)", **AX)
+    fig.update_annotations(font_size=12)
+    fig.update_layout(**lay(height=320, showlegend=False, margin=dict(l=30, r=12, t=30, b=36)))
+    st.plotly_chart(fig, use_container_width=True)
     concept("Like studying for an exam:\n\n• **Training set** = the textbook you study.\n"
             "• **Validation set** = practice papers to adjust your approach.\n"
             "• **Test set** = the *real* exam — questions you've never seen. Only this score is honest.")
