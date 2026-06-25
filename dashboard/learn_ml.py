@@ -401,6 +401,13 @@ def _forecast_fig(oem, h=330):
     if RENORM100[oem]:
         fig.add_scatter(x=[0, g.age_months.iloc[0] / 12], y=[100, sm.iloc[0]], mode="lines",
                         line=dict(color=TEAL, width=1.2, dash="dot"), showlegend=False)
+    else:                                              # Bajaj: telemetry starts months after registration
+        a1 = g.age_months.iloc[0] / 12
+        fig.add_vrect(x0=0, x1=a1, fillcolor="rgba(159,179,200,.06)", line_width=0)
+        fig.add_scatter(x=[0, a1], y=[sm.iloc[0], sm.iloc[0]], mode="lines",
+                        line=dict(color=GREY, width=1, dash="dot"), showlegend=False)
+        fig.add_annotation(x=0, y=sm.iloc[0], text="reg", showarrow=False, xanchor="left",
+                           yanchor="bottom", font=dict(color=GREY, size=9))
     fig.add_scatter(x=g.age_months / 12, y=sm, mode="markers+lines", line=dict(color=TEAL, width=2),
                     marker=dict(size=3), showlegend=False)
     fig.add_scatter(x=xc, y=c90, mode="lines", line=dict(width=0, color=GREY), showlegend=False)
@@ -436,6 +443,9 @@ def _testgrid_fig(oem):
         if RENORM100[oem]:
             fig.add_scatter(x=[0, age[0]], y=[100, sm.iloc[0]], mode="lines",
                             line=dict(color=TEAL, width=1, dash="dot"), row=r, col=c, showlegend=False)
+        else:                                          # Bajaj: telemetry starts months after registration
+            fig.add_scatter(x=[0, age[0]], y=[sm.iloc[0], sm.iloc[0]], mode="lines",
+                            line=dict(color=GREY, width=1, dash="dot"), row=r, col=c, showlegend=False)
         fig.add_scatter(x=age, y=sm.tolist(), mode="lines",
                         line=dict(color=TEAL, width=1.4), row=r, col=c, showlegend=False)
         fig.add_scatter(x=fage, y=p["p90"], mode="lines", line=dict(width=0, color=GREY),
@@ -446,6 +456,11 @@ def _testgrid_fig(oem):
                         line=dict(color=clr, width=1.8, dash="dash"), row=r, col=c, showlegend=False)
         fig.add_vline(x=p["warr_age"] / 12, line=dict(color="#9aa7b6", width=1, dash="dashdot"), row=r, col=c)
     fig.add_hline(y=eol, line=dict(color=AMBER, width=1, dash="dot"), row="all", col="all")
+    if not RENORM100[oem]:                                 # shade reg→first-telemetry gap (after row="all" hline)
+        for i, p in enumerate(preds):
+            r, c = i // ncols + 1, i % ncols + 1
+            fig.add_vrect(x0=0, x1=p["age"][0] / 12.0, fillcolor="rgba(159,179,200,.06)",
+                          line_width=0, layer="below", row=r, col=c)
     fig.update_yaxes(range=[min(eol - 10, 45), 101], **AX); fig.update_xaxes(dtick=1, **AX)
     fig.update_annotations(font_size=10)
     for i, flag in enumerate(risk):                       # red subplot title for at-risk vehicles
