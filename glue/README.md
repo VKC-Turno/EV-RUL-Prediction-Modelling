@@ -99,9 +99,11 @@ the healthy fleet (+18–43% RMSE). The quality gate (`data_quality.apply_qualit
 - **Mahindra dual-source** features (temp/GPS/dte) are stubbed — add the native-feed merge per
   `feature_logic.mahindra()` if your model's `FEATS` need them, else Mahindra trains on the coulomb+
   electrical subset.
-- **Quality gate**: prediction and training both call `data_quality.apply_quality`, which reads
-  `data/manifests/vehicle_data_quality.csv`. Ship that manifest in `src.zip` (or regenerate it in-job)
-  so thin vehicles are excluded in AWS too.
+- **Quality gate**: prediction and training call `data_quality.apply_quality`, which drops **only**
+  vehicles the manifest flags `quality == "thin"` and **keeps everything else** (incl. vehicles not in the
+  manifest — presumed OK), logging each exclusion + reason. For a NEW fleet, **regenerate the manifest** by
+  running `build_data_quality.py` on the freshly-built `feature_table` — don't just ship the local one (it
+  only knows the local cohort). Best wired as a Glue step between feature-extraction and persist/predict.
 - The `src/*_features.py` modules `os.chdir()` on import (harmless in Glue — they only affect the local
   file-based `main()`); guard it if your environment is strict.
 - Validate on **one OEM (Bajaj)** end-to-end before fanning out to all three.
