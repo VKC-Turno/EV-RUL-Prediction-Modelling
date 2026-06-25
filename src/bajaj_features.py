@@ -32,7 +32,7 @@ BOUNDS = {
 
 
 def load_clean(fp):
-    df = pd.read_parquet(fp)
+    df = fp if isinstance(fp, pd.DataFrame) else pd.read_parquet(fp)   # accept a DataFrame (Glue UDF) or a path
     df["t"] = pd.to_datetime(df["t"]) if "t" in df.columns else \
         pd.to_datetime(df["eventAt"].astype("int64"), unit="ms")
     for c, (lo, hi) in BOUNDS.items():
