@@ -8,5 +8,15 @@
     "degrading_rmse": 5.026,
     "flat_rmse": 1.797,
     "band_coverage": 0.799
+  },
+  {
+    "version": "euler_20260624",
+    "trained_at": "2026-06-24T20:49:26",
+    "n_vehicles": 119,
+    "n_degraders": 84,
+    "overall_rmse": 3.523,
+    "degrading_rmse": 5.027,
+    "flat_rmse": 1.797,
+    "band_coverage": 0.8
   }
 ]
