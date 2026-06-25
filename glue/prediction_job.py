@@ -15,7 +15,6 @@ Packaging: --extra-py-files s3://.../src.zip
 Deps:      --additional-python-modules pandas,pyarrow,xgboost,lightgbm,scikit-learn,s3fs
 """
 import sys
-import json
 import pickle
 import importlib
 from awsglue.utils import getResolvedOptions
@@ -49,7 +48,7 @@ def forecast(g):
     return sim["q10"].to_numpy(), sim["q50"].to_numpy(), sim["q90"].to_numpy()
 
 
-rows = []
+rows, monthly = [], []        # rows = one per vehicle (decisions); monthly = vehicle x forecast-month (curves)
 for vin, g in m.groupby("vin"):
     g = g.sort_values("month").reset_index(drop=True)
     if len(g) < 4:
@@ -60,19 +59,21 @@ for vin, g in m.groupby("vin"):
     hit = np.where(p50 <= EOL)[0]
     rul_months = int(hit[0] + 1) if len(hit) else None        # months from now until P50 crosses EoL
     months_to_warr = max(int(round(warr_age - cur_age)), 1)
-    at_risk_p50 = bool((p50[:months_to_warr] <= EOL).any())   # expected to cross EoL by warranty
-    at_risk_p10 = bool((p10[:months_to_warr] <= EOL).any())   # worst-case
     rows.append(dict(
         oem=OEM, vin=vin, asof_age_months=round(cur_age, 1), current_soh=round(cur_soh, 1),
         eol_pct=EOL, rul_months=rul_months, warranty_age_months=warr_age,
-        at_risk_by_warranty=at_risk_p50, at_risk_worstcase=at_risk_p10,
-        forecast_p50=json.dumps([round(float(x), 2) for x in p50]),
-        forecast_p10=json.dumps([round(float(x), 2) for x in p10]),
-        forecast_p90=json.dumps([round(float(x), 2) for x in p90])))
+        at_risk_by_warranty=bool((p50[:months_to_warr] <= EOL).any()),   # expected (P50) crosses EoL by warranty
+        at_risk_worstcase=bool((p10[:months_to_warr] <= EOL).any())))    # worst-case (P10)
+    for h in range(len(p50)):                                 # long trajectory: one row per forecast month
+        monthly.append(dict(oem=OEM, vin=vin, horizon_month=h + 1,
+                            forecast_age_months=round(cur_age + h + 1, 1),
+                            p10=round(float(p10[h]), 2), p50=round(float(p50[h]), 2),
+                            p90=round(float(p90[h]), 2)))
 
-out = pd.DataFrame(rows)
-dest = args["OUT_S3"].rstrip("/") + f"/predictions_{OEM}.parquet"
-with fs.open(dest, "wb") as f:
-    out.to_parquet(f, index=False)
-print(f"[prediction] OEM={OEM}: {len(out)} vehicles "
-      f"({int(out['at_risk_by_warranty'].sum())} at-risk by warranty) -> {dest}")
+base = args["OUT_S3"].rstrip("/")
+with fs.open(f"{base}/predictions_{OEM}.parquet", "wb") as f:
+    pd.DataFrame(rows).to_parquet(f, index=False)             # per-vehicle: at-risk flags + RUL + current SoH
+with fs.open(f"{base}/predictions_monthly_{OEM}.parquet", "wb") as f:
+    pd.DataFrame(monthly).to_parquet(f, index=False)          # per-(vehicle, forecast-month): p10/p50/p90 SoH
+print(f"[prediction] OEM={OEM}: {len(rows)} vehicles "
+      f"({sum(r['at_risk_by_warranty'] for r in rows)} at-risk), {len(monthly)} monthly rows -> {base}")

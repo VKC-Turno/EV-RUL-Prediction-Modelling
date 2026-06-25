@@ -81,10 +81,19 @@ Use a **Glue Workflow** with triggers: `persist_models` → (fan-out) 3× `featu
 `prediction`. Put it on a **scheduled trigger** (e.g. weekly `cron(0 3 ? * MON *)`) or fire on new-data
 via EventBridge. Run order: **compact (Mahindra) → persist_models → feature jobs → prediction jobs.**
 
-## Outputs
-- `features/oem=<oem>/` — the feature_table (one row per vehicle-month), Athena-queryable (crawl it).
-- `predictions/oem=<oem>/predictions_<oem>.parquet` — per vehicle: `current_soh`, `rul_months`,
-  `at_risk_by_warranty` (P50), `at_risk_worstcase` (P10), and JSON `forecast_p10/p50/p90` arrays.
+## Outputs (all Parquet on S3, Athena-queryable — crawl into the Glue Catalog)
+- `features/oem=<oem>/` — feature_table, **one row per vehicle-month**.
+- `predictions/oem=<oem>/predictions_<oem>.parquet` — **one row per vehicle** (the decision view):
+  `current_soh`, `rul_months`, `at_risk_by_warranty` (P50<EoL by warranty), `at_risk_worstcase` (P10),
+  `eol_pct`, `warranty_age_months`.
+- `predictions/oem=<oem>/predictions_monthly_<oem>.parquet` — **vehicle × forecast-month** (the curves):
+  `horizon_month`, `forecast_age_months`, `p10/p50/p90` SoH — the full trajectory in long, numeric form
+  (no JSON), so `WHERE horizon_month=24 AND p50<80` works directly.
+
+## Training options
+`persist_models` trains on all quality-gated vehicles. Add `--DEGRADERS_ONLY true` to train on degraders
+only — **default off and not recommended**: our A/B showed it gives no degrader-accuracy gain and hurts
+the healthy fleet (+18–43% RMSE). The quality gate (`data_quality.apply_quality`) is always applied.
 
 ## Caveats / TODO
 - **Mahindra dual-source** features (temp/GPS/dte) are stubbed — add the native-feed merge per

@@ -29,6 +29,10 @@ args = getResolvedOptions(sys.argv, ["FEATURE_ROOT_S3", "MODEL_ROOT_S3", "DATE"]
 OEMS = ["euler", "mahindra", "bajaj"]
 if "--OEMS" in sys.argv:
     OEMS = [o.strip().lower() for o in getResolvedOptions(sys.argv, ["OEMS"])["OEMS"].split(",")]
+# Opt-in: train on DEGRADERS only (drop flat vehicles). Default OFF — our A/B showed this does NOT help
+# degraders and HURTS healthy-fleet accuracy; the quality gate is the right lever. Kept for experiments.
+DEG_ONLY = ("--DEGRADERS_ONLY" in sys.argv and
+            getResolvedOptions(sys.argv, ["DEGRADERS_ONLY"])["DEGRADERS_ONLY"].lower() in ("true", "1", "yes"))
 MODULE = {"euler": "euler_model", "mahindra": "model", "bajaj": "bajaj_model"}
 fs = s3fs.S3FileSystem()
 
@@ -44,6 +48,9 @@ for oem in OEMS:
     feat = f"{args['FEATURE_ROOT_S3'].rstrip('/')}/oem={oem}/"
     m = data_quality.apply_quality(pd.read_parquet(feat), oem)
     m["month"] = pd.to_datetime(m["month"])
+    if DEG_ONLY:                                           # opt-in: keep only degraders (>=2pp drop)
+        d = m.groupby("vin")["soh"].agg(lambda s: s.iloc[0] - s.iloc[-1])
+        m = m[m["vin"].isin(d[d >= 2].index)]
     g = m.groupby("vin")
     n_veh = int(m["vin"].nunique())
     n_deg = int((g["soh"].first() - g["soh"].last() >= 2).sum())
