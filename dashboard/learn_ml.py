@@ -688,10 +688,22 @@ elif step == STEPS[6]:
 elif step == STEPS[7]:
     st.title("7 · Which clues mattered most? — Feature importance")
     st.markdown("After training, each model reports **how much it leaned on each feature** (bigger bar = "
-                "used more). Compare the three — they're **not the same**, because their feeds differ:")
+                "used more). Compare the three — they're **not the same**, because their feeds differ. The "
+                "line under each chart flags **thinly-populated features** — a clue can rank low simply "
+                "because it's mostly *missing data*, not because it doesn't matter.")
     cols = st.columns(3)
     for col, oem in zip(cols, OEM_KEYS):
         col.markdown(f"**{oem}**"); col.plotly_chart(_fi_fig(oem), use_container_width=True)
+        # data coverage of the model's features — surfaces e.g. Mahindra temp_max being ~7% populated
+        F = FEATS_BY[oem]; mfeats = importlib.import_module(OEMS[oem]["module"]).FEATS
+        cov = {f: float(F[f].notna().mean()) for f in mfeats if f in F.columns}
+        thin = sorted(((f, c) for f, c in cov.items() if c < 0.5), key=lambda x: x[1])
+        if thin:
+            col.caption("📉 **thin features** (mostly-missing data → bar is unreliable): "
+                        + " · ".join(f"`{f}` {c:.0%}" for f, c in thin))
+        else:
+            col.caption(f"📊 all {len(cov)} model features ≥50% populated "
+                        f"(median {100 * np.median(list(cov.values())):.0f}%).")
     concept("**Feature importance** opens the 'black box': which inputs drove predictions. Euler/Mahindra "
             "can lean on electrical & age signals; Bajaj — lacking current/voltage — leans on age, "
             "temperature, charge cycles and mileage. The *available* features shape what each model can use.")
