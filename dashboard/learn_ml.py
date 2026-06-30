@@ -112,7 +112,7 @@ def _split(vins, drop, seed=0, force_train=frozenset()):
 def diagnostics(oem_key, deg_only=False):
     """Train one model on the TRAIN split; report per-transition RMSE on each split + feature importance."""
     cfg = OEMS[oem_key]
-    m = data_quality.apply_quality(load_ft(cfg["ft"]), oem_key)   # drop data-thin; split FIXED regardless of deg_only
+    m = data_quality.apply_quality(load_cohort(oem_key), oem_key)   # drop data-thin; split FIXED regardless of deg_only
     mod = importlib.import_module(cfg["module"])
     FEATS = mod.FEATS
     g = m.groupby("vin")
@@ -151,7 +151,7 @@ def diagnostics(oem_key, deg_only=False):
 def forecaster(oem_key, deg_only=False):
     cfg = OEMS[oem_key]
     mod = importlib.import_module(cfg["module"])
-    m = deg_filter(data_quality.apply_quality(load_ft(cfg["ft"]), oem_key), deg_only)
+    m = deg_filter(data_quality.apply_quality(load_cohort(oem_key), oem_key), deg_only)
     if oem_key == "Euler":
         if not deg_only:                                  # use the persisted all-vehicle model
             import euler_train
@@ -236,7 +236,7 @@ def test_predictions(oem_key, deg_only=False):
     """Train on the NON-test vehicles, then for each TEST vehicle forecast from its latest data out to
     its own warranty deadline (= registration + warranty term). Returns per-vehicle actual + forecast."""
     cfg = OEMS[oem_key]
-    m = data_quality.apply_quality(load_ft(cfg["ft"]), oem_key)   # drop data-thin; TEST set FIXED regardless of deg_only
+    m = data_quality.apply_quality(load_cohort(oem_key), oem_key)   # drop data-thin; TEST set FIXED regardless of deg_only
     mod = importlib.import_module(cfg["module"])
     g = m.groupby("vin")
     drop = g["soh"].first() - g["soh"].last()
@@ -317,27 +317,29 @@ step = st.sidebar.radio("Steps", STEPS, label_visibility="collapsed")
 st.sidebar.markdown("---")
 
 OEM_KEYS = list(OEMS.keys())
-FEATS_BY = {o: load_ft(OEMS[o]["ft"]) for o in OEM_KEYS}
 
 
 @st.cache_data(show_spinner=False)
-def _redshift_cohort_cached(oem, _mtime, local_n):
-    p = f"data/redshift/{oem.lower()}_featengg.parquet"
-    r = pd.read_parquet(p).rename(columns={"ymd": "month"})
+def _store_cohort(oem, _mtime):
+    """Raw (ungated) Redshift store feature table, renamed to the local schema (ymd→month, str vin)."""
+    r = pd.read_parquet(f"data/redshift/{oem.lower()}_featengg.parquet").rename(columns={"ymd": "month"})
     r["month"] = pd.to_datetime(r["month"].astype(str)); r["vin"] = r["vin"].astype(str)
-    g = data_quality.apply_quality(r, oem)
-    return g if g["vin"].nunique() > local_n else None
+    return r
 
 
-def redshift_cohort(oem):
-    """The larger feature set already downloaded from the Redshift store (gated), for coverage views.
-    Cache-busts on the parquet's mtime so a re-download is picked up. Returns None if absent or not
-    bigger than the local modeled cohort."""
+def load_cohort(oem):
+    """The cohort the WHOLE dashboard runs on: prefer the full Redshift STORE table (much larger), fall
+    back to the local feature table when the store is absent or not bigger. Cache-busts on parquet mtime."""
     p = f"data/redshift/{oem.lower()}_featengg.parquet"
-    if not os.path.exists(p):
-        return None
-    local_n = data_quality.apply_quality(FEATS_BY[oem], oem)["vin"].nunique()
-    return _redshift_cohort_cached(oem, os.path.getmtime(p), local_n)
+    if os.path.exists(p):
+        store = _store_cohort(oem, os.path.getmtime(p))
+        if store["vin"].nunique() > load_ft(OEMS[oem]["ft"])["vin"].nunique():
+            return store
+    return load_ft(OEMS[oem]["ft"])
+
+
+FEATS_BY = {o: load_cohort(o) for o in OEM_KEYS}                          # store cohort where available
+LOCAL_N = {o: load_ft(OEMS[o]["ft"])["vin"].nunique() for o in OEM_KEYS}  # previous local size, for coverage
 _tv = sum(F.vin.nunique() for F in FEATS_BY.values()); _tm = sum(len(F) for F in FEATS_BY.values())
 st.sidebar.caption(f"Running example: **{_tv} vehicles** across Euler · Mahindra · Bajaj, "
                    f"{_tm:,} vehicle-months.")
@@ -785,17 +787,24 @@ elif step == STEPS[2]:
                             title=dict(text=f"Registered fleet by OEM — {sum(REG.values()):,} vehicles", font=dict(size=14))))
     fc1.plotly_chart(pie, use_container_width=True)
     fc1.caption("**Mahindra is ~74% of the fleet** — but it's also where SoH is hardest to measure (next chart).")
-    MH_BOTH = 233                                   # Intellicar (current) + native = coulomb-measurable = store cohort
-    MH_NATIVE_ONLY = REG["Mahindra"] - MH_BOTH
-    bar = go.Figure(go.Bar(x=["Native feed only<br>(no current → no SoH)", "Intellicar + native<br>(current → coulomb SoH)"],
-                           y=[MH_NATIVE_ONLY, MH_BOTH], marker_color=[GREY, TEAL],
-                           text=[f"{MH_NATIVE_ONLY:,}", f"{MH_BOTH:,}"], textposition="outside", cliponaxis=False))
-    bar.update_layout(**lay(height=340, showlegend=False, margin=dict(l=10, r=10, t=46, b=10),
-                            title=dict(text="Mahindra feed split — who carries a usable SoH signal", font=dict(size=14))))
-    bar.update_yaxes(title_text="vehicles", range=[0, REG["Mahindra"] * 1.1], **AX); bar.update_xaxes(**AX)
+    SOH_OK = {"Euler": REG["Euler"], "Mahindra": 233, "Bajaj": REG["Bajaj"]}   # feed carries a usable SoH signal
+    NO_SOH = {o: REG[o] - SOH_OK[o] for o in REG}
+    SMETHOD = {"Euler": "BMS capacity", "Mahindra": "coulomb (Intellicar)", "Bajaj": "reported SoH"}
+    xlab = [f"{o}<br>({SMETHOD[o]})" for o in REG]
+    bar = go.Figure()
+    bar.add_bar(name="usable SoH signal", x=xlab, y=[SOH_OK[o] for o in REG], marker_color=TEAL,
+                text=[f"{SOH_OK[o]:,}" for o in REG], textposition="outside", cliponaxis=False)
+    bar.add_bar(name="no usable SoH signal", x=xlab, y=[NO_SOH[o] for o in REG], marker_color=GREY,
+                text=[f"{NO_SOH[o]:,}" if NO_SOH[o] else "" for o in REG], textposition="inside")
+    bar.update_layout(barmode="stack", **lay(height=340, showlegend=True, margin=dict(l=10, r=10, t=58, b=10),
+                            title=dict(text="Who carries a usable SoH signal — by OEM", font=dict(size=14))))
+    bar.update_yaxes(title_text="registered vehicles", **AX); bar.update_xaxes(**AX)
     fc2.plotly_chart(bar, use_container_width=True)
-    fc2.caption("Only **~233 of 11,187 (≈2%)** Mahindra carry current via the Intellicar feed → coulomb SoH; the "
-                "other ~98% are **native-only** (no current, no SoH). Euler & Bajaj each have a single own feed.")
+    fc2.caption("Each bar = the registered fleet, split by whether the OEM's **feed carries a usable SoH signal**. "
+                "**Euler** (BMS capacity) and **Bajaj** (reported SoH) feeds carry it for ~the whole fleet — no "
+                "signal barrier. **Mahindra** is the outlier: its main feed has no current, so only **~233 of "
+                "11,187 (≈2%)** — the ones also on the Intellicar feed — are SoH-measurable; the other ~98% are "
+                "native-only. (How many we've actually *downloaded* is a separate limit — see Step 12 coverage.)")
 
     st.markdown("#### Which signals each fleet's feed provides")
     st.dataframe(availability_df(), hide_index=True, use_container_width=True)
@@ -1316,31 +1325,25 @@ elif step == STEPS[12]:
     # ── coverage: are we doing this for the WHOLE fleet, or just the downloaded subset? ──
     st.markdown("---")
     st.markdown("#### 📡 Coverage — are we doing this for the *whole* fleet?")
-    st.markdown("Everything above runs on the small **modeled local cohort**. But we've already downloaded much "
-                "larger feature sets (the Redshift store) — here's the full picture, and what the curation + "
-                "artifact audit look like **at that scale**:")
+    st.markdown("**This whole dashboard now runs on the full Redshift store cohort** (it used to run on a much "
+                "smaller *local* subset). Here's local-was vs what we run on now, with the curation + artifact "
+                "audit at that scale:")
     REG = {"Euler": 2132, "Mahindra": 11187, "Bajaj": 1803}
     cov = []
     for oem in OEM_KEYS:
-        local = data_quality.apply_quality(FEATS_BY[oem], oem)["vin"].nunique()
-        rs = redshift_cohort(oem)
-        if rs is not None:
-            cur = training_curation.curate(rs, EOL_PCT[oem], WARRANTY_YR[oem] * 12)
-            au = soh_audit.summary(rs, EOL_PCT[oem])
-            cov.append({"Fleet": oem, "Registered": REG[oem], "Modeled (local)": local,
-                        "Downloaded (store)": rs["vin"].nunique(),
-                        "✅ Good (store)": int(cur.bucket.isin(training_curation.GOOD).sum()),
-                        "🔴 At-risk": int((cur.bucket == "AT_RISK").sum()), "⚠️ Tainted": au["tainted"]})
-        else:
-            cov.append({"Fleet": oem, "Registered": REG[oem], "Modeled (local)": local,
-                        "Downloaded (store)": local, "✅ Good (store)": "—", "🔴 At-risk": "—", "⚠️ Tainted": "—"})
+        active = data_quality.apply_quality(FEATS_BY[oem], oem)
+        cur = training_curation.curate(active, EOL_PCT[oem], WARRANTY_YR[oem] * 12)
+        au = soh_audit.summary(active, EOL_PCT[oem])
+        cov.append({"Fleet": oem, "Registered": REG[oem], "Local (was)": LOCAL_N[oem],
+                    "Now running on": active["vin"].nunique(),
+                    "✅ Good": int(cur.bucket.isin(training_curation.GOOD).sum()),
+                    "🔴 At-risk": int((cur.bucket == "AT_RISK").sum()), "⚠️ Tainted": au["tainted"]})
     st.table(pd.DataFrame(cov).set_index("Fleet"))
-    st.warning("⚠️ **The store is a big, free coverage jump** — we can curate & audit **726 Euler / 222 Mahindra "
-               "/ 1,024 Bajaj** today (vs 119 / 84 / 57 modeled) using data we already have. The Mahindra store "
-               "(**233 vins** — we had mistakenly read only 3 from a stale local copy) is ≈ the **near-complete "
-               "both-feeds cohort**: essentially all the SoH-measurable Mahindra there is. **The remaining "
-               "ceilings are physical, not download-able:** **Mahindra** — only ~233 of 11,187 (≈2%) are "
-               "SoH-measurable at all (the rest are native-only: no current → no SoH, ever, without a new "
+    st.warning("⚠️ **We now model the full store — 726 Euler / 222 Mahindra / 1,024 Bajaj** (was 119 / 84 / 57). "
+               "The Mahindra store (**233 vins** — we'd mistakenly read only 3 from a stale local copy) is ≈ the "
+               "**near-complete both-feeds cohort**: essentially all the SoH-measurable Mahindra there is. **The "
+               "remaining ceilings are physical, not download-able:** **Mahindra** — only ~233 of 11,187 (≈2%) "
+               "are SoH-measurable at all (the rest are native-only: no current → no SoH, ever, without a new "
                "signal); **Bajaj** — no current/voltage telemetry, so the electrical recompute can't run there. "
                "So 'all vehicles' is bounded by *what each feed physically carries*, not just downloads.")
 

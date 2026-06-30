@@ -64,8 +64,10 @@ GLITCH_PP = 6.0      # |single-step SoH change| above this is treated as a capac
 #                      (2026-06-30): the old 10pp bound missed the 6-10pp BMS re-estimation jumps (soh_audit
 #                      CLIFF=6); confirmatory 5fold×3seed free-run MAE 3.42->3.29 (-0.12pp), winsorise≈drop so
 #                      we keep winsorise (preserves bounded large-loss signal; drop under-predicts degraders).
-#                      NOTE: affects the RATE model (diagnostics/free_run) only — the deployed TRAJECTORY model
-#                      (build_traj_samples) does not use this; glitch-cleaning the trajectory target is a TODO.
+#                      NOTE: this affects the RATE model (diagnostics/free_run) only. Cleaning the deployed
+#                      TRAJECTORY model's SoH target was TESTED (cliff-interp / median3 / monotone / theil-sen)
+#                      and REJECTED — null vs seed noise, adversarially verified: its cumulative-loss + √-horizon
+#                      formulation already absorbs the cliff/stuck artifacts. Keep the trajectory target RAW.
 GLITCH_CAP = 4.0     # winsorise the glitch transition's monthly loss target to this (pp/mo)
 
 
