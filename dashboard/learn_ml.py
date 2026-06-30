@@ -329,7 +329,8 @@ def smooth(s, win=5):
 STEPS = ["📋 Overview", "1 · The problem", "2 · The data", "3 · The target (SoH)", "4 · Features",
          "5 · Train / Validation / Test", "6 · Training the model", "7 · Which clues matter?",
          "8 · Errors & overfitting", "9 · A tougher test (LOVO)", "10 · Predicting the future",
-         "11 · Range & km left", "12 · Data quality", "13 · Limits & retraining"]
+         "11 · Range & km left", "12 · Data quality", "13 · Limits & retraining",
+         "14 · Validation & data needs"]
 step = st.sidebar.radio("Steps", STEPS, label_visibility="collapsed")
 st.sidebar.markdown("---")
 
@@ -758,6 +759,123 @@ def _fc_at_warranty(p, q="p50"):
     """Forecast quantile value at (the point closest to) the vehicle's warranty deadline."""
     fage = np.asarray(p["fage"])
     return float(np.asarray(p[q])[int(np.argmin(np.abs(fage - p["warr_age"])))])
+
+
+# ── validation-page analyses: held-out backtests + the data-sufficiency learning curve ──
+@st.cache_data(show_spinner="Backtesting held-out vehicles…")
+def _backtest_eval(oem_key, deg_only=False):
+    """Train on the non-test vehicles; for each held-out TEST vehicle anchor at the MIDPOINT of its history
+    and forecast the rest, comparing P50 to the actual later SoH. Returns per-vehicle records (measured +
+    forecast + MAE + usage + decline) for the actual-vs-predicted and usage views."""
+    cfg = OEMS[oem_key]; mod = importlib.import_module(cfg["module"]); euler = oem_key == "Euler"
+    m = data_quality.apply_quality(load_cohort(oem_key), oem_key)
+    gb = m.groupby("vin"); drop = gb["soh"].first() - gb["soh"].last()
+    smin = gb["soh"].min(); aged = set(smin[smin <= EOL_PCT[oem_key]].index)
+    TR, VA, TE = _split(list(m["vin"].unique()), drop, force_train=aged)
+    tr_vins = {v for v in (TR | VA) if drop[v] >= 2} if deg_only else (TR | VA)
+    model = (mod.train_traj(mod.build_traj_samples(m[m["vin"].isin(tr_vins)])) if euler
+             else mod.train_quantiles(mod.build_transitions(m[m["vin"].isin(tr_vins)])))
+    eol = EOL_PCT[oem_key]; recs = []
+    te = sorted(TE)                                              # subsample for speed — a mean MAE / usage
+    if len(te) > 120:                                           # distribution is reliable from ~120 vehicles
+        te = [te[i] for i in np.random.RandomState(0).choice(len(te), 120, replace=False)]
+    for vin in te:
+        g = m[m["vin"] == vin].sort_values("month").reset_index(drop=True); n = len(g)
+        if n < 6:
+            continue
+        cut = n // 2; hist = g.iloc[:cut + 1]; aa = float(hist["age_months"].iloc[-1])
+        H = int(round(g["age_months"].iloc[-1] - aa))
+        if H < 1:
+            continue
+        if euler:
+            fc = mod.forecast(hist, model, H); p50 = np.asarray(fc[0.5])
+        else:
+            p50 = mod.simulate(hist, model, H)["q50"].to_numpy()
+        errs = [abs(p50[d - 1] - float(r["soh"])) for _, r in g.iloc[cut + 1:].iterrows()
+                for d in [int(round(r["age_months"] - aa))] if 1 <= d <= len(p50)]
+        if not errs:
+            continue
+        last = float(hist["soh"].iloc[-1]); span = float(g["age_months"].iloc[-1] - g["age_months"].iloc[0])
+        usage = float(pd.to_numeric(g["km_month"], errors="coerce").clip(upper=15000).median()) if "km_month" in g else np.nan
+        recs.append(dict(vin=vin[-6:], n=n, span=span, cut_age=aa,
+                         age=g["age_months"].tolist(), soh=g["soh"].tolist(),
+                         fage=(aa + np.arange(0, H + 1)).tolist(), p50=[last] + p50[:H].tolist(),
+                         mae=float(np.mean(errs)), usage=usage,
+                         decline=float((g["soh"].iloc[0] - g["soh"].min()) / max(span, 1)),
+                         reached_eol=bool(g["soh"].min() <= eol)))
+    return recs
+
+
+@st.cache_data(show_spinner="Measuring how much history the model needs…")
+def _learning_curve(oem_key, deg_only=False):
+    """Forecast accuracy vs months of history. FIXED eval set (same vehicles for every anchor length so the
+    curve isn't confounded): for each anchor N (first N months) forecast the rest and average the MAE."""
+    cfg = OEMS[oem_key]; mod = importlib.import_module(cfg["module"]); euler = oem_key == "Euler"
+    m = data_quality.apply_quality(load_cohort(oem_key), oem_key)
+    G = {v: g.sort_values("month").reset_index(drop=True) for v, g in m.groupby("vin")}
+    rows = {v: len(G[v]) for v in G}
+    rmax = int(np.percentile(list(rows.values()), 90))
+    anchors = [a for a in (3, 4, 6, 8, 10, 12, 15, 18) if a <= rmax - 3]
+    ev = [v for v in G if rows[v] >= (anchors[-1] + 3)] if anchors else []
+    tr = [v for v in G if v not in set(ev)]
+    if not anchors or not ev or len(tr) < 10:
+        return [], [], 0
+    n_ev = len(ev)
+    if len(ev) > 80:                                            # subsample the eval set — a mean curve is stable
+        ev = [ev[i] for i in np.random.RandomState(1).choice(len(ev), 80, replace=False)]
+    model = (mod.train_traj(mod.build_traj_samples(m[m["vin"].isin(tr)])) if euler
+             else mod.train_quantiles(mod.build_transitions(m[m["vin"].isin(tr)])))
+    ns, maes = [], []
+    for N in anchors:
+        es = []
+        for v in ev:
+            g = G[v]; anc = g.iloc[:N]; aa = float(anc["age_months"].iloc[-1])
+            H = int(round(g["age_months"].iloc[-1] - aa))
+            if H < 1:
+                continue
+            p = (np.asarray(mod.forecast(anc, model, H)[0.5]) if euler else mod.simulate(anc, model, H)["q50"].to_numpy())
+            for j in range(N, len(g)):
+                d = int(round(g["age_months"].iloc[j] - aa))
+                if 1 <= d <= len(p):
+                    es.append(abs(p[d - 1] - float(g["soh"].iloc[j])))
+        ns.append(N); maes.append(float(np.mean(es)) if es else float("nan"))
+    return ns, maes, n_ev
+
+
+@st.cache_data(show_spinner="Backtesting example vehicles…")
+def _validation_demos(oem_key, deg_only=False):
+    """Pick a few COMPLETE-history vehicles (≤2 at-risk + ≤2 safe), train a model that EXCLUDES them, then
+    backtest each (anchor at the midpoint, forecast the rest) — an honest actual-vs-predicted on real journeys
+    (incl. aged ones, which the held-out test set never has because aged vehicles are forced into training)."""
+    cfg = OEMS[oem_key]; mod = importlib.import_module(cfg["module"]); euler = oem_key == "Euler"
+    m = data_quality.apply_quality(load_cohort(oem_key), oem_key); eol = EOL_PCT[oem_key]
+    o = m.groupby("vin").agg(nrow=("soh", "size"), smin=("soh", "min"), s0=("soh", "first"),
+                             a0=("age_months", "first"), a1=("age_months", "last"))
+    o["span"] = o["a1"] - o["a0"]; o["drop"] = o["s0"] - o["smin"]
+    o = o[o["nrow"] >= 6]
+    atr = list(o[(o["smin"] <= eol) | (o["drop"] >= 8)].sort_values(["span", "drop"], ascending=False).index[:2])
+    safe = list(o[(o["smin"] > eol) & (o["drop"] < 5)].sort_values("span", ascending=False).index[:2])
+    demos = atr + safe; labs = ["at-risk"] * len(atr) + ["safe"] * len(safe)
+    if not demos:
+        return []
+    train = m[~m["vin"].isin(set(demos))]
+    model = (mod.train_traj(mod.build_traj_samples(train)) if euler
+             else mod.train_quantiles(mod.build_transitions(train)))
+    recs = []
+    for vin, lab in zip(demos, labs):
+        g = m[m["vin"] == vin].sort_values("month").reset_index(drop=True); n = len(g)
+        cut = n // 2; hist = g.iloc[:cut + 1]; aa = float(hist["age_months"].iloc[-1])
+        H = int(round(g["age_months"].iloc[-1] - aa))
+        if H < 1:
+            continue
+        p50 = np.asarray(mod.forecast(hist, model, H)[0.5]) if euler else mod.simulate(hist, model, H)["q50"].to_numpy()
+        errs = [abs(p50[d - 1] - float(r["soh"])) for _, r in g.iloc[cut + 1:].iterrows()
+                for d in [int(round(r["age_months"] - aa))] if 1 <= d <= len(p50)]
+        last = float(hist["soh"].iloc[-1])
+        recs.append(dict(vin=vin[-6:], lab=lab, cut_age=aa, age=g["age_months"].tolist(), soh=g["soh"].tolist(),
+                         fage=(aa + np.arange(0, H + 1)).tolist(), p50=[last] + p50[:H].tolist(),
+                         mae=float(np.mean(errs)) if errs else float("nan")))
+    return recs
 
 
 # ═════════════════════════════════ STEP 0 ═════════════════════════════════
@@ -1418,3 +1536,100 @@ elif step == STEPS[13]:
     takeaway("That's the full pipeline across three fleets: problem → data → target → features → split → "
              "train → inspect → validate → forecast → retrain — raw telemetry to a warranty-risk call, "
              "end to end.")
+
+# ═════════════════════════════════ STEP 14 ═════════════════════════════════
+elif step == STEPS[14]:
+    st.title("14 · Validation — does it work, and how much data does it need?")
+    st.markdown("Three checks: **(a)** real held-out vehicles' measured SoH vs what the model predicted from "
+                "only **half** their history · **(b)** how accuracy improves as we feed it more months · "
+                "**(c)** whether accuracy holds across usage levels.")
+    OEMCOL = {"Euler": TEAL, "Mahindra": AMBER, "Bajaj": "#6f7fd6"}
+
+    # ---- (a) actual vs predicted ----
+    st.markdown("#### (a) Actual vs predicted — forecast from half a vehicle's history")
+    st.caption("Each vehicle was **never seen in training**. We anchor at the midpoint of its measured history "
+               "(teal), forecast the rest (dashed), and compare to what actually happened — a couple heading "
+               "toward end-of-life (**at-risk**) and a couple that stay healthy (**safe**), picked for the "
+               "longest histories.")
+    vtabs = st.tabs(OEM_KEYS)
+    for vt, oem in zip(vtabs, OEM_KEYS):
+        with vt:
+            try:
+                recs = _validation_demos(oem, DEG_ONLY); eol = EOL_PCT[oem]; a100 = RENORM100[oem]
+                if not recs:
+                    st.info("Not enough complete-history vehicles to backtest.")
+                else:
+                    vfig = make_subplots(rows=2, cols=2, vertical_spacing=0.14, horizontal_spacing=0.08,
+                                         subplot_titles=[f"…{d['vin']} · {'🔴 at-risk' if d['lab']=='at-risk' else '🟢 safe'} · err {d['mae']:.1f}pp" for d in recs])
+                    for i, d in enumerate(recs):
+                        r, c = i // 2 + 1, i % 2 + 1; clr = RED if d["lab"] == "at-risk" else GREEN
+                        age = np.asarray(d["age"]) / 12.0; fage = np.asarray(d["fage"]) / 12.0
+                        sm = smooth(pd.Series(d["soh"]))
+                        ax = ([0.0] + age.tolist()) if a100 else age.tolist()
+                        sy = ([100.0] + sm.tolist()) if a100 else sm.tolist()
+                        vfig.add_scatter(x=ax, y=sy, mode="lines", line=dict(color=TEAL, width=1.6), row=r, col=c, showlegend=False)
+                        vfig.add_scatter(x=fage, y=d["p50"], mode="lines", line=dict(color=clr, width=1.6, dash="dash"), row=r, col=c, showlegend=False)
+                        vfig.add_vline(x=d["cut_age"] / 12.0, line=dict(color="#7f8ea3", width=1, dash="dot"), row=r, col=c)
+                        vfig.add_hline(y=eol, line=dict(color=AMBER, width=1, dash="dot"), row=r, col=c)
+                    vfig.update_yaxes(range=[max(eol - 12, 45), 101], **AX); vfig.update_xaxes(title_text="age (years)", **AX)
+                    vfig.update_annotations(font_size=11)
+                    vfig.update_layout(**lay(height=540, showlegend=False, margin=dict(l=40, r=14, t=46, b=36)))
+                    st.plotly_chart(vfig, use_container_width=True)
+                    st.caption("Teal = measured · dashed = forecast P50 from the dotted anchor onward · amber = "
+                               "EoL · **err** = mean abs error (pp) over the forecast window. The model was "
+                               "trained **without** these vehicles and only saw the data left of the dotted line.")
+            except Exception as ex:
+                st.warning(f"Backtest unavailable ({ex}).")
+
+    # ---- (b) data sufficiency ----
+    st.markdown("---")
+    st.markdown("#### (b) How much history does the model need?")
+    st.caption("Same held-out vehicles each time; we give the model only the first **N months** of each and "
+               "forecast the rest. Error drops as N grows, then flattens — the **knee is the minimum history** "
+               "for a near-best forecast.")
+    lcfig = go.Figure(); knees = {}
+    for oem in OEM_KEYS:
+        ns, maes, nev = _learning_curve(oem, DEG_ONLY)
+        if not ns:
+            continue
+        lcfig.add_scatter(x=ns, y=maes, mode="lines+markers", name=f"{oem} (n={nev})", line=dict(color=OEMCOL[oem], width=2))
+        best = np.nanmin(maes); knees[oem] = next((n for n, mae in zip(ns, maes) if mae <= best + 0.3), ns[-1])
+    lcfig.update_xaxes(title_text="months of history given to the model", **AX)
+    lcfig.update_yaxes(title_text="forecast error (MAE, pp)", **AX)
+    lcfig.update_layout(**lay(height=380, margin=dict(l=52, r=20, t=30, b=46)))
+    st.plotly_chart(lcfig, use_container_width=True)
+    if knees:
+        st.caption("**Minimum useful history (knee):** " + " · ".join(f"{o} ≈ {k} mo" for o, k in knees.items())
+                   + ". Below it the forecast is materially less reliable; beyond it more history barely helps. "
+                   "(Young fleets like Bajaj cap how far the curve can go.)")
+
+    # ---- (c) usage-stratified ----
+    st.markdown("---")
+    st.markdown("#### (c) Does accuracy hold across usage levels? (and a defect/artifact check)")
+    st.caption("Held-out vehicles split into low / medium / high **km-per-month** bands — to check the model "
+               "isn't biased for any usage regime. The scatter flags **fast-decline + low-usage** vehicles: "
+               "the likeliest **SoH artifacts or defective packs**, since real wear needs real use.")
+    ucols = st.columns(3)
+    for col, oem in zip(ucols, OEM_KEYS):
+        ru = [r for r in _backtest_eval(oem, DEG_ONLY) if r["usage"] == r["usage"] and r["usage"] > 0]
+        col.markdown(f"**{oem}**")
+        if len(ru) < 6:
+            col.caption("not enough usage data"); continue
+        u = np.array([r["usage"] for r in ru]); mae = np.array([r["mae"] for r in ru])
+        t1, t2 = np.percentile(u, [33, 66])
+        for b, sel in (("low", u <= t1), ("med", (u > t1) & (u <= t2)), ("high", u > t2)):
+            col.caption(f"{b} use: MAE {np.mean(mae[sel]):.2f}pp (n={int(sel.sum())})")
+    scfig = go.Figure()
+    for oem in OEM_KEYS:
+        ru = [r for r in _backtest_eval(oem, DEG_ONLY) if r["usage"] == r["usage"] and r["usage"] > 0]
+        if ru:
+            scfig.add_scatter(x=[r["usage"] for r in ru], y=[r["decline"] for r in ru], mode="markers",
+                              name=oem, marker=dict(color=OEMCOL[oem], size=6, opacity=0.6))
+    scfig.add_hline(y=0.5, line=dict(color=RED, width=1, dash="dot"), annotation_text="fast decline", annotation_font_size=10)
+    scfig.update_xaxes(title_text="usage (km / month)", **AX); scfig.update_yaxes(title_text="observed decline (pp / month)", **AX)
+    scfig.update_layout(**lay(height=360, margin=dict(l=52, r=20, t=30, b=46)))
+    st.plotly_chart(scfig, use_container_width=True)
+    st.caption("**Top-left = fast decline despite low usage = likely a SoH artifact or a defective pack** (real "
+               "wear needs real use). Bottom-right = high-usage vehicles wearing as expected.")
+    takeaway("The model tracks held-out vehicles to within a few pp, needs roughly the knee-many months to be "
+             "reliable, and the usage view separates *real wear* from *suspect artifacts* — a built-in sanity check.")
