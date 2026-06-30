@@ -60,7 +60,12 @@ def _curv(age, soh):
 # to GLITCH_CAP rather than drop them, which keeps a (bounded) large-loss signal so the model can still
 # predict genuine fast decline, without the artifact extremes.  Backtest-validated (LOVO K=6 holdout):
 # winsorise+cap beats both keep-raw (RMSE) and drop (degrading-cohort under-prediction).
-GLITCH_PP = 10.0     # |single-step SoH change| above this is treated as a capacity glitch
+GLITCH_PP = 6.0      # |single-step SoH change| above this is treated as a capacity glitch. TIGHTENED 10->6
+#                      (2026-06-30): the old 10pp bound missed the 6-10pp BMS re-estimation jumps (soh_audit
+#                      CLIFF=6); confirmatory 5fold×3seed free-run MAE 3.42->3.29 (-0.12pp), winsorise≈drop so
+#                      we keep winsorise (preserves bounded large-loss signal; drop under-predicts degraders).
+#                      NOTE: affects the RATE model (diagnostics/free_run) only — the deployed TRAJECTORY model
+#                      (build_traj_samples) does not use this; glitch-cleaning the trajectory target is a TODO.
 GLITCH_CAP = 4.0     # winsorise the glitch transition's monthly loss target to this (pp/mo)
 
 

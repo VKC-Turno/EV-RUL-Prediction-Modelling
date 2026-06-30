@@ -78,7 +78,11 @@ OEM_FEEDS = {
 # Source: "0. Tech Specs for OEMs.xlsx" (docs). km in absolute km (1.2 lakh = 120000).
 WARRANTY = {
     "mahindra": [("grand", (5, 120000)), ("treo", (3, 120000)), ("zor", (3, 80000))],
-    "euler":    [("hi range", (6, 150000)), ("", (5, 125000))],
+    # Euler: HiLoad (our cargo cohort) corrected to 3yr/80k 2026-06-30 — the bare-default 5yr/125k was the
+    # passenger HiCity term mis-applied to HiLoad (HiLoad warranty 'unverified' in OEM_Model_Specs.csv;
+    # independent search: HiLoad vehicle = 3yr, 80-100k km, +2yr extended battery). PROVISIONAL — get official doc.
+    "euler":    [("hirange", (6, 150000)), ("hi range", (6, 150000)), ("hicity", (5, 125000)),
+                 ("hi city", (5, 125000)), ("", (3, 80000))],
     # Bajaj: no OEM spec sheet on hand. reg-date -> warranty_end_date in pricing CSV implies ~3 yr
     # (median ~3.2 yr across 34 sold/repo units). km limit unknown -> default 120k. Refine if spec found.
     "bajaj":    [("", (3, 120000))],

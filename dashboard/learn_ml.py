@@ -24,6 +24,9 @@ sys.path.insert(0, str(ROOT / "src")); sys.path.insert(0, str(ROOT))
 os.chdir(ROOT)
 
 import data_quality                                     # shared data-quality gate (drops data-thin vehicles)
+import rul_km                                            # SoH forecast -> remaining kilometres to end-of-life
+import soh_audit                                         # SoH-signal artifact audit (cliff / stuck-floor / iso-floor)
+import training_curation                                 # robust √t-smoothed training-set buckets
 
 _ico = ROOT / "turno_logo.png"
 st.set_page_config(page_title="Turno · EV SoH Prediction Modeling", layout="wide",
@@ -87,11 +90,17 @@ def deg_filter(m, on):
     return m[m["vin"].isin(d[d >= 2].index)]
 
 
-def _split(vins, drop, seed=0):
-    """By-vehicle 60/20/20 split, stratified so each split keeps degraders and flat vehicles."""
+def _split(vins, drop, seed=0, force_train=frozenset()):
+    """By-vehicle 60/20/20 split, stratified so each split keeps degraders and flat vehicles.
+    `force_train` vehicles (the completely-aged / reached-EoL ones) are ALL placed in train — they are
+    far too scarce to 'spend' on val/test, and a model can only *learn* end-of-life behaviour from
+    vehicles that actually reached it. (Honest aged-vehicle accuracy then comes from Step-9 LOVO, which
+    holds out each vehicle one at a time, not from the held-out test set.)"""
     rng = np.random.RandomState(seed)
-    out = [set(), set(), set()]
-    for grp in (sorted(v for v in vins if drop[v] >= 2), sorted(v for v in vins if drop[v] < 2)):
+    ft = set(force_train) & set(vins)
+    out = [set(ft), set(), set()]
+    pool = [v for v in vins if v not in ft]
+    for grp in (sorted(v for v in pool if drop[v] >= 2), sorted(v for v in pool if drop[v] < 2)):
         grp = list(grp); rng.shuffle(grp); n = len(grp)
         ntr, nva = int(n * 0.6), int(n * 0.2)
         for i, s in enumerate((grp[:ntr], grp[ntr:ntr + nva], grp[ntr + nva:])):
@@ -108,7 +117,8 @@ def diagnostics(oem_key, deg_only=False):
     FEATS = mod.FEATS
     g = m.groupby("vin")
     drop = (g["soh"].first() - g["soh"].last())
-    TR, VA, TE = _split(list(m["vin"].unique()), drop)
+    smin = g["soh"].min(); aged = set(smin[smin <= EOL_PCT[oem_key]].index)   # completely-aged -> always train
+    TR, VA, TE = _split(list(m["vin"].unique()), drop, force_train=aged)
     tr = {v for v in TR if drop[v] >= 2} if deg_only else TR   # toggle filters TRAIN only (val/test fixed)
     t_tr = mod.build_transitions(m[m["vin"].isin(tr)])
     if hasattr(mod, "train"):                       # Euler rate model (XGBoost regression)
@@ -180,7 +190,10 @@ def forecast_demo(oem_key, m, deg_only=False):
 
 # Representative warranty term (years) per OEM — drawn as the warranty deadline on the prediction plots.
 # (Euler 5 yr; Mahindra Treo 3 yr = the cohort majority; Bajaj ~3 yr.)
-WARRANTY_YR = {"Euler": 5, "Mahindra": 3, "Bajaj": 5}   # Bajaj RE/Maxima = 5 yr/120k km (verified spec sheet)
+WARRANTY_YR = {"Euler": 3, "Mahindra": 3, "Bajaj": 5}   # Euler HiLoad = 3yr (CORRECTED 2026-06-30; the old 5yr was
+# borrowed from the passenger HiCity/NEO model — our cohort is 100% HiLoad cargo). PROVISIONAL/unverified — get an
+# official Euler doc; src/config.py still encodes the wrong 5yr for the decision dashboard/reports. Bajaj RE = 5yr.
+WARRANTY_KM = {"Euler": 80000, "Mahindra": 120000, "Bajaj": 120000}   # Euler HiLoad ~80k km (was 125k = passenger term)
 EOL_PCT = {"Euler": 80, "Mahindra": 80, "Bajaj": 70}   # end-of-life SoH threshold per OEM (Bajaj = 70%)
 # Euler/Mahindra SoH is renormalised to 100% at registration (so we anchor the curve at 100 there); Bajaj
 # uses the ABSOLUTE BMS-reported SoH, so it legitimately starts below 100 — no 100% anchor (no fake drop).
@@ -227,7 +240,8 @@ def test_predictions(oem_key, deg_only=False):
     mod = importlib.import_module(cfg["module"])
     g = m.groupby("vin")
     drop = g["soh"].first() - g["soh"].last()
-    TR, VA, TE = _split(list(m["vin"].unique()), drop)
+    smin = g["soh"].min(); aged = set(smin[smin <= EOL_PCT[oem_key]].index)   # completely-aged -> always train
+    TR, VA, TE = _split(list(m["vin"].unique()), drop, force_train=aged)
     tr_vins = {v for v in (TR | VA) if drop[v] >= 2} if deg_only else (TR | VA)  # filter TRAIN only
     train = m[m["vin"].isin(tr_vins)]
     euler = oem_key == "Euler"
@@ -298,12 +312,32 @@ def smooth(s, win=5):
 STEPS = ["👋 Start here", "1 · The problem", "2 · The data", "3 · The target (SoH)", "4 · Features",
          "5 · Train / Validation / Test", "6 · Training the model", "7 · Which clues matter?",
          "8 · Errors & overfitting", "9 · A tougher test (LOVO)", "10 · Predicting the future",
-         "11 · Data quality", "12 · Limits & retraining"]
+         "11 · Range & km left", "12 · Data quality", "13 · Limits & retraining"]
 step = st.sidebar.radio("Steps", STEPS, label_visibility="collapsed")
 st.sidebar.markdown("---")
 
 OEM_KEYS = list(OEMS.keys())
 FEATS_BY = {o: load_ft(OEMS[o]["ft"]) for o in OEM_KEYS}
+
+
+@st.cache_data(show_spinner=False)
+def _redshift_cohort_cached(oem, _mtime, local_n):
+    p = f"data/redshift/{oem.lower()}_featengg.parquet"
+    r = pd.read_parquet(p).rename(columns={"ymd": "month"})
+    r["month"] = pd.to_datetime(r["month"].astype(str)); r["vin"] = r["vin"].astype(str)
+    g = data_quality.apply_quality(r, oem)
+    return g if g["vin"].nunique() > local_n else None
+
+
+def redshift_cohort(oem):
+    """The larger feature set already downloaded from the Redshift store (gated), for coverage views.
+    Cache-busts on the parquet's mtime so a re-download is picked up. Returns None if absent or not
+    bigger than the local modeled cohort."""
+    p = f"data/redshift/{oem.lower()}_featengg.parquet"
+    if not os.path.exists(p):
+        return None
+    local_n = data_quality.apply_quality(FEATS_BY[oem], oem)["vin"].nunique()
+    return _redshift_cohort_cached(oem, os.path.getmtime(p), local_n)
 _tv = sum(F.vin.nunique() for F in FEATS_BY.values()); _tm = sum(len(F) for F in FEATS_BY.values())
 st.sidebar.caption(f"Running example: **{_tv} vehicles** across Euler · Mahindra · Bajaj, "
                    f"{_tm:,} vehicle-months.")
@@ -340,6 +374,52 @@ def availability_df():
             row[o] = "✅" if any(c in cols for c in cands) else "—"
         rows.append(row)
     return pd.DataFrame(rows)
+
+
+# Per-OEM RAW-field audit (from docs/oem_fields_one_pager.md). ✅ usable · ⚠️ weak/caveats · ❌ not usable.
+_FCOLS = ["field", "what it is", "use for SoH / RUL", "data quality"]
+OEM_FIELD_AUDIT = {
+    "Euler — dense 2023+ feed (BMS remaining-capacity + current/voltage; strongest)": [
+        ("batteryRemainingCapacity", "Ah remaining", "✅ SoH target (BMS-capacity)", "94%"),
+        ("batteryCurrent", "pack current (signed)", "✅ Ah throughput / C-rate", "94%"),
+        ("batteryVoltage", "pack voltage", "✅ voltage-stress feature", "100%"),
+        ("batterySoh", "BMS reported SoH", "✅ SoH cross-check", "100% (coarse)"),
+        ("batterySoc", "state of charge %", "✅ cycling / DoD / dwell", "100%"),
+        ("batteryTemperature", "pack temp °C", "✅ thermal stress", "100%"),
+        ("cellImbalance", "cell imbalance", "✅ degradation signal", "68%"),
+        ("vehicleMode", "drive / charge mode", "⚠️ usage", "94%"),
+        ("odometer", "distance", "⚠️ km/RUL — noisy outliers", "100% present"),
+        ("eventAt, vin", "time, id", "✅ keys", "100%"),
+    ],
+    "Mahindra · Intellicar feed (has current — only ~2% of fleet, ~224 of ~11,000)": [
+        ("current", "pack current", "✅ coulomb SoH (only source w/ current)", "100%"),
+        ("soc", "state of charge %", "✅ ΔSoC for every method", "100%"),
+        ("batteryVoltage", "pack voltage", "✅ energy / health cross-check", "100%"),
+        ("odometer", "distance", "✅ distance-per-SoC", "93%"),
+        ("dte", "distance-to-empty", "⚠️ range-retention proxy", "100%"),
+        ("make, model", "OEM / variant", "⚠️ capacity context", "100%"),
+    ],
+    "Mahindra · Native OEM feed (~98% of fleet — NO current → SoH not measurable)": [
+        ("soc", "state of charge %", "⚠️ distance-per-SoC proxy only", "100% (garbage to clip)"),
+        ("odometer", "distance", "⚠️ distance-per-SoC", "100% (0 garbage)"),
+        ("distanceToEmpty", "range left", "⚠️ range proxy (fails)", "100%"),
+        ("batteryTemp", "pack temp °C", "✅ thermal feature", "~30% (−50/2001 outliers)"),
+        ("state", "DRIVE / CHARGE / IDLE", "✅ segmentation feature", "~30%"),
+        ("latitude, longitude", "GPS", "✅ climate / season proxy", "100%"),
+        ("gearPosition, vehicleModel", "usage / context", "⚠️ low value", "—"),
+        ("kwh", "instantaneous power", "❌ not cumulative → not integrable", "25%"),
+    ],
+    "Bajaj — verbose BMS feed (~10-month history; no current/voltage)": [
+        ("essBmsSohcEstPercValue", "reported SoH %", "✅ SoH target (clean, monotone)", "good"),
+        ("essBmsChgcycleActCountValue", "charge-cycle count", "✅ direct aging driver", "good"),
+        ("essBmsSocEstPercValue", "SoC %", "✅ cycling / dwell", "good"),
+        ("essBmsTemperatureActDegcValue", "pack temp °C", "✅ thermal", "good"),
+        ("etsVcuAmbienttempActDegcValue", "ambient temp °C", "✅ climate proxy", "good"),
+        ("etsVcuDriveeffEstWhpkmValue", "drive efficiency Wh/km", "⚠️ range-fade proxy", "ok"),
+        ("hmiIclOdoActMValue", "odometer (metres ÷1000)", "✅ km/RUL — clean", "good"),
+        ("evcChgInputenergycountActKwhValue", "charge input energy kWh", "❌ not cumulative", "weak"),
+    ],
+}
 
 
 # ── small per-OEM plot panels (compact, sized to sit three-across) ──
@@ -422,6 +502,150 @@ def _forecast_fig(oem, h=330):
     fig.update_yaxes(range=[60, 101], **AX)            # common 60–100% scale across all fleets
     fig.update_layout(**lay(height=h, margin=dict(l=40, r=8, t=22, b=34)))
     return fig, g.vin.iloc[0], len(p50), wyr
+
+
+# ── SoH → kilometres: range now (rated × SoH) + remaining km to EoL (× usage rate), mirrors src/rul_km.py ──
+RATED_KM = {"Euler": 120, "Mahindra": 80, "Bajaj": 178}   # rated (ARAI) full-charge range, km (OEM_Model_Specs.csv)
+RATED_KM_SRC = {                                          # OEM source for the promised range (per OEM_Model_Specs.csv)
+    "Euler": "https://eulermotors.com/en/hiload",
+    "Mahindra": "https://www.mahindralastmilemobility.com/treo-zor-dv",
+    "Bajaj": "https://www.bajajauto.com",
+}
+
+
+@st.cache_data(show_spinner=False)
+def _euler_rated():
+    p = Path("data/manifests/euler_variant_map.csv")
+    if not p.exists():
+        return {}
+    v = pd.read_csv(p)
+    return {k: float(x) for k, x in zip(v["vin"], pd.to_numeric(v["rated_km"], errors="coerce")) if pd.notna(x)}
+
+
+@st.cache_data(show_spinner=False)
+def _rul_order(oem):
+    """Ordered candidate vins for the warranty cards: most-degraded that REACHED warranty first; else oldest.
+    Returns (vins, reached_flag)."""
+    m = data_quality.apply_quality(FEATS_BY[oem], oem)
+    wyr, wkm = WARRANTY_YR[oem], WARRANTY_KM[oem]
+    a = m.groupby("vin").agg(n=("soh", "size"), cur=("soh", "last"),
+                             age=("age_months", "last"), odo=("odo_max", "max"))
+    a = a[a["n"] >= 8]; a["age_yr"] = a["age"] / 12; a["odoc"] = a["odo"].where(a["odo"] < 3e5)
+    reached = a[(a["age_yr"] >= wyr) | (a["odoc"] >= wkm)]             # reached warranty by time OR distance
+    if len(reached):
+        return list(reached.sort_values("cur").index), True           # worst SoH first
+    if len(a):
+        return list(a.sort_values("age_yr", ascending=False).index), False   # oldest first
+    return list(pd.unique(m["vin"])), False
+
+
+@st.cache_data(show_spinner=False)
+def _rul_demo(oem, deg_only, rank=0):
+    m = data_quality.apply_quality(FEATS_BY[oem], oem)
+    eol, wyr, wkm = EOL_PCT[oem], WARRANTY_YR[oem], WARRANTY_KM[oem]
+    order, reached_flag = _rul_order(oem)
+    vin = order[min(rank, len(order) - 1)]
+    g = m[m.vin == vin].sort_values("month").reset_index(drop=True)
+    cur = float(g.soh.iloc[-1]); a0m = float(g["age_months"].iloc[-1])
+    has_odo = "odo_max" in g.columns and bool((g["odo_max"] < 3e5).any())
+    odo_now = float(g["odo_max"][g["odo_max"] < 3e5].max()) if has_odo else None
+    reach_by = "km" if (odo_now is not None and odo_now >= wkm) else "age"
+    # near-term degradation rate from the model, then a LINEAR projection to EoL — avoids the rate model's
+    # asymptotic flattening (its predicted monthly loss decays to ~0 over a long horizon).
+    mod, fmodel = forecaster(oem, deg_only)
+    try:
+        p50 = (np.asarray(mod.forecast(g, fmodel, 18)[0.5], dtype="float64") if oem == "Euler"
+               else mod.simulate(g, fmodel, 18)["q50"].to_numpy())
+    except Exception:
+        p50 = np.array([cur])
+    k = min(12, len(p50))
+    model_rate = max((cur - float(p50[k - 1])) / k, 0.0) if k >= 1 else 0.0   # model near-term pp/month
+    span_m = max(a0m - float(g["age_months"].iloc[0]), 1.0)                   # this vehicle's observed life (months)
+    hist_rate = max((float(g["soh"].iloc[0]) - cur) / span_m, 0.0)           # ...and its observed degradation pace
+    rate = max(model_rate, hist_rate)                                        # faster of the two -> healthy ones still project
+    if rate > 0.01 and cur > eol:
+        mte = (cur - eol) / rate
+        npts = int(min(np.ceil((cur - (eol - 3)) / rate), 24))              # to ~3pp past EoL, capped at 2 yr
+        f_soh = cur - rate * np.arange(1, npts + 1)
+    else:
+        mte, f_soh = None, np.array([])                                     # truly flat -> no projection
+    kmpm = rul_km.km_per_month(g["age_months"], g["odo_max"]) if "odo_max" in g.columns else None
+    if kmpm is not None and (kmpm <= 0 or kmpm > 8000):               # gate dirty/sparse odometers
+        kmpm = None
+    rem_km = int(round(kmpm * mte)) if (kmpm and mte) else None
+    rated = float(RATED_KM[oem])                                       # one flat OEM rated -> range strictly = rated×SoH
+    ntr = len(f_soh)
+    f_odo = ((np.full(ntr, kmpm).cumsum() + odo_now).tolist() if (kmpm and odo_now and ntr) else None)
+    gc = g[g["odo_max"] < 3e5] if "odo_max" in g.columns else g.iloc[0:0]   # clean-odo trajectory (km-based plot)
+    return dict(vin=vin, cur=cur, eol=eol, mte=mte, kmpm=(int(round(kmpm)) if kmpm else None),
+                rem_km=rem_km, rated=rated, range_now=rated * cur / 100, range_eol=rated * eol / 100,
+                reached=reached_flag, reach_by=reach_by, age_yr=a0m / 12.0, odo=odo_now, wyr=wyr, wkm=wkm,
+                a_hist=(g["age_months"].to_numpy() / 12.0).tolist(), soh_hist=smooth(g["soh"]).to_numpy().tolist(),
+                f_age=((a0m + np.arange(1, ntr + 1)) / 12.0).tolist(), f_p50=f_soh.tolist(),
+                odo_hist=gc["odo_max"].to_numpy().tolist(), odo_soh=smooth(gc["soh"]).to_numpy().tolist(), f_odo=f_odo)
+
+
+_PAIRCOL = [TEAL, "#c792ff"]                                          # two-vehicle comparison colours
+
+
+def _range_fig(oem, infos, h=230):
+    rated, eol = infos[0]["rated"], infos[0]["eol"]
+    xs = np.linspace(100, eol - 3, 40)
+    fig = go.Figure()
+    # OEM promised (rated) range — the headline number, constant; actual range = rated × SoH falls below it
+    fig.add_hline(y=rated, line=dict(color=GREY, width=1.5, dash="dot"),
+                  annotation_text=f"OEM promised {rated:.0f} km", annotation_position="top right",
+                  annotation=dict(font=dict(color=GREY, size=10)))
+    fig.add_scatter(x=xs, y=rated * xs / 100, mode="lines", line=dict(color="#3a6b7e", width=2), showlegend=False)
+    fig.add_vline(x=eol, line=dict(color=AMBER, dash="dash"))
+    for j, info in enumerate(infos):                                  # each vehicle's "range now" on the rated line
+        fig.add_scatter(x=[info["cur"]], y=[info["range_now"]], mode="markers",
+                        marker=dict(color=_PAIRCOL[j % 2], size=12), name=f"…{info['vin'][-6:]}")
+    fig.update_xaxes(title="SoH %", autorange="reversed", **AX)        # 100% (new) on the left, aging to the right
+    fig.update_yaxes(title="full-charge range (km)", range=[0, rated * 1.12], **AX)
+    fig.update_layout(**lay(height=h, margin=dict(l=46, r=12, t=14, b=34),
+                            legend=dict(orientation="h", y=-0.28, font=dict(size=10))))
+    return fig
+
+
+def _rul_soh_fig(oem, infos, h=230):
+    """SoH for two warranty-vehicles overlaid: each measured (solid) + forecast (dashed) to EoL, with the binding
+    warranty limit marked. X-axis adapts: AGE (years) when time-bound, ODOMETER (km) when distance-bound."""
+    info0 = infos[0]; eol = info0["eol"]
+    use_km = info0.get("reach_by") == "km" and info0.get("odo_hist") and len(info0["odo_hist"]) >= 2
+    fig = go.Figure(); hi = 0.0
+    for j, info in enumerate(infos):
+        c = _PAIRCOL[j % 2]
+        if use_km:
+            x, y, fx, fy = info["odo_hist"], info["odo_soh"], info.get("f_odo"), info.get("f_p50")
+        else:
+            x, y, fx, fy = info["a_hist"], info["soh_hist"], info.get("f_age"), info.get("f_p50")
+        if not x:
+            continue
+        fig.add_scatter(x=x, y=y, mode="lines+markers", line=dict(color=c, width=2), marker=dict(size=3),
+                        name=f"…{info['vin'][-6:]}")
+        if fx and fy and len(fx) == len(fy):                          # bridge from the last measured point
+            fig.add_scatter(x=[x[-1]] + list(fx), y=[y[-1]] + list(fy), mode="lines",
+                            line=dict(color=c, width=2, dash="dash"), showlegend=False)
+        hi = max(hi, x[-1], (fx[-1] if fx else 0))
+    wline = info0["wkm"] if use_km else info0["wyr"]
+    wlabel = f"{info0['wkm']//1000}k-km warranty" if use_km else f"{info0['wyr']}-yr warranty"
+    xtitle = "odometer (km)" if use_km else "age (years)"
+    hi = max(hi, wline)
+    fig.add_hline(y=eol, line=dict(color=AMBER, dash="dash"), annotation_text=f"{eol}% EoL",
+                  annotation_position="bottom left")
+    fig.add_vline(x=wline, line=dict(color=GREY, width=1.5, dash="dashdot"), annotation_text=wlabel,
+                  annotation_position="top right", annotation=dict(font=dict(color=GREY, size=10)))
+    xa = dict(title=xtitle, range=[0, hi * 1.05 if use_km else hi + 0.3], **AX)
+    if not use_km:
+        xa["dtick"] = 1
+    fig.update_xaxes(**xa)
+    fig.update_yaxes(title="SoH %", range=[eol - 6, 101], **AX)        # bound to the data band (not down to 55)
+    fig.update_layout(**lay(height=h, margin=dict(l=44, r=12, t=10, b=34),
+                            legend=dict(orientation="h", y=-0.28, font=dict(size=10))))
+    return fig
+
+
 
 
 def _testgrid_fig(oem):
@@ -548,6 +772,31 @@ elif step == STEPS[2]:
     st.markdown("Each vehicle streams battery telemetry, summarised to **one row per vehicle per month**. "
                 "But the three feeds **don't carry the same sensors** — this table is the heart of the "
                 "comparison:")
+
+    # ── fleet at a glance: OEM-wise distribution (pie) + Mahindra native vs Intellicar split (bar) ──
+    st.markdown("#### Fleet at a glance — who's in it, and what we can actually measure")
+    REG = {"Euler": 2132, "Mahindra": 11187, "Bajaj": 1803}
+    OEMCOL = {"Euler": TEAL, "Mahindra": AMBER, "Bajaj": "#6f7fd6"}
+    fc1, fc2 = st.columns(2)
+    pie = go.Figure(go.Pie(labels=list(REG), values=list(REG.values()), hole=0.45, sort=False,
+                           marker=dict(colors=[OEMCOL[o] for o in REG], line=dict(color="#0e1726", width=2)),
+                           textinfo="label+percent", textfont_size=13))
+    pie.update_layout(**lay(height=340, showlegend=False, margin=dict(l=10, r=10, t=46, b=10),
+                            title=dict(text=f"Registered fleet by OEM — {sum(REG.values()):,} vehicles", font=dict(size=14))))
+    fc1.plotly_chart(pie, use_container_width=True)
+    fc1.caption("**Mahindra is ~74% of the fleet** — but it's also where SoH is hardest to measure (next chart).")
+    MH_BOTH = 233                                   # Intellicar (current) + native = coulomb-measurable = store cohort
+    MH_NATIVE_ONLY = REG["Mahindra"] - MH_BOTH
+    bar = go.Figure(go.Bar(x=["Native feed only<br>(no current → no SoH)", "Intellicar + native<br>(current → coulomb SoH)"],
+                           y=[MH_NATIVE_ONLY, MH_BOTH], marker_color=[GREY, TEAL],
+                           text=[f"{MH_NATIVE_ONLY:,}", f"{MH_BOTH:,}"], textposition="outside", cliponaxis=False))
+    bar.update_layout(**lay(height=340, showlegend=False, margin=dict(l=10, r=10, t=46, b=10),
+                            title=dict(text="Mahindra feed split — who carries a usable SoH signal", font=dict(size=14))))
+    bar.update_yaxes(title_text="vehicles", range=[0, REG["Mahindra"] * 1.1], **AX); bar.update_xaxes(**AX)
+    fc2.plotly_chart(bar, use_container_width=True)
+    fc2.caption("Only **~233 of 11,187 (≈2%)** Mahindra carry current via the Intellicar feed → coulomb SoH; the "
+                "other ~98% are **native-only** (no current, no SoH). Euler & Bajaj each have a single own feed.")
+
     st.markdown("#### Which signals each fleet's feed provides")
     st.dataframe(availability_df(), hide_index=True, use_container_width=True)
     st.caption("✅ = present in that OEM's feed. **Bajaj has no pack current or voltage**, so we can't "
@@ -562,6 +811,31 @@ elif step == STEPS[2]:
         col.markdown(f"**{oem}** — {F.vin.nunique()} veh · {len(F):,} rows · {F.shape[1]} cols")
         show = [c for c in ["month", "soh", "age_months", "temp_max", "soc_mean", "odo_max"] if c in F]
         col.dataframe(F[show].head(6).reset_index(drop=True), hide_index=True, use_container_width=True)
+    st.markdown("#### When does each fleet's data start — and who was captured *from new*?")
+    st.markdown("A vehicle only truly starts at **~100% SoH** if telemetry begins near its registration. If the "
+                "feed turned on *after* the vehicle was already in service, its first reading is already aged.")
+    wcols = st.columns(3)
+    for col, oem in zip(wcols, OEM_KEYS):
+        F = FEATS_BY[oem]; m = pd.to_datetime(F["month"]); fa = F.groupby("vin")["age_months"].min()
+        n = len(fa); new = int((fa <= 3).sum())
+        col.markdown(f"**{oem}** · data {m.min():%b %Y} → {m.max():%b %Y}")
+        col.metric("Captured ~new (start ≈100% SoH)", f"{new} / {n}",
+                   f"{100*new/n:.0f}% · median start age {fa.median():.0f} mo", delta_color="off")
+    st.caption("⚠️ **Bajaj** data only starts **Sep 2025**, so every Bajaj vehicle was already ~16 months old at "
+               "first telemetry — **0% captured new**. That's why Bajaj can't be anchored to 100% and we use its "
+               "**absolute** BMS-reported SoH. Euler (from Oct 2023) and Mahindra (from Mar 2023) capture far more "
+               "vehicles near-new, so their SoH is anchored to 100% at registration.")
+    st.markdown("#### Every raw field each OEM sends — and whether it's usable")
+    st.caption("The full per-OEM audit (also in `docs/oem_fields_one_pager.md`). "
+               "✅ usable · ⚠️ weak / caveats · ❌ not usable.")
+    for title, rows in OEM_FIELD_AUDIT.items():
+        with st.expander(title):
+            st.dataframe(pd.DataFrame(rows, columns=_FCOLS), hide_index=True, use_container_width=True)
+            if "Native OEM feed" in title:
+                st.caption("**Proxy-SoH coverage of 95 native vehicles** — *computable* but **none trustworthy**: "
+                           "distanceToEmpty **84** (corr ≈ −0.20) · distance-per-SoC **25** (≈ +0.22) · "
+                           "charge-energy/`kwh` **8** (≈ +0.32; kwh field in 84, plausible-scale in 22) · "
+                           "any **84/95** → native-only tier falls back to an **age prior**, not a proxy.")
     takeaway("ML needs **examples** — one per row. A model can only use clues its feed actually carries, so "
              "the three models necessarily lean on different features (Step 7 shows how differently).")
 
@@ -629,9 +903,22 @@ elif step == STEPS[5]:
                 "stratified so each keeps degraders and flat vehicles. **Columns = fleets, rows = the three "
                 "groups** (each shown on its own so you can see who's in it):")
     cols = st.columns(3)
+    aged_rows = []; risk_by_oem = {}
     for col, oem in zip(cols, OEM_KEYS):
-        s = diagnostics(oem, DEG_ONLY)["sizes"]
+        d = diagnostics(oem, DEG_ONLY); s = d["sizes"]; tr = d["splits"]["train"]
         col.markdown(f"**{oem}** — 🟢 {s['train']} · 🟡 {s['validation']} · 🔴 {s['test']}")
+        F = FEATS_BY[oem]; eol = EOL_PCT[oem]; wm = WARRANTY_YR[oem] * 12
+        o = ov(F); aged_vins = [v for v in tr if v in o.index and o.loc[v, "smin"] <= eol]
+        risk = []                                    # crossed EoL BEFORE its warranty deadline = early failure
+        for v in aged_vins:
+            below = F[(F.vin == v) & (F.soh <= eol)].sort_values("age_months")
+            if len(below) and float(below.age_months.iloc[0]) < wm:
+                risk.append(v)
+        risk_by_oem[oem] = risk
+        aged_rows.append({"Fleet": oem, "Train vehicles": s["train"],
+                          "Completely-aged": len(aged_vins),
+                          "↳ At-risk (failed in warranty)": len(risk),
+                          "↳ Graceful (post-warranty)": len(aged_vins) - len(risk)})
     splitnames = ["train", "validation", "test"]
     rowlab = {"train": "🟢 Training", "validation": "🟡 Validation", "test": "🔴 Test"}
     colmap = {"train": GREEN, "validation": AMBER, "test": RED}
@@ -655,6 +942,111 @@ elif step == STEPS[5]:
     fig.update_annotations(font_size=12)
     fig.update_layout(**lay(height=640, showlegend=False, margin=dict(l=42, r=44, t=44, b=40)))
     st.plotly_chart(fig, use_container_width=True)
+    st.markdown("##### 🔵 Completely-aged vehicles are forced into training — but what *kind* of aging is it?")
+    tot = {"Fleet": "**All fleets**",
+           "Train vehicles": sum(r["Train vehicles"] for r in aged_rows),
+           "Completely-aged": sum(r["Completely-aged"] for r in aged_rows),
+           "↳ At-risk (failed in warranty)": sum(r["↳ At-risk (failed in warranty)"] for r in aged_rows),
+           "↳ Graceful (post-warranty)": sum(r["↳ Graceful (post-warranty)"] for r in aged_rows)}
+    st.table(pd.DataFrame(aged_rows + [tot]).set_index("Fleet"))
+    st.error("⚠️ **All aged examples are early failures — there are 0 graceful-aging examples.** Every "
+             "completely-aged vehicle crossed EoL *inside* its warranty window (Euler from 11 mo, Mahindra "
+             "from 15 mo), so the only end-of-life behaviour the model ever sees is the **failure tail** — "
+             "biasing it toward over-predicting risk. **Bajaj has 0 aged at all**, so its long-horizon "
+             "forecast is pure *extrapolation* until real aged Bajaj exist. We also can't validate the "
+             "'98% survive' assumption from data — no vehicle has aged gracefully to EoL. Honest aged "
+             "accuracy now comes from **Step 9 (LOVO)**, not the held-out test set.")
+
+    # ── every vehicle per fleet: the healthy mass (grey) vs the completely-aged early-failures (red) ──
+    st.markdown("##### 🔎 *Every* vehicle's SoH trajectory — the healthy fleet (grey) vs the early-failures (red)")
+    aged_set = {o: set(risk_by_oem.get(o, [])) for o in OEM_KEYS}
+    gated = {o: data_quality.apply_quality(FEATS_BY[o], o) for o in OEM_KEYS}
+    ymin = 101.0
+    fig2 = make_subplots(rows=1, cols=3, horizontal_spacing=0.06, subplot_titles=[
+        f"{o} — {gated[o].vin.nunique()} vehicles · {len(aged_set[o])} reached EoL" for o in OEM_KEYS])
+    for ci, oem in enumerate(OEM_KEYS, start=1):
+        Fg = gated[oem]; eol = EOL_PCT[oem]; a100 = RENORM100[oem]
+        for is_aged, vins in ((False, [v for v in Fg.vin.unique() if v not in aged_set[oem]]),
+                              (True, list(aged_set[oem]))):       # grey first, red on top
+            for v in vins:
+                gg = Fg[Fg.vin == v].sort_values("age_months")
+                ax = ([0.0] if a100 else []) + (gg.age_months / 12).tolist()
+                sy = ([100.0] if a100 else []) + gg.soh.tolist()
+                ymin = min(ymin, min(sy))
+                fig2.add_scatter(x=ax, y=sy, mode="lines", row=1, col=ci, showlegend=False,
+                                 line=dict(color=(RED if is_aged else GREY), width=(1.4 if is_aged else 0.7)),
+                                 opacity=(0.8 if is_aged else 0.16))
+        fig2.add_hline(y=eol, line=dict(color=AMBER, dash="dash"), row=1, col=ci,
+                       annotation_text=f"{eol}% EoL", annotation_font_size=10)
+        fig2.add_vline(x=WARRANTY_YR[oem], line=dict(color=GREEN, dash="dot"), row=1, col=ci,
+                       annotation_text=f"{WARRANTY_YR[oem]}-yr warr", annotation_font_size=10)
+        fig2.update_xaxes(title_text="age (years)", row=1, col=ci, **AX)
+    fig2.update_yaxes(range=[max(ymin - 3, 55), 101], title_text="SoH %", **AX)
+    fig2.update_annotations(font_size=12)
+    fig2.update_layout(**lay(height=390, showlegend=False, margin=dict(l=46, r=16, t=48, b=42)))
+    st.plotly_chart(fig2, use_container_width=True)
+    st.caption("Every line is one vehicle in the fleet cohort. **Grey = the healthy majority** — they ride "
+               "near the top, mostly above the amber EoL line. **Red = the completely-aged early-failures** — "
+               "they dive below EoL well to the *left* of the green warranty line. Note **Bajaj's entire "
+               "fleet stays above its 70% EoL (0 red)**: nothing has reached end-of-life yet, so its "
+               "long-horizon forecast is pure extrapolation. (Some red dives are also partly SoH-pipeline "
+               "artifacts — frozen values / recalibration cliffs — see the data-quality note.)")
+
+    # ── curated training set: robust √t-smoothed buckets (the "good training data" selection to confirm) ──
+    st.markdown("---")
+    st.markdown("##### 🎯 Curated training set — robust √t-smoothed buckets *(confirm before retraining)*")
+    st.caption("Each vehicle's SoH is robustly **√t-smoothed** (Theil–Sen, ignores cliffs/stuck values) and "
+               "**projected to its warranty deadline**. 🟢 **graceful-aged** = aged/near-warranty that projects "
+               "to *survive*; ⚪ **genuine-flat**; 🟦 **probable out-of-risk** (young, projects safe); 🔴 "
+               "**at-risk** (projects < EoL even after cleaning); 🚫 **thin** (too little data to fit a trend).")
+    WARR_MO = {o: WARRANTY_YR[o] * 12 for o in OEM_KEYS}
+    cur = {o: training_curation.curate(data_quality.apply_quality(FEATS_BY[o], o), EOL_PCT[o], WARR_MO[o])
+           for o in OEM_KEYS}
+    BMAP = [("GRACEFUL", "🟢 Graceful-aged", GREEN), ("FLAT", "⚪ Genuine-flat", GREY),
+            ("PROBABLE_OOR", "🟦 Probable-OOR", TEAL), ("AT_RISK", "🔴 At-risk", RED),
+            ("EXCLUDED", "🚫 Thin", None)]
+    crows = []
+    for o in OEM_KEYS:
+        vc = cur[o].bucket.value_counts()
+        crows.append({"Fleet": o, **{lbl: int(vc.get(k, 0)) for k, lbl, _ in BMAP},
+                      "✅ Good total": int(cur[o].bucket.isin(training_curation.GOOD).sum())})
+    st.table(pd.DataFrame(crows).set_index("Fleet"))
+    cmin = 101.0
+    cfig = make_subplots(rows=1, cols=3, horizontal_spacing=0.06, subplot_titles=list(OEM_KEYS))
+    for ci, o in enumerate(OEM_KEYS, start=1):
+        Fg = data_quality.apply_quality(FEATS_BY[o], o); eol = EOL_PCT[o]; a100 = RENORM100[o]; warr = WARR_MO[o]
+        bk = cur[o].set_index("vin")
+        for k, _, color in BMAP:
+            if color is None:
+                continue
+            for v in bk[bk.bucket == k].index:
+                gg = Fg[Fg.vin == v].sort_values("age_months")
+                ax = ([0.0] if a100 else []) + (gg.age_months / 12).tolist()
+                sy = ([100.0] if a100 else []) + gg.soh.tolist()
+                cmin = min(cmin, min(sy))
+                cfig.add_scatter(x=ax, y=sy, mode="lines", line=dict(color=color, width=1.0),
+                                 opacity=0.5, row=1, col=ci, showlegend=False)
+                proj, smn = bk.loc[v, "proj"], bk.loc[v, "sm_now"]   # √t projection from smoothed-now, FORWARD only
+                if pd.notna(proj) and warr / 12 > ax[-1] + 1e-9:     # skip vehicles already past warranty age
+                    cmin = min(cmin, float(proj))
+                    cfig.add_scatter(x=[ax[-1], warr / 12], y=[float(smn), float(proj)], mode="lines",
+                                     line=dict(color=color, width=0.7, dash="dot"), opacity=0.3,
+                                     row=1, col=ci, showlegend=False)
+        cfig.add_hline(y=eol, line=dict(color=AMBER, dash="dash"), row=1, col=ci,
+                       annotation_text=f"{eol}% EoL", annotation_font_size=10)
+        cfig.add_vline(x=warr / 12, line=dict(color="#7f8ea3", dash="dot"), row=1, col=ci,
+                       annotation_text=f"{WARRANTY_YR[o]}-yr warr", annotation_font_size=10)
+        cfig.update_xaxes(title_text="age (years)", row=1, col=ci, **AX)
+    cfig.update_yaxes(range=[max(cmin - 3, 55), 101], title_text="SoH %", **AX)
+    cfig.update_annotations(font_size=12)
+    cfig.update_layout(**lay(height=400, showlegend=False, margin=dict(l=46, r=16, t=46, b=42)))
+    st.plotly_chart(cfig, use_container_width=True)
+    st.caption("Solid = observed, dotted = √t projection to warranty. Confirm: 🟢 glide above EoL near the "
+               "warranty line, 🔴 dip below, ⚪ stay flat. Rules in `src/training_curation.py` "
+               "(graceful = age ≥60% warranty or reached EoL · projects ≥EoL · ≥3pp decline). "
+               "✅ **Euler now uses the corrected 3-yr / 36-mo warranty** (the old 5-yr was borrowed from the "
+               "passenger HiCity/NEO model; our cohort is 100% HiLoad cargo) — this cut Euler at-risk **22→9** "
+               "and lifted graceful-aged **21→39**. Still PROVISIONAL: unverified pending an official Euler doc.")
     concept("Like studying for an exam: **train** = the textbook you study, **validation** = practice "
             "papers to adjust your approach, **test** = the *real* exam (questions you've never seen). Only "
             "the test score is honest.")
@@ -804,7 +1196,48 @@ elif step == STEPS[10]:
 
 # ═════════════════════════════════ STEP 11 ═════════════════════════════════
 elif step == STEPS[11]:
-    st.title("11 · Data quality — which vehicles can we trust?")
+    st.title("11 · From SoH to kilometres — range & km left")
+    st.markdown("Forecasting gives **SoH over time**. Two conversions turn that into the numbers a warranty needs:")
+    st.markdown("- **Range now ≈ rated full-charge range × SoH** — a 90%-SoH pack goes ~90% as far.\n"
+                "- **Remaining km to end-of-life = km/month × months-until-SoH-hits-EoL** (read off the forecast). "
+                "A high-utilisation vehicle therefore delivers *more* km before the same calendar-driven EoL.")
+    st.caption("Shown for the most-degraded vehicle in each fleet that has **reached its warranty boundary** "
+               "(time *or* distance, whichever it hit) — the real test of whether a battery survives the warranty. "
+               "Where the fleet is too young for any to have reached it, the **oldest** vehicle is shown and flagged.")
+    cols = st.columns(3)
+    for col, oem in zip(cols, OEM_KEYS):
+        order, reached = _rul_order(oem)
+        ranks = [0] if len(order) < 2 else ([0, max(1, len(order) // 4)] if reached else [0, 1])  # worst + a moderate one
+        infos, seen = [], set()
+        for r in ranks:                                              # two vehicles per OEM, for comparison
+            inf = _rul_demo(oem, DEG_ONLY, r)
+            if inf["vin"] not in seen:
+                seen.add(inf["vin"]); infos.append(inf)
+        col.markdown(f"**{oem}** · comparing {len(infos)} vehicles")
+        for j, info in enumerate(infos):
+            dot = "🟢" if j == 0 else "🟣"
+            if info["reached"]:
+                at = f"{info['odo']/1000:.0f}k km" if info["reach_by"] == "km" else f"{info['age_yr']:.1f} yr"
+                mark = "✅" if info["cur"] > info["eol"] + 2 else "⚠️"
+                col.caption(f"{dot} …{info['vin'][-6:]}: {mark} reached warranty (**{at}**) at **SoH "
+                            f"{info['cur']:.0f}%** · range {info['range_now']:.0f} km")
+            else:
+                col.caption(f"{dot} …{info['vin'][-6:]}: oldest **{info['age_yr']:.1f} yr** at **SoH "
+                            f"{info['cur']:.0f}%** (not yet at warranty) · range {info['range_now']:.0f} km")
+        col.plotly_chart(_rul_soh_fig(oem, infos), use_container_width=True)
+        col.caption("SoH measured → forecast (dashed); grey dash-dot = warranty (axis = the binding limit).")
+        col.plotly_chart(_range_fig(oem, infos), use_container_width=True)
+        col.caption(f"…converts to range. Grey dotted = OEM promised **{infos[0]['rated']:.0f} km** "
+                    f"(ARAI · [source]({RATED_KM_SRC[oem]})); blue line = rated × SoH.")
+    concept("This is exactly what `src/rul_km.py` computes (and the SoH/RUL decision dashboard shows). "
+            "Remaining-km needs a **clean odometer**: Bajaj has one; Mahindra's is too sparse; Euler's field "
+            "odometer is noisy — shown as *n/a* rather than a confidently wrong number.")
+    takeaway("**SoH → range now** (rated × SoH) and **SoH forecast → km-to-EoL** (× usage rate) are the two "
+             "numbers a data-backed warranty is built on. ARAI ranges are optimistic (real-world ~30–40% lower); "
+             "what we add is the *fade* and the *remaining distance*.")
+
+elif step == STEPS[12]:
+    st.title("12 · Data quality — which vehicles can we trust?")
     st.markdown("Not every vehicle has **enough data to prove** how it's aging. A battery with only a few "
                 "valid months, or a short observation window, can look 'flat' just because we haven't "
                 "watched it long enough — training on it would teach the model a trend that isn't really "
@@ -836,11 +1269,87 @@ elif step == STEPS[11]:
     st.warning("⚠️ This is a **data** decision, not a model one: we keep well-observed *flat* vehicles "
                "(valuable negative examples) and only drop vehicles whose trend is **unprovable**. A "
                "backtest showed this beats both 'use everything' and 'drop all flat vehicles'.")
-    takeaway("Documenting data quality stops us training on unprovable vehicles by mistake — and tells us "
-             "exactly which dense files to delete and replace with more useful, longer-history vehicles.")
 
-elif step == STEPS[12]:
-    st.title("12 · Limits, honesty & retraining")
+    # ── SoH-signal artifact audit: is the SoH we DO have real degradation or pipeline noise? ──
+    st.markdown("---")
+    st.markdown("#### 🔬 Is the SoH *signal itself* trustworthy? — measurement-artifact audit")
+    st.markdown("Data-thin (above) is about *how much* data; this is about whether the SoH numbers we **do** "
+                "have are real degradation or **pipeline artifacts**. Three patterns — verified by hand on the "
+                "completely-aged vehicles — corrupt the signal:")
+    st.markdown("- **Cliff** — a single-month SoH drop ≥6pp: physically impossible for Li-ion, a BMS capacity "
+                "*re-estimation jump* (e.g. Euler …217380 sat flat at 90.6 then dropped −24.6pp in one month). "
+                "Corrupts the monthly-loss target the rate model trains on.\n"
+                "- **Stuck-floor** — SoH frozen at its minimum for ≥5 months after a real drop: a held/stale "
+                "value (Euler …217158 reported *exactly* 79.0 for 18 straight months).\n"
+                "- **Iso-floor** *(Mahindra only)* — the monotone envelope pinned ≥2pp *below* a raw coulomb "
+                "signal that had recovered (H48636: raw climbed back to 81% but the envelope froze at 78.5%).")
+    arows = []
+    for oem in OEM_KEYS:
+        s = soh_audit.summary(data_quality.apply_quality(FEATS_BY[oem], oem), EOL_PCT[oem])
+        arows.append({"Fleet": oem, "Vehicles": s["n"], "✅ Clean": s["clean"], "⚠️ Tainted": s["tainted"],
+                      "· Cliff": s["cliff"], "· Stuck": s["stuck"], "· Iso-floor": s["iso"],
+                      "Aged tainted": f"{s['aged_tainted']} / {s['aged']}"})
+    asum = lambda k: sum(r[k] for r in arows)
+    aged_t = sum(int(r["Aged tainted"].split(" / ")[0]) for r in arows)
+    aged_n = sum(int(r["Aged tainted"].split(" / ")[1]) for r in arows)
+    arows.append({"Fleet": "**All fleets**", "Vehicles": asum("Vehicles"), "✅ Clean": asum("✅ Clean"),
+                  "⚠️ Tainted": asum("⚠️ Tainted"), "· Cliff": asum("· Cliff"), "· Stuck": asum("· Stuck"),
+                  "· Iso-floor": asum("· Iso-floor"), "Aged tainted": f"{aged_t} / {aged_n}"})
+    st.table(pd.DataFrame(arows).set_index("Fleet"))
+    st.error(f"🔬 **{aged_t} of the {aged_n} completely-aged vehicles carry an artifact** — the model's "
+             "end-of-life signal is almost entirely contaminated; only **2** (Euler …217146, …217092) show "
+             "clean gradual aging to EoL. **Bajaj is ~98% clean** (smooth reported SoH, no envelope) — its "
+             "problem is purely that *nothing has aged*. **Euler & Mahindra (~⅓ tainted)** carry the envelope "
+             "+ recalibration artifacts. **Implication: fix the SoH pipeline before trusting long-horizon "
+             "at-risk numbers** — a cliff/stuck/iso-floor doesn't just add noise, it biases the rare "
+             "end-of-life examples the model leans on. Detector: `src/soh_audit.py`.")
+    st.info("🔬 **Can we get a *cleaner* SoH instead?** We tested two alternatives for Euler (LFP fleet) and "
+            "**neither is a drop-in replacement**: (1) re-deriving SoH from dense electrical signals via "
+            "**segment coulomb-counting** — physically sound but far too noisy (9–28pp month-to-month, "
+            "segment-starved on the worst vehicles, confirming coulomb is broken on this field data); (2) the "
+            "BMS's **native `batterySoh`** field — garbage-laden (values of 0 and >70,000) and where clean it "
+            "reads ~10–20pp *higher* than our remaining-capacity SoH. Useful signal though: the native estimate "
+            "brackets the truth from *above* and remaining-capacity from *below*, so some 'aged' Euler vehicles "
+            "are likely **less degraded than the stuck-floor SoH suggests**. (scripts in scratchpad; "
+            "see `src/soh_audit.py`.)")
+
+    # ── coverage: are we doing this for the WHOLE fleet, or just the downloaded subset? ──
+    st.markdown("---")
+    st.markdown("#### 📡 Coverage — are we doing this for the *whole* fleet?")
+    st.markdown("Everything above runs on the small **modeled local cohort**. But we've already downloaded much "
+                "larger feature sets (the Redshift store) — here's the full picture, and what the curation + "
+                "artifact audit look like **at that scale**:")
+    REG = {"Euler": 2132, "Mahindra": 11187, "Bajaj": 1803}
+    cov = []
+    for oem in OEM_KEYS:
+        local = data_quality.apply_quality(FEATS_BY[oem], oem)["vin"].nunique()
+        rs = redshift_cohort(oem)
+        if rs is not None:
+            cur = training_curation.curate(rs, EOL_PCT[oem], WARRANTY_YR[oem] * 12)
+            au = soh_audit.summary(rs, EOL_PCT[oem])
+            cov.append({"Fleet": oem, "Registered": REG[oem], "Modeled (local)": local,
+                        "Downloaded (store)": rs["vin"].nunique(),
+                        "✅ Good (store)": int(cur.bucket.isin(training_curation.GOOD).sum()),
+                        "🔴 At-risk": int((cur.bucket == "AT_RISK").sum()), "⚠️ Tainted": au["tainted"]})
+        else:
+            cov.append({"Fleet": oem, "Registered": REG[oem], "Modeled (local)": local,
+                        "Downloaded (store)": local, "✅ Good (store)": "—", "🔴 At-risk": "—", "⚠️ Tainted": "—"})
+    st.table(pd.DataFrame(cov).set_index("Fleet"))
+    st.warning("⚠️ **The store is a big, free coverage jump** — we can curate & audit **726 Euler / 222 Mahindra "
+               "/ 1,024 Bajaj** today (vs 119 / 84 / 57 modeled) using data we already have. The Mahindra store "
+               "(**233 vins** — we had mistakenly read only 3 from a stale local copy) is ≈ the **near-complete "
+               "both-feeds cohort**: essentially all the SoH-measurable Mahindra there is. **The remaining "
+               "ceilings are physical, not download-able:** **Mahindra** — only ~233 of 11,187 (≈2%) are "
+               "SoH-measurable at all (the rest are native-only: no current → no SoH, ever, without a new "
+               "signal); **Bajaj** — no current/voltage telemetry, so the electrical recompute can't run there. "
+               "So 'all vehicles' is bounded by *what each feed physically carries*, not just downloads.")
+
+    takeaway("Documenting data quality stops us training on unprovable vehicles by mistake — and tells us "
+             "exactly which dense files to delete and replace with more useful, longer-history vehicles. "
+             "The artifact audit goes further: it flags where the SoH *values themselves* need fixing.")
+
+elif step == STEPS[13]:
+    st.title("13 · Limits, honesty & retraining")
     st.markdown("Good ML is **honest about what it doesn't know.** Each fleet's real data limits:")
     cols = st.columns(3)
     for col, oem in zip(cols, OEM_KEYS):
