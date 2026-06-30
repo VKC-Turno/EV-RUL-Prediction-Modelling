@@ -16,6 +16,10 @@ Fleet is LFP across all three OEMs. Unlike NMC/NCA cells, LFP tolerates sitting 
 high state-of-charge well — for LFP the dominant calendar-aging stressor is HEAT
 (high pack temperature, and high SoC × high temperature together). The "why it
 matters" copy below reflects that, and does NOT repeat NMC-style "high SoC is bad".
+
+Layout: one uniform design system — full-width container, a single stat-card
+component, full-bleed charts (no mismatched side-by-side columns), and one chart
+styler so every section looks identical and premium.
 """
 from __future__ import annotations
 
@@ -63,17 +67,18 @@ HOT_C = 35.0
 # ---------------------------------------------------------------------------
 # Dark "premium" palette.
 # ---------------------------------------------------------------------------
-BG = "#0e1116"
-PANEL = "#171b22"
+BG = "#0c0f14"
+PANEL = "#161a21"
 PANEL2 = "#1d222b"
-LINE = "#262c36"
-TEXT = "#e8edf4"
+LINE = "#242b36"
+TEXT = "#eef2f8"
 MUTE = "#8a95a5"
 FAINT = "#5b6675"
 GREEN = "#34d17f"
 AMBER = "#f3b14e"
 RED = "#ef5d63"
 BLUE = "#5aa9f7"
+GREEN_FILL = "rgba(52,209,127,.16)"
 
 st.set_page_config(page_title="Battery Health", layout="wide", page_icon="🔋")
 
@@ -127,6 +132,7 @@ def vehicle_index(oem: str) -> pd.DataFrame:
             continue
         drop = float(g["soh"].head(3).mean() - g["soh"].tail(3).mean())
         rows.append(dict(vin=vin, n_months=n, last_soh=float(g["soh"].iloc[-1]),
+                         soh_start=float(g["soh"].iloc[0]),
                          drop=drop if np.isfinite(drop) else 0.0,
                          age=float(g["age_months"].max()) if "age_months" in g else np.nan))
     idx = pd.DataFrame(rows)
@@ -151,6 +157,129 @@ def fleet_stat(oem: str, col: str):
 
 
 # ===========================================================================
+# Personalisation — per-vehicle behaviour vs the fleet (age-matched, LFP-tuned)
+# ===========================================================================
+# For every metric below, a HIGHER value = harsher on the pack (gentler = lower).
+# High-SoC dwell is deliberately EXCLUDED — LFP tolerates a full pack; heat and
+# hard, high-current use are the real stressors. Currents are stored as abs().
+_BEH_COLS = {"cur_chg_mean": "charge_i", "cur_dis_mean": "drive_i", "cur_abs_p95": "peak_i",
+             "crate_p95": "crate", "ah_throughput": "throughput", "dod_mean": "dod",
+             "frac_soc_low": "lowdwell", "temp_mean": "temp", "dte_mean": "range",
+             "capacity_ah": "cap", "km_month": "km", "cyc_month": "cyc_month"}
+_CARE_METRICS = ["charge_i", "drive_i", "peak_i", "crate", "throughput", "dod", "lowdwell", "temp"]
+_LEVER_LABEL = {"temp": ("running hot", "park and charge in the shade"),
+                "peak_i": ("hard peak pulls", "smoother starts and lighter peak loads"),
+                "crate": ("hard peak pulls", "smoother starts and lighter peak loads"),
+                "drive_i": ("hard driving", "smoother acceleration"),
+                "throughput": ("heavy throughput", "spreading out very heavy days where you can"),
+                "dod": ("deep discharges", "topping up before it runs low"),
+                "lowdwell": ("deep discharges", "recharging before it runs near-empty")}
+
+
+@st.cache_data(show_spinner=False)
+def behaviour_table(oem: str) -> pd.DataFrame:
+    """One row per vehicle: lifetime-mean of each behaviour metric (abs for currents) + age + SoH now.
+    Only columns that exist for the OEM are filled. Used for fleet percentile ranking."""
+    df = load_oem(oem)
+    rows = []
+    for vin, g in df.groupby("vin"):
+        soh = pd.to_numeric(g["soh"], errors="coerce").dropna()
+        if soh.empty:
+            continue
+        rec = {"vin": vin, "soh_now": float(soh.iloc[-1]),
+               "age": float(pd.to_numeric(g.get("age_months"), errors="coerce").max())}
+        for src, key in _BEH_COLS.items():
+            if src in g.columns:
+                s = pd.to_numeric(g[src], errors="coerce")
+                if src == "km_month":
+                    s = s.where((s >= 0) & (s <= 15000))
+                s = s.dropna()
+                if len(s):
+                    rec[key] = abs(float(s.mean())) if src in ("cur_chg_mean", "cur_dis_mean") else float(s.mean())
+        rows.append(rec)
+    return pd.DataFrame(rows)
+
+
+def vehicle_behaviour(frame) -> dict:
+    """This vehicle's lifetime behaviour values, keyed like behaviour_table (mean_val resolves at call time)."""
+    out = {}
+    for src, key in _BEH_COLS.items():
+        v = mean_val(frame, src)
+        if v is not None:
+            out[key] = abs(v) if src in ("cur_chg_mean", "cur_dis_mean") else v
+    return out
+
+
+def _col(bt, name):
+    return bt[name] if (name in getattr(bt, "columns", [])) else pd.Series(dtype=float)
+
+
+def gentler_than(series, value):
+    """% of the fleet HARSHER (higher) than this value — i.e. 'you are gentler than X%'. Needs >=8 peers."""
+    s = series.dropna()
+    if value is None or not np.isfinite(value) or len(s) < 8:
+        return None
+    return round(float((s > value).mean() * 100), 0)
+
+
+def harsher_than(series, value):
+    """% of the fleet BELOW this value — for 'better than X%' on a higher-is-better metric (range/SoH)."""
+    s = series.dropna()
+    if value is None or not np.isfinite(value) or len(s) < 8:
+        return None
+    return round(float((s < value).mean() * 100), 0)
+
+
+def peer_soh_rank(bt, age, soh, window=6):
+    """Age-matched: % of similar-age vehicles with LOWER SoH than this one (falls back to whole fleet)."""
+    if bt.empty or soh is None or not np.isfinite(soh):
+        return None, 0
+    band = bt[(bt["age"] >= age - window) & (bt["age"] <= age + window)] if np.isfinite(age) else bt
+    s = band["soh_now"].dropna()
+    if len(s) < 10:
+        s = bt["soh_now"].dropna()
+    if len(s) < 10:
+        return None, len(s)
+    return round(float((s < soh).mean() * 100), 0), len(s)
+
+
+def care_score(bt, rv):
+    g = [gentler_than(_col(bt, k), rv[k]) for k in _CARE_METRICS if k in rv]
+    g = [x for x in g if x is not None]
+    return round(float(np.mean(g)), 0) if g else None
+
+
+def care_grade(score):
+    if score is None:
+        return ("—", MUTE)
+    if score >= 72:
+        return ("Gentle", GREEN)
+    if score >= 50:
+        return ("Moderate", GREEN)
+    if score >= 35:
+        return ("Firm", AMBER)
+    return ("Hard", RED)
+
+
+def style_word(gpct, words=("Firm", "Typical", "Gentle")):
+    if gpct is None:
+        return "—"
+    return words[2] if gpct >= 66 else (words[1] if gpct >= 33 else words[0])
+
+
+def top_levers(bt, rv, n=2):
+    seen, scored = set(), []
+    for k, (label, action) in _LEVER_LABEL.items():
+        if k in rv and label not in seen:
+            h = harsher_than(_col(bt, k), rv[k])
+            if h is not None and h >= 60:
+                seen.add(label)
+                scored.append((h, label, action))
+    scored.sort(reverse=True)
+    return scored[:n]
+
+
+# ===========================================================================
 # √t projection (robust, clamped so health can't rise with age)
 # ===========================================================================
 def _theilsen(x: np.ndarray, y: np.ndarray):
@@ -164,31 +293,33 @@ def _theilsen(x: np.ndarray, y: np.ndarray):
 
 
 def project(age_months, soh, eol: float) -> dict | None:
-    """soh ≈ a − b·√age, clamped non-increasing, projected forward to EoL."""
+    """Robust √t decline (slope ≤ 0), but ANCHORED at the present measured SoH so the projection is
+    continuous with the measured line — it starts exactly where the battery is now, not at a smoothed
+    fit value (which, for cliff-laden SoH like Mahindra's, would float above the last reading)."""
     age = np.asarray(age_months, dtype=float)
     soh = np.asarray(soh, dtype=float)
     m = np.isfinite(age) & np.isfinite(soh)
     age, soh = age[m], soh[m]
     if len(age) < 3:
         return None
-    x = np.sqrt(np.clip(age, 0, None))
-    slope, inter = _theilsen(x, soh)
-    if slope > 0:
-        slope, inter = 0.0, float(np.median(soh))
+    order = np.argsort(age); age, soh = age[order], soh[order]
+    slope, _ = _theilsen(np.sqrt(np.clip(age, 0, None)), soh)   # robust √t slope (deceleration-aware)
+    slope = min(slope, 0.0)                                     # health can't rise with age
+    now_age = float(age[-1]); now_soh = float(soh[-1])          # anchor at the LATEST measured point
+    inter = now_soh - slope * np.sqrt(max(now_age, 0.0))        # so the line passes through (now_age, now_soh)
 
     def fit(t):
         t = np.asarray(t, dtype=float)
         return inter + slope * np.sqrt(np.clip(t, 0, None))
 
-    now_age = float(age.max())
-    if slope < -1e-9:
+    if slope < -1e-9 and now_soh > eol:
         root = (eol - inter) / slope
-        t_eol = root * root if root > 0 else 0.0
+        t_eol = root * root if root > 0 else now_age
         months_to_eol = max(0.0, t_eol - now_age)
     else:
-        months_to_eol = None
+        months_to_eol = None                                   # flat, or already at/below EoL
     return dict(fit=fit, slope=slope, inter=inter, now_age=now_age,
-                now_soh=float(fit(now_age)), months_to_eol=months_to_eol)
+                now_soh=now_soh, months_to_eol=months_to_eol)
 
 
 # ===========================================================================
@@ -220,87 +351,123 @@ def fmt_months_human(months):
     return "now" if months <= 0 else fmt_age(months)
 
 
-def section(label: str, title: str):
-    """Tesla-style: small uppercase monospace label + big title."""
+def section(label: str, title: str, sub: str | None = None):
+    """Small uppercase monospace label + big title + optional one-line subtitle."""
+    sub_html = (f"<div style='color:{MUTE};font-size:0.98rem;margin-top:4px;'>{sub}</div>"
+                if sub else "")
     st.markdown(
-        f"<div style='margin:34px 0 4px 0;'>"
+        f"<div style='margin:42px 0 18px 0;'>"
         f"<div style='font-family:ui-monospace,SFMono-Regular,Menlo,monospace;"
-        f"font-size:0.72rem;letter-spacing:0.16em;color:{FAINT};"
+        f"font-size:0.72rem;letter-spacing:0.18em;color:{FAINT};"
         f"text-transform:uppercase;'>{label}</div>"
-        f"<div style='font-size:1.6rem;font-weight:700;color:{TEXT};margin-top:2px;'>"
-        f"{title}</div></div>",
+        f"<div style='font-size:1.62rem;font-weight:700;color:{TEXT};margin-top:3px;"
+        f"letter-spacing:-0.01em;'>{title}</div>{sub_html}</div>",
         unsafe_allow_html=True,
     )
 
 
 def big_number(value: str, unit: str = "", color: str = TEXT):
-    return (f"<span style='font-size:2.6rem;font-weight:700;color:{color};'>{value}</span>"
+    return (f"<span style='font-size:2.6rem;font-weight:700;color:{color};"
+            f"letter-spacing:-0.02em;'>{value}</span>"
             f"<span style='font-size:1.0rem;color:{MUTE};margin-left:6px;'>{unit}</span>")
 
 
-def split_bar(frac: float, c_left: str, c_right: str, h: int = 14):
-    """Two-tone horizontal split bar (left fraction filled c_left)."""
-    p = float(np.clip(frac, 0, 1)) * 100
+def card(label: str, value: str, sub: str | None = None, color: str = TEXT) -> str:
+    """Uniform stat-card markup. Equal min-height so a row of them always lines up."""
+    sub_html = (f"<div style='color:{FAINT};font-size:0.78rem;margin-top:5px;'>{sub}</div>"
+                if sub else "")
     return (
-        f"<div style='display:flex;height:{h}px;border-radius:7px;overflow:hidden;"
-        f"background:{c_right};'>"
-        f"<div style='width:{p:.1f}%;background:{c_left};'></div></div>"
+        f"<div style='background:{PANEL};border:1px solid {LINE};border-radius:16px;"
+        f"padding:18px 20px;min-height:108px;'>"
+        f"<div style='color:{MUTE};font-size:0.74rem;font-weight:600;text-transform:uppercase;"
+        f"letter-spacing:0.05em;'>{label}</div>"
+        f"<div style='color:{color};font-size:1.85rem;font-weight:700;margin-top:8px;"
+        f"line-height:1.05;letter-spacing:-0.02em;'>{value}</div>{sub_html}</div>"
     )
 
 
-def legend_row(color: str, label: str, value: str):
-    return (
-        f"<div style='display:flex;align-items:center;gap:10px;margin-top:8px;'>"
-        f"<span style='width:11px;height:11px;border-radius:3px;background:{color};"
-        f"display:inline-block;'></span>"
-        f"<span style='color:{MUTE};flex:1;'>{label}</span>"
-        f"<span style='color:{TEXT};font-weight:600;'>{value}</span></div>"
-    )
+def stat_strip(items):
+    """Render a row of equal-width uniform stat cards. items = (label, value[, sub[, color]])."""
+    cols = st.columns(len(items), gap="medium")
+    for col, it in zip(cols, items):
+        label, value = it[0], it[1]
+        sub = it[2] if len(it) > 2 else None
+        color = it[3] if len(it) > 3 else TEXT
+        with col:
+            st.markdown(card(label, value, sub, color), unsafe_allow_html=True)
 
 
 def why(text: str, sources: str | None = None):
-    s = (f"<div style='color:{FAINT};font-size:0.78rem;margin-top:8px;'>Sources: {sources}</div>"
+    s = (f"<div style='color:{FAINT};font-size:0.78rem;margin-top:10px;'>Sources: {sources}</div>"
          if sources else "")
     st.markdown(
-        f"<div style='color:{MUTE};font-size:0.95rem;line-height:1.6;margin-top:10px;'>"
-        f"{text}</div>{s}", unsafe_allow_html=True,
+        f"<div style='color:{MUTE};font-size:0.96rem;line-height:1.65;margin-top:16px;"
+        f"max-width:980px;'>{text}</div>{s}", unsafe_allow_html=True,
     )
 
 
-def hist_with_zone(values, marker, threshold, lower_good=True, unit=""):
-    """Distribution histogram with a coloured 'aging zone' past the threshold +
-    a dotted marker at this vehicle's value."""
+def _polish(fig, height: int = 320, legend: bool = False):
+    """One styler for every chart -> uniform bg, grid, font, margins. Merges with each
+    chart's own axis titles (plotly update_layout recurses into sub-objects)."""
+    fig.update_layout(
+        height=height, paper_bgcolor=PANEL, plot_bgcolor=PANEL,
+        font=dict(color=MUTE, size=12), margin=dict(l=18, r=18, t=20, b=16),
+        xaxis=dict(gridcolor=LINE, color=MUTE, zeroline=False),
+        yaxis=dict(gridcolor=LINE, color=MUTE, zeroline=False),
+        showlegend=legend, hoverlabel=dict(bgcolor=PANEL2, font_color=TEXT, bordercolor=LINE),
+    )
+    if legend:
+        fig.update_layout(legend=dict(orientation="h", x=0, y=1.04, yanchor="bottom",
+                                      bgcolor="rgba(0,0,0,0)", font=dict(color=MUTE, size=11)))
+    return fig
+
+
+def chart(fig, height: int = 320, legend: bool = False):
+    """Full-width, uniformly-styled chart wrapped in a premium card."""
+    with st.container(border=True):
+        st.plotly_chart(_polish(fig, height, legend), use_container_width=True,
+                        config={"displayModeBar": False})
+
+
+def soc_density_fig(soc_mean, frac_low, frac_high):
+    """Approximate SoC distribution from the summary stats we track (time at low / typical / high charge).
+    We don't get the full per-percent histogram, so the shape is representative — the mass is real."""
+    fl = max(float(frac_low or 0.0), 0.0); fh = max(float(frac_high or 0.0), 0.0)
+    fm = max(1.0 - fl - fh, 0.05); mid = float(np.clip(soc_mean if soc_mean else 55.0, 35.0, 78.0))
+    x = np.linspace(0, 100, 240)
+    y = (fl * np.exp(-0.5 * ((x - 16) / 9) ** 2) + fm * np.exp(-0.5 * ((x - mid) / 13) ** 2)
+         + fh * np.exp(-0.5 * ((x - 88) / 8) ** 2))
+    y = y / (y.max() or 1.0)
+    fig = go.Figure(go.Scatter(x=x, y=y, mode="lines", fill="tozeroy",
+                               line=dict(color=GREEN, width=2.4), fillcolor=GREEN_FILL))
+    if soc_mean:
+        fig.add_vline(x=float(soc_mean), line=dict(color=MUTE, width=1.2, dash="dot"),
+                      annotation_text=f"typical {soc_mean:.0f}%", annotation_font_size=11,
+                      annotation_font_color=MUTE)
+    fig.update_layout(xaxis=dict(title="state of charge (%)", range=[0, 100]),
+                      yaxis=dict(visible=False))
+    return fig
+
+
+def temp_dist_fig(values, marker):
+    """Pack-temperature distribution with the LFP 'hot zone' shaded + this vehicle's marker."""
     values = np.asarray(values, dtype=float)
     values = values[np.isfinite(values)]
     if len(values) < 10:
         return None
     lo, hi = np.percentile(values, 1), np.percentile(values, 99)
     values = values[(values >= lo) & (values <= hi)]
-    fig = go.Figure()
-    # good side
-    fig.add_trace(go.Histogram(
-        x=values, nbinsx=28, marker_color=GREEN, opacity=0.55,
-        hoverinfo="skip", showlegend=False,
-    ))
-    # shade the aging zone
-    if lower_good:
-        fig.add_vrect(x0=threshold, x1=max(hi, marker if marker else hi),
-                      fillcolor=AMBER, opacity=0.13, line_width=0)
-    else:
-        fig.add_vrect(x0=min(lo, marker if marker else lo), x1=threshold,
-                      fillcolor=AMBER, opacity=0.13, line_width=0)
-    fig.add_vline(x=threshold, line=dict(color=AMBER, width=1.5, dash="dot"))
+    fig = go.Figure(go.Histogram(x=values, nbinsx=30, marker_color=BLUE, opacity=0.55,
+                                 hoverinfo="skip", showlegend=False))
+    fig.add_vrect(x0=HOT_C, x1=max(hi, marker if marker else hi),
+                  fillcolor=AMBER, opacity=0.12, line_width=0)
+    fig.add_vline(x=HOT_C, line=dict(color=AMBER, width=1.5, dash="dot"))
     if marker is not None and np.isfinite(marker):
         fig.add_vline(x=marker, line=dict(color=TEXT, width=2.5, dash="dot"),
-                      annotation_text=f"  you: {marker:.0f}{unit}",
-                      annotation_position="top",
+                      annotation_text=f"  you: {marker:.0f}°C", annotation_position="top",
                       annotation_font=dict(color=TEXT, size=12))
-    fig.update_layout(
-        height=190, paper_bgcolor=PANEL, plot_bgcolor=PANEL, bargap=0.06,
-        margin=dict(l=8, r=8, t=18, b=8),
-        xaxis=dict(gridcolor=LINE, zeroline=False, color=MUTE),
-        yaxis=dict(visible=False), showlegend=False,
-    )
+    fig.update_layout(bargap=0.06, xaxis=dict(title="monthly pack temperature (°C)"),
+                      yaxis=dict(visible=False))
     return fig
 
 
@@ -308,7 +475,7 @@ def gauge(soh: float, eol: float, color: str):
     fig = go.Figure(go.Indicator(
         mode="gauge+number",
         value=round(soh, 1),
-        number={"suffix": " %", "font": {"size": 54, "color": TEXT}},
+        number={"suffix": " %", "font": {"size": 52, "color": TEXT}},
         gauge={
             "axis": {"range": [eol - 20, 100], "tickwidth": 1, "tickcolor": FAINT,
                      "tickfont": {"size": 11, "color": MUTE}},
@@ -323,43 +490,40 @@ def gauge(soh: float, eol: float, color: str):
                           "value": eol},
         },
     ))
-    fig.update_layout(height=250, margin=dict(l=18, r=18, t=8, b=0),
+    fig.update_layout(height=240, margin=dict(l=18, r=18, t=10, b=4),
                       paper_bgcolor="rgba(0,0,0,0)", font={"color": TEXT})
     return fig
 
 
 # ===========================================================================
-# Global dark styling
+# Global dark styling — full-width premium shell
 # ===========================================================================
 st.markdown(
     f"""
     <style>
       .stApp {{ background:{BG}; }}
-      .block-container {{ padding-top: 1.8rem; max-width: 1120px; }}
+      .block-container {{ padding: 1.6rem 2.6rem 4rem; max-width: 1500px; }}
       [data-testid="stHeader"] {{ background: rgba(0,0,0,0); }}
       h1,h2,h3,h4,p,span,label,div {{ color:{TEXT}; }}
-      div[data-testid="stMetric"] {{
-          background:{PANEL}; border:1px solid {LINE}; border-radius:14px;
-          padding:14px 16px;
-      }}
-      div[data-testid="stMetricLabel"] p {{ color:{MUTE}; font-weight:600; }}
-      div[data-testid="stMetricValue"] {{ color:{TEXT}; }}
-      .panel {{ background:{PANEL}; border:1px solid {LINE}; border-radius:16px;
-                padding:20px 22px; }}
-      /* st.container(border=True) -> dark card to match .panel */
+      * {{ -webkit-font-smoothing:antialiased; }}
+      /* Uniform card surface for every bordered container, metric + custom card */
       div[data-testid="stVerticalBlockBorderWrapper"] {{
           background:{PANEL}; border:1px solid {LINE} !important;
           border-radius:16px; padding:18px 20px;
       }}
-      /* metric cards already carry their own panel; flatten them inside a card */
-      div[data-testid="stVerticalBlockBorderWrapper"] div[data-testid="stMetric"] {{
-          background:transparent; border:none; padding:4px 0;
+      div[data-testid="stMetric"] {{
+          background:transparent; border:none; padding:2px 0;
       }}
-      .pill {{ display:inline-block; padding:4px 14px; border-radius:999px;
+      div[data-testid="stMetricLabel"] p {{ color:{MUTE}; font-weight:600;
+          text-transform:uppercase; font-size:0.72rem; letter-spacing:0.05em; }}
+      div[data-testid="stMetricValue"] {{ color:{TEXT}; font-weight:700; }}
+      .pill {{ display:inline-block; padding:5px 16px; border-radius:999px;
                font-weight:700; font-size:0.9rem; }}
       div[data-baseweb="select"] > div {{ background:{PANEL2}; border-color:{LINE}; }}
       .stProgress > div > div > div {{ background:{GREEN}; }}
-      .stSelectbox label {{ color:{MUTE}; }}
+      .stSelectbox label {{ color:{MUTE}; font-weight:600; text-transform:uppercase;
+          font-size:0.72rem; letter-spacing:0.05em; }}
+      hr {{ border-color:{LINE}; }}
     </style>
     """,
     unsafe_allow_html=True,
@@ -369,12 +533,12 @@ st.markdown(
 # ===========================================================================
 # Header + picker
 # ===========================================================================
-hcol1, hcol2 = st.columns([0.72, 0.28])
+hcol1, hcol2 = st.columns([0.7, 0.3], gap="large")
 with hcol1:
-    st.markdown(f"<h1 style='margin-bottom:0;'>🔋 Your Battery Health</h1>",
-                unsafe_allow_html=True)
-    st.markdown(f"<p style='color:{MUTE};margin-top:4px;'>A simple, friendly check-up "
-                f"for your electric three-wheeler — by Turno.</p>", unsafe_allow_html=True)
+    st.markdown("<h1 style='margin-bottom:0;font-weight:800;letter-spacing:-0.02em;'>"
+                "🔋 Your Battery Health</h1>", unsafe_allow_html=True)
+    st.markdown(f"<p style='color:{MUTE};margin-top:6px;font-size:1.02rem;'>A simple, friendly "
+                f"check-up for your electric three-wheeler — by Turno.</p>", unsafe_allow_html=True)
 with hcol2:
     oem = st.selectbox("Vehicle brand", OEMS, index=0)
 
@@ -392,10 +556,11 @@ def _vin_label(v: str) -> str:
     star = " ⭐" if v in demo_vins else ""
     if row.empty:
         return v + star
-    return f"{v}  ·  {int(row.iloc[0]['n_months'])} mo history{star}"
+    r0 = row.iloc[0]
+    return f"{v}  ·  {int(r0['n_months'])} mo history · started {r0['soh_start']:.0f}%{star}"
 
 
-vcol1, _ = st.columns([0.6, 0.4])
+vcol1, _ = st.columns([0.55, 0.45])
 with vcol1:
     vin = st.selectbox("Vehicle (VIN)", ordered, index=0, format_func=_vin_label,
                        help="⭐ = demo vehicles with long history and visible decline.")
@@ -445,36 +610,42 @@ proj = project(g["age_months"].to_numpy(), g["soh"].to_numpy(), eol)
 # 1) HERO — Battery health gauge
 # ===========================================================================
 section("BATTERY HEALTH", "How your battery is doing")
-hero_l, hero_r = st.columns([0.42, 0.58])
+hero_l, hero_r = st.columns([0.4, 0.6], gap="large")
 with hero_l:
-    st.plotly_chart(gauge(soh_now, eol, status_color), use_container_width=True,
-                    config={"displayModeBar": False})
+    with st.container(border=True):
+        st.plotly_chart(gauge(soh_now, eol, status_color), use_container_width=True,
+                        config={"displayModeBar": False})
 with hero_r:
-    st.write("")
-    st.markdown(f"<span class='pill' style='background:{status_color}26;color:{status_color};'>"
-                f"● {status_label}</span>", unsafe_allow_html=True)
-    st.markdown(f"<div style='margin-top:10px;'>{big_number(f'{soh_now:.0f}', '%', status_color)}"
-                f"<span style='color:{MUTE};font-size:1.05rem;margin-left:6px;'>battery health</span></div>",
-                unsafe_allow_html=True)
-    if proj and proj["months_to_eol"] is not None and soh_now > eol:
-        life = f"about <b style='color:{TEXT}'>{fmt_months_human(proj['months_to_eol'])}</b> of healthy life left"
-    elif soh_now <= eol:
-        life = "this battery has reached its <b>end-of-life</b> health line"
-    else:
-        life = "holding steady — <b>no meaningful decline</b> detected yet"
-    st.markdown(f"<p style='color:{MUTE};font-size:1.1rem;margin-top:14px;'>"
-                f"Your {oem} battery is at {soh_now:.0f}% of its original capacity — {life}.</p>",
-                unsafe_allow_html=True)
+    with st.container(border=True):
+        st.markdown(f"<span class='pill' style='background:{status_color}26;color:{status_color};'>"
+                    f"● {status_label}</span>", unsafe_allow_html=True)
+        st.markdown(f"<div style='margin-top:14px;'>{big_number(f'{soh_now:.0f}', '%', status_color)}"
+                    f"<span style='color:{MUTE};font-size:1.05rem;margin-left:6px;'>battery health</span></div>",
+                    unsafe_allow_html=True)
+        if proj and proj["months_to_eol"] is not None and soh_now > eol:
+            life = f"about <b style='color:{TEXT}'>{fmt_months_human(proj['months_to_eol'])}</b> of healthy life left"
+        elif soh_now <= eol:
+            life = "this battery has reached its <b>end-of-life</b> health line"
+        else:
+            life = "holding steady — <b>no meaningful decline</b> detected yet"
+        st.markdown(f"<p style='color:{MUTE};font-size:1.12rem;margin-top:16px;line-height:1.6;'>"
+                    f"Your {oem} battery is at {soh_now:.0f}% of its original capacity — {life}.</p>",
+                    unsafe_allow_html=True)
+        _prank, _pn = peer_soh_rank(behaviour_table(oem), age_now, soh_now)
+        if _prank is not None:
+            _pc = GREEN if _prank >= 50 else AMBER
+            st.markdown(f"<div style='margin-top:6px;'><span class='pill' style='background:{_pc}26;color:{_pc};'>"
+                        f"🏅 Healthier than ~{_prank:.0f}% of similar-age {oem}s</span></div>",
+                        unsafe_allow_html=True)
 
-# Metric cards
-c1, c2, c3, c4, c5 = st.columns(5)
-c1.metric("Battery health", f"{soh_now:.0f}%")
-c2.metric("Range now", f"{range_now:.0f} km", delta=f"{range_now - rated:.0f} km vs new",
-          delta_color="inverse")
-c3.metric("Battery age", fmt_age(age_now))
-c4.metric("Distance driven", f"{odo:,.0f} km" if odo and odo > 0 else "—")
-c5.metric("Charge cycles", f"{cycles:,.0f}" if cycles and np.isfinite(cycles) and cycles > 0 else "—",
-          help=None if (cycles and cycles > 0) else "Not reported for this vehicle.")
+st.write("")
+stat_strip([
+    ("Battery health", f"{soh_now:.0f}%", None, status_color),
+    ("Range now", f"{range_now:.0f} km", f"{range_now - rated:+.0f} km vs new"),
+    ("Battery age", fmt_age(age_now)),
+    ("Distance driven", f"{odo:,.0f} km" if odo and odo > 0 else "—"),
+    ("Charge cycles", f"{cycles:,.0f}" if cycles and np.isfinite(cycles) and cycles > 0 else "—"),
+])
 
 
 # ===========================================================================
@@ -482,29 +653,25 @@ c5.metric("Charge cycles", f"{cycles:,.0f}" if cycles and np.isfinite(cycles) an
 # ===========================================================================
 soc_high = mean_val(g, "frac_soc_high")
 if soc_high is not None:
+    sm = mean_val(g, "soc_mean"); fl = mean_val(g, "frac_soc_low"); pct_high = soc_high * 100
     section("STATE OF CHARGE", "Where you keep the charge")
-    sl, sr = st.columns([0.55, 0.45])
-    with sl:
-        with st.container(border=True):
-            pct_high = soc_high * 100
-            st.markdown(f"{big_number(f'{pct_high:.0f}', '%', GREEN)}"
-                        f"<span style='color:{MUTE};margin-left:8px;'>of the time at a high charge</span>",
-                        unsafe_allow_html=True)
-            st.markdown("<div style='margin-top:16px;'></div>", unsafe_allow_html=True)
-            st.markdown(split_bar(soc_high, GREEN, PANEL2), unsafe_allow_html=True)
-            st.markdown(legend_row(GREEN, "Time at high charge", f"{pct_high:.0f}%")
-                        + legend_row(PANEL2, "Time at lower charge", f"{100 - pct_high:.0f}%"),
-                        unsafe_allow_html=True)
-    with sr:
-        why(
-            "Your fleet runs <b>LFP (lithium iron phosphate)</b> batteries. Unlike the "
-            "nickel-based cells in many cars, LFP is <b>very tolerant of sitting at a high "
-            "state of charge</b> — keeping it topped up does little harm, so charge to full "
-            "whenever it's convenient. For LFP the bigger ageing driver is <b>heat</b> "
-            "(see Temperature below), especially a hot pack <i>while</i> sitting full. "
-            "So: charge freely, but try to park and charge in the shade.",
-            sources="Turno LFP fleet analysis",
-        )
+    stat_strip([
+        ("Typical charge", f"{sm:.0f}%" if sm is not None else "—"),
+        ("Time at high charge", f"{pct_high:.0f}%"),
+        ("Time at low charge", f"{fl * 100:.0f}%" if fl is not None else "—"),
+    ])
+    st.write("")
+    chart(soc_density_fig(sm, fl, soc_high), height=300)
+    st.caption("Approximate shape, built from how much time you spend at low / typical / high charge.")
+    why(
+        "Your fleet runs <b>LFP (lithium iron phosphate)</b> batteries. Unlike the "
+        "nickel-based cells in many cars, LFP is <b>very tolerant of sitting at a high "
+        "state of charge</b> — keeping it topped up does little harm, so charge to full "
+        "whenever it's convenient. For LFP the bigger ageing driver is <b>heat</b> "
+        "(see Temperature below), especially a hot pack <i>while</i> sitting full. "
+        "So: charge freely, but try to park and charge in the shade.",
+        sources="Turno LFP fleet analysis",
+    )
 
 
 # ===========================================================================
@@ -512,144 +679,246 @@ if soc_high is not None:
 # ===========================================================================
 temp_mean_v = mean_val(g, "temp_mean")
 if temp_mean_v is not None:
+    tser = pd.to_numeric(g["temp_mean"], errors="coerce").dropna()
+    frac_hot = float((tser >= HOT_C).mean()) if len(tser) else 0.0
+    peak = mean_val(g, "temp_p95")
+    if peak is None:
+        peak = last_val(g, "temp_max")
+    hot_color = RED if frac_hot > 0.4 else (AMBER if frac_hot > 0.15 else GREEN)
     section("TEMPERATURE", "How hot your pack runs")
-    tl, tr = st.columns([0.55, 0.45])
-    with tl:
-        # % of months the pack ran hot (mean monthly temp >= HOT_C)
-        tser = pd.to_numeric(g["temp_mean"], errors="coerce").dropna()
-        frac_hot = float((tser >= HOT_C).mean()) if len(tser) else 0.0
-        peak = mean_val(g, "temp_p95")
-        if peak is None:
-            peak = last_val(g, "temp_max")
-        hot_color = RED if frac_hot > 0.4 else (AMBER if frac_hot > 0.15 else GREEN)
-        with st.container(border=True):
-            st.markdown(f"{big_number(f'{temp_mean_v:.0f}', '°C', TEXT)}"
-                        f"<span style='color:{MUTE};margin-left:8px;'>typical pack temperature</span>",
-                        unsafe_allow_html=True)
-            st.markdown("<div style='margin-top:14px;'></div>", unsafe_allow_html=True)
-            st.markdown(split_bar(frac_hot, hot_color, PANEL2), unsafe_allow_html=True)
-            st.markdown(legend_row(hot_color, f"Time running hot (≥{HOT_C:.0f}°C)", f"{frac_hot * 100:.0f}%")
-                        + legend_row(PANEL2, "Time in a comfortable range", f"{(1 - frac_hot) * 100:.0f}%"),
-                        unsafe_allow_html=True)
-            if peak is not None:
-                st.markdown(legend_row(AMBER, "Hottest the pack got", f"{peak:.0f}°C"),
-                            unsafe_allow_html=True)
-    with tr:
-        why(
-            "Heat is the <b>number-one ageing stressor for LFP</b> batteries. A pack that "
-            "regularly runs hot loses capacity faster — and the effect compounds when it's "
-            "hot <i>and</i> sitting at a high charge. Indian operating temperatures make this "
-            "the metric to watch. <b>What helps:</b> park and charge in shade, avoid charging "
-            "right after a long hot run, and give the pack a few minutes to cool.",
-            sources="Turno LFP fleet analysis",
-        )
-        # distribution vs fleet (where this vehicle sits)
-        fs = fleet_stat(oem, "temp_mean")
-        if fs is not None:
-            fig = hist_with_zone(fs["values"], temp_mean_v, HOT_C, lower_good=True, unit="°C")
-            if fig is not None:
-                st.markdown(f"<div style='color:{FAINT};font-size:0.8rem;margin-top:6px;'>"
-                            f"Your pack temperature vs the whole fleet (amber = hot zone):</div>",
-                            unsafe_allow_html=True)
-                st.plotly_chart(fig, use_container_width=True, config={"displayModeBar": False})
+    stat_strip([
+        ("Typical pack temp", f"{temp_mean_v:.0f}°C"),
+        ("Time running hot", f"{frac_hot * 100:.0f}%", f"at or above {HOT_C:.0f}°C", hot_color),
+        ("Hottest it got", f"{peak:.0f}°C" if peak is not None else "—"),
+    ])
+    fs = fleet_stat(oem, "temp_mean")
+    fig = temp_dist_fig(fs["values"], temp_mean_v) if fs is not None else None
+    if fig is not None:
+        st.write("")
+        chart(fig, height=300)
+        st.caption("Your pack temperature against the whole fleet — amber marks the LFP hot zone.")
+    why(
+        "Heat is the <b>number-one ageing stressor for LFP</b> batteries. A pack that "
+        "regularly runs hot loses capacity faster — and the effect compounds when it's "
+        "hot <i>and</i> sitting at a high charge. Indian operating temperatures make this "
+        "the metric to watch. <b>What helps:</b> park and charge in shade, avoid charging "
+        "right after a long hot run, and give the pack a few minutes to cool.",
+        sources="Turno LFP fleet analysis",
+    )
 
 
 # ===========================================================================
-# 4) USAGE  (monthly km + cycles trend — no time-of-day data, honest substitute)
+# 4) USAGE  (monthly km + charging trend — full-width, no mismatched columns)
 # ===========================================================================
-section("USAGE", "How much you drive and charge")
-gm = g.dropna(subset=["age_months"]).copy()
+gm = g.dropna(subset=["age_months"]).sort_values("age_months").copy()
 has_km = "km_month" in gm.columns and gm["km_month"].notna().any()
-has_cyc = "cyc_month" in gm.columns and gm["cyc_month"].notna().any()
+km_avg = float(gm["km_month"].dropna().mean()) if has_km else None
+# Charging signal: Bajaj reports real charge cycles; Euler/Mahindra don't, but DO report cumulative Ah
+# throughput (cum_ah) — and since a battery is charged ≈ as much as it's driven, the monthly Ah that
+# flows through the pack is an honest charging-intensity proxy.
+chg_y = chg_name = chg_y2 = chg_lbl = chg_val = chg_tot_lbl = chg_tot_val = None
+if "cyc_month" in gm.columns and gm["cyc_month"].notna().any():
+    chg_y, chg_name, chg_y2 = gm["cyc_month"], "charge cycles / month", "cycles / mo"
+    chg_lbl, chg_val = "Typical charges / month", f"{float(gm['cyc_month'].dropna().mean()):,.0f}"
+    if cycles and cycles > 0:
+        chg_tot_lbl, chg_tot_val = "Total charge cycles", f"{cycles:,.0f}"
+elif "cum_ah" in gm.columns and gm["cum_ah"].notna().sum() >= 2:
+    thru = gm["cum_ah"].diff().clip(lower=0)
+    if thru.notna().any():
+        chg_y, chg_name, chg_y2 = thru, "energy through pack (Ah / mo)", "Ah / mo"
+        chg_lbl, chg_val = "Energy through pack / month", f"{float(thru.dropna().mean()):,.0f} Ah"
+        chg_tot_lbl, chg_tot_val = "Lifetime energy throughput", f"{float(gm['cum_ah'].dropna().iloc[-1]):,.0f} Ah"
+has_chg = chg_y is not None
 
-ul, ur = st.columns([0.55, 0.45])
-with ul:
-    if has_km or has_cyc:
-        fig = go.Figure()
-        if has_km:
-            fig.add_trace(go.Bar(x=gm["age_months"], y=gm["km_month"], name="km / month",
-                                 marker_color=BLUE, opacity=0.85))
-        if has_cyc:
-            fig.add_trace(go.Scatter(x=gm["age_months"], y=gm["cyc_month"],
-                                     name="charge cycles / month", yaxis="y2",
-                                     mode="lines+markers", line=dict(color=AMBER, width=2)))
-        layout = dict(
-            height=300, paper_bgcolor=PANEL, plot_bgcolor=PANEL,
-            margin=dict(l=10, r=10, t=10, b=10),
-            xaxis=dict(title="Battery age (months)", gridcolor=LINE, color=MUTE, zeroline=False),
-            yaxis=dict(title="km / month", gridcolor=LINE, color=MUTE, zeroline=False),
-            legend=dict(orientation="h", y=1.02, x=0, font=dict(color=MUTE)),
-            bargap=0.3,
-        )
-        if has_cyc:
-            layout["yaxis2"] = dict(title="cycles / mo", overlaying="y", side="right",
-                                    color=MUTE, showgrid=False)
-        fig.update_layout(**layout)
-        st.plotly_chart(fig, use_container_width=True, config={"displayModeBar": False})
-    else:
-        st.markdown(f"<div class='panel' style='color:{MUTE};'>Monthly usage trend "
-                    f"isn't available for this vehicle yet.</div>", unsafe_allow_html=True)
-with ur:
-    km_avg = float(gm["km_month"].dropna().mean()) if has_km else None
-    cyc_avg = float(gm["cyc_month"].dropna().mean()) if has_cyc else None
-    with st.container(border=True):
-        if km_avg is not None:
-            st.metric("Typical distance / month", f"{km_avg:,.0f} km")
-        if odo and odo > 0:
-            st.metric("Lifetime distance", f"{odo:,.0f} km")
-        if cyc_avg is not None:
-            st.metric("Typical charges / month", f"{cyc_avg:,.0f}")
-        elif cycles and cycles > 0:
-            st.metric("Total charge cycles", f"{cycles:,.0f}")
-    note = ("Higher mileage and more frequent charging both add wear over time, but on LFP "
-            "they matter less than heat. ")
-    if not has_cyc:
-        note += "Charge-frequency isn't measured on this vehicle, so we show distance only."
-    why(note)
+section("USAGE", "How much you drive and charge" if has_chg else "How much you drive")
+usage_items = []
+if km_avg is not None:
+    usage_items.append(("Distance / month", f"{km_avg:,.0f} km"))
+if odo and odo > 0:
+    usage_items.append(("Lifetime distance", f"{odo:,.0f} km"))
+if chg_lbl:
+    usage_items.append((chg_lbl, chg_val))
+if chg_tot_lbl:
+    usage_items.append((chg_tot_lbl, chg_tot_val))
+if usage_items:
+    stat_strip(usage_items)
+    st.write("")
+
+if has_km or has_chg:
+    fig = go.Figure()
+    if has_km:
+        fig.add_trace(go.Bar(x=gm["age_months"], y=gm["km_month"], name="km / month",
+                             marker_color=BLUE, opacity=0.85))
+    if has_chg:
+        fig.add_trace(go.Scatter(x=gm["age_months"], y=chg_y, name=chg_name, yaxis="y2",
+                                 mode="lines+markers", line=dict(color=AMBER, width=2.4),
+                                 marker=dict(size=5)))
+    fig.update_layout(
+        bargap=0.32,
+        xaxis=dict(title="Battery age (months)"),
+        yaxis=dict(title="km / month"),
+    )
+    if has_chg:
+        fig.update_layout(yaxis2=dict(title=chg_y2, overlaying="y", side="right",
+                                      color=MUTE, showgrid=False))
+    chart(fig, height=340, legend=True)
+else:
+    st.info("Monthly usage trend isn't available for this vehicle yet.")
+
+note = "Higher mileage and more charging both add wear over time, but on LFP they matter less than heat. "
+if chg_name and "cycles" in chg_name:
+    note += "The amber line is your actual charge-cycle pattern."
+elif has_chg:
+    note += ("This fleet doesn't report charge-session counts, so the amber line shows the energy flowing "
+             "through the pack each month — a charging-intensity proxy (you charge ≈ as much as you drive).")
+else:
+    note += "Charge data isn't reported for this vehicle, so we show distance only."
+why(note)
+
+
+# ===========================================================================
+# 4b) HOW YOU TREAT YOUR BATTERY — personalised, fleet-relative, LFP-tuned
+# ===========================================================================
+bt = behaviour_table(oem)
+rv = vehicle_behaviour(g)
+has_current = "charge_i" in rv and "drive_i" in rv          # Euler / Mahindra (intellicar currents)
+has_cycles = ("cyc_month" in rv) or ("cyc_max" in g.columns) or ("cum_cycles" in g.columns)
+
+if has_current or has_cycles or "temp" in rv:
+    section("HOW YOU TREAT YOUR BATTERY", "Your habits vs the fleet")
+
+    if has_current:
+        cs = care_score(bt, rv)
+        grade, gcol = care_grade(cs)
+        cl, cr = st.columns([0.4, 0.6], gap="large")
+        with cl:
+            with st.container(border=True):
+                st.markdown(big_number(f"{cs:.0f}" if cs is not None else "–", "/100", gcol),
+                            unsafe_allow_html=True)
+                st.markdown(f"<div style='margin-top:10px;'><span class='pill' "
+                            f"style='background:{gcol}26;color:{gcol};'>{grade} usage</span></div>"
+                            f"<div style='color:{MUTE};margin-top:10px;'>Battery-care score — higher means "
+                            f"gentler on the pack than similar {oem}s.</div>", unsafe_allow_html=True)
+        with cr:
+            why("This blends how gently you charge, drive, cycle and work the pack — each compared with the rest "
+                "of the fleet. It deliberately ignores how full you keep the battery: for your <b>LFP</b> pack a "
+                "full charge is fine. <b>Charge to full whenever you like;</b> the real levers are smoother pulls "
+                "and keeping the pack cool.")
+
+        # behaviour fingerprint
+        chg = gentler_than(_col(bt, "charge_i"), rv.get("charge_i"))
+        drv = gentler_than(_col(bt, "drive_i"), rv.get("drive_i"))
+        depk = "dod" if ("dod" in bt.columns and "dod" in rv) else ("lowdwell" if "lowdwell" in rv else None)
+        dep = gentler_than(_col(bt, depk), rv.get(depk)) if depk else None
+        items = [("Charging style", style_word(chg),
+                  f"gentler than {chg:.0f}% of fleet" if chg is not None else "—",
+                  GREEN if (chg or 0) >= 50 else AMBER),
+                 ("Driving style", style_word(drv),
+                  f"gentler than {drv:.0f}% of fleet" if drv is not None else "—",
+                  GREEN if (drv or 0) >= 50 else AMBER)]
+        if dep is not None:
+            items.append(("Cycling depth", style_word(dep, ("Deep", "Typical", "Shallow")),
+                          f"shallower than {dep:.0f}% of fleet", GREEN if dep >= 50 else AMBER))
+        st.write("")
+        stat_strip(items)
+
+        # Mahindra: tangible numbers (real capacity, range, cycles) the OEM signals support
+        if oem == "Mahindra":
+            tang = []
+            caps = pd.to_numeric(g["capacity_ah"], errors="coerce").dropna() if "capacity_ah" in g.columns else pd.Series(dtype=float)
+            cap_new = float(caps.head(3).mean()) if len(caps) >= 2 else None
+            if cap_new and len(caps):
+                cap_now = float(caps.iloc[-1]); pctcap = 100 * cap_now / cap_new if cap_new else None
+                tang.append(("Pack capacity now", f"{cap_now:.0f} Ah",
+                             f"≈{pctcap:.0f}% of ~{cap_new:.0f} Ah when newer" if pctcap else None))
+            if "range" in rv:
+                rrank = harsher_than(_col(bt, "range"), rv["range"])
+                tang.append(("Typical range", f"{rv['range']:.0f} km",
+                             f"better than {rrank:.0f}% of similar vehicles" if rrank is not None else "the vehicle's own distance-to-empty"))
+            if "throughput" in rv and cap_new:
+                tang.append(("Full cycles / month", f"{rv['throughput'] / cap_new:.1f}",
+                             "energy through the pack ÷ its capacity"))
+            if tang:
+                st.write("")
+                stat_strip(tang)
+
+        # personalised "what's aging your battery most"
+        levers = top_levers(bt, rv)
+        if levers:
+            parts = " and ".join(f"<b>{lab}</b> (higher than {h:.0f}% of similar vehicles)" for h, lab, _ in levers)
+            actions = "; ".join(act for _, _, act in levers)
+            why(f"The habits adding the most wear right now are {parts}. Easing these — {actions} — is where you'd "
+                f"gain the most extra life. Charging stays simple: charge to full whenever you like; heat is the "
+                f"main thing to manage.")
+        else:
+            why("No single habit stands out as harsh — your pack is mostly seeing normal calendar and cycle ageing. "
+                "The biggest lever is heat: keep it parked and charged in the shade.")
+
+    else:  # Bajaj — no current signals; lean on heat rank + cycle count
+        items = []
+        if "temp" in rv:
+            cool = gentler_than(_col(bt, "temp"), rv["temp"])
+            if cool is not None:
+                items.append(("Cool-running rank", f"cooler than {cool:.0f}%",
+                              "heat is the #1 LFP stressor", GREEN if cool >= 50 else AMBER))
+        cycmax = last_val(g, "cyc_max") or last_val(g, "cum_cycles")
+        if cycmax and cycmax > 0:
+            items.append(("Charge-cycles lived", f"{cycmax:,.0f}", "LFP packs last many thousands"))
+        cm = mean_val(g, "cyc_month")
+        if cm is not None:
+            items.append(("Cycles / month", f"{cm:,.0f}", "your recent charging pace"))
+        if items:
+            stat_strip(items)
+            why("Your battery is <b>LFP</b>, built for a long cycle life, so a steady monthly pace is comfortably "
+                "normal. The main thing that ages it is heat — charge to full whenever you like, just park in the "
+                "shade.")
 
 
 # ===========================================================================
 # 5) EFFICIENCY  (only where driveeff_mean exists — Bajaj)
 # ===========================================================================
 if "driveeff_mean" in g.columns and g["driveeff_mean"].notna().any():
-    section("EFFICIENCY", "Your efficiency")
-    el, er = st.columns([0.55, 0.45])
     ge = g.dropna(subset=["driveeff_mean", "age_months"])
     eff_now = float(ge["driveeff_mean"].iloc[-1])
-    with el:
-        fig = go.Figure()
-        fig.add_trace(go.Scatter(x=ge["age_months"], y=ge["driveeff_mean"],
-                                 mode="lines+markers", line=dict(color=GREEN, width=2.5),
-                                 name="Your efficiency"))
-        fs = fleet_stat(oem, "driveeff_mean")
-        if fs is not None:
-            fig.add_hline(y=fs["med"], line=dict(color=MUTE, width=1.2, dash="dot"),
-                          annotation_text="fleet typical",
-                          annotation_position="bottom right",
-                          annotation_font=dict(color=MUTE, size=11))
-        fig.update_layout(height=270, paper_bgcolor=PANEL, plot_bgcolor=PANEL,
-                          margin=dict(l=10, r=10, t=10, b=10),
-                          xaxis=dict(title="Battery age (months)", gridcolor=LINE, color=MUTE,
-                                     zeroline=False),
-                          yaxis=dict(title="efficiency score", gridcolor=LINE, color=MUTE,
-                                     zeroline=False),
-                          showlegend=False)
-        st.plotly_chart(fig, use_container_width=True, config={"displayModeBar": False})
-    with er:
-        with st.container(border=True):
-            st.markdown(big_number(f"{eff_now:.0f}", "", GREEN), unsafe_allow_html=True)
-            st.markdown(f"<span style='color:{MUTE};'>current efficiency score</span>",
-                        unsafe_allow_html=True)
-        why("How efficiently your vehicle turns battery energy into distance. Smoother, "
-            "steadier driving keeps this high; lots of hard acceleration and stop-start "
-            "traffic pulls it down. It doesn't damage the battery directly, but a higher "
-            "score means more range from the same charge.")
+    fs = fleet_stat(oem, "driveeff_mean")
+    section("EFFICIENCY", "How efficiently you drive")
+    stat_strip([
+        ("Current efficiency", f"{eff_now:.0f}"),
+        ("Fleet typical", f"{fs['med']:.0f}" if fs else "—"),
+    ])
+    st.write("")
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(x=ge["age_months"], y=ge["driveeff_mean"],
+                             mode="lines+markers", line=dict(color=GREEN, width=2.6),
+                             marker=dict(size=5), name="Your efficiency"))
+    if fs is not None:
+        fig.add_hline(y=fs["med"], line=dict(color=MUTE, width=1.2, dash="dot"),
+                      annotation_text="fleet typical", annotation_position="bottom right",
+                      annotation_font=dict(color=MUTE, size=11))
+    fig.update_layout(xaxis=dict(title="Battery age (months)"),
+                      yaxis=dict(title="efficiency score"))
+    chart(fig, height=300)
+    why("How efficiently your vehicle turns battery energy into distance. Smoother, "
+        "steadier driving keeps this high; lots of hard acceleration and stop-start "
+        "traffic pulls it down. It doesn't damage the battery directly, but a higher "
+        "score means more range from the same charge.")
 
 
 # ===========================================================================
-# 6) DEGRADATION + PROJECTION CHART
+# 6) LIFESPAN — degradation history + projection (the centrepiece chart)
 # ===========================================================================
 section("LIFESPAN", "How your battery is aging")
+life_left = (fmt_months_human(proj["months_to_eol"])
+             if proj and proj["months_to_eol"] is not None
+             else ("reached end-of-life" if soh_now <= eol else "no decline yet"))
+stat_strip([
+    ("Health today", f"{soh_now:.0f}%", None, status_color),
+    ("Healthy life left", life_left),
+    ("End-of-life line", f"{eol:.0f}%"),
+    ("Warranty term", f"{warr_years} yr / {warr_km / 1000:.0f}k km"),
+])
+st.write("")
+
 chart_end = max(warr_months, age_now if np.isfinite(age_now) else 0,
                 (proj["months_to_eol"] + proj["now_age"]) if (proj and proj["months_to_eol"]) else 0)
 chart_end = float(min(chart_end + 3, max(warr_months + 6, 90)))
@@ -684,15 +953,10 @@ fig.add_hline(y=eol, line=dict(color=AMBER, width=2, dash="dot"),
 fig.add_vline(x=warr_months, line=dict(color=MUTE, width=1.5, dash="dash"),
               annotation_text=f"Warranty ({warr_years} yr)", annotation_position="top left",
               annotation_font=dict(color=MUTE, size=11))
-fig.update_layout(height=380, paper_bgcolor=PANEL, plot_bgcolor=PANEL,
-                  margin=dict(l=10, r=10, t=42, b=10),
-                  xaxis=dict(title="Battery age (months)", gridcolor=LINE, color=MUTE, zeroline=False),
-                  yaxis=dict(title="Battery health (%)", gridcolor=LINE, color=MUTE,
-                             range=[eol - 18, 102]),
-                  legend=dict(orientation="h", x=1, xanchor="right", y=1.06, yanchor="bottom",
-                              bgcolor="rgba(0,0,0,0)", font=dict(color=MUTE, size=11)),
+fig.update_layout(xaxis=dict(title="Battery age (months)"),
+                  yaxis=dict(title="Battery health (%)", range=[eol - 18, 102]),
                   hovermode="x unified")
-st.plotly_chart(fig, use_container_width=True, config={"displayModeBar": False})
+chart(fig, height=400, legend=True)
 
 
 # ===========================================================================
@@ -715,7 +979,7 @@ eff_deadline_age = (age_now if np.isfinite(age_now) else 0.0) + eff_remaining
 proj_at_deadline = float(proj["fit"](eff_deadline_age)) if proj is not None else soh_now
 survives = proj_at_deadline >= eol
 
-wl, wr = st.columns([0.5, 0.5])
+wl, wr = st.columns([0.5, 0.5], gap="large")
 with wl:
     with st.container(border=True):
         st.markdown(f"**Warranty term** — {warr_years} years or {warr_km:,.0f} km "
@@ -775,8 +1039,9 @@ else:
     bg = AMBER
 
 st.write("")
-st.markdown(f"<div class='panel' style='border-left:5px solid {bg};font-size:1.15rem;"
-            f"line-height:1.55;'>💬 {summary}</div>", unsafe_allow_html=True)
+st.markdown(f"<div style='background:{PANEL};border:1px solid {LINE};border-left:5px solid {bg};"
+            f"border-radius:16px;padding:20px 24px;font-size:1.15rem;line-height:1.55;'>"
+            f"💬 {summary}</div>", unsafe_allow_html=True)
 st.write("")
 st.markdown(f"<div style='color:{FAINT};font-size:0.82rem;'>Turno · Sample customer "
             f"battery-health view. Health, range and projections are estimates from your "
