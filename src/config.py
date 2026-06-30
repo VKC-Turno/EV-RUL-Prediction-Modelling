@@ -108,9 +108,11 @@ def warranty_for(oem, model):
     return DEFAULT_WARRANTY
 
 
-# Default SoH method per source: 'coulomb' needs current (intellicar); else 'distance_per_soc';
-# euler can also use 'reported'.
-SOH_METHOD = {"intellicar": "coulomb", "mahindra": "distance_per_soc", "euler": "reported",
+# Default SoH method per source: 'coulomb' needs current (intellicar); 'distance_per_soc' for native
+# Mahindra; 'bms_capacity' = BMS remaining-capacity -> full-capacity -> SoH (what euler_features actually
+# builds — high-SoC band, isotonic fit); 'reported' = the BMS-reported SoH field directly (Bajaj).
+# (Euler's 'batterySoh' reported field is garbage 0/>70000, so Euler uses bms_capacity, NOT 'reported'.)
+SOH_METHOD = {"intellicar": "coulomb", "mahindra": "distance_per_soc", "euler": "bms_capacity",
               "bajaj": "reported"}
 
 # Monthly-sample cadence: dense feeds tolerate more days/month.
