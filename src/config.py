@@ -83,13 +83,19 @@ WARRANTY = {
     # independent search: HiLoad vehicle = 3yr, 80-100k km, +2yr extended battery). PROVISIONAL — get official doc.
     "euler":    [("hirange", (6, 150000)), ("hi range", (6, 150000)), ("hicity", (5, 125000)),
                  ("hi city", (5, 125000)), ("", (3, 80000))],
-    # Bajaj: no OEM spec sheet on hand. reg-date -> warranty_end_date in pricing CSV implies ~3 yr
-    # (median ~3.2 yr across 34 sold/repo units). km limit unknown -> default 120k. Refine if spec found.
-    "bajaj":    [("", (3, 120000))],
+    # Bajaj RE E-TEC: BATTERY warranty 5yr / 120k km (OEM_Model_Specs.csv, spec-sheet verified) — the relevant
+    # term for SoH at-risk. (The ~3yr the pricing-CSV warranty_end_date implies is the shorter VEHICLE warranty.)
+    # The 120k-km limit usually binds BEFORE 5yr for high-use vehicles -> use the km-bound effective deadline.
+    "bajaj":    [("", (5, 120000))],
     "piaggio":  [("", (3, 100000))],
     "montra":   [("", (5, 175000))],
 }
 DEFAULT_WARRANTY = (5, 120000)
+
+# Fleet-level representative warranty (years, km) per OEM — the cohort-majority variant. SINGLE SOURCE for
+# the one-warranty-line-per-OEM dashboard views (so config and the dashboard never drift apart again).
+# Euler = HiLoad (3yr, provisional); Mahindra = Treo (3yr); Bajaj = RE E-TEC battery (5yr; km usually binds first).
+FLEET_WARRANTY = {"euler": (3, 80000), "mahindra": (3, 120000), "bajaj": (5, 120000)}
 
 
 def warranty_for(oem, model):

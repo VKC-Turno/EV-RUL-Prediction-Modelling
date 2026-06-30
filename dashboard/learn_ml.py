@@ -27,9 +27,10 @@ import data_quality                                     # shared data-quality ga
 import rul_km                                            # SoH forecast -> remaining kilometres to end-of-life
 import soh_audit                                         # SoH-signal artifact audit (cliff / stuck-floor / iso-floor)
 import training_curation                                 # robust √t-smoothed training-set buckets
+import config                                            # single source for warranty terms (FLEET_WARRANTY)
 
 _ico = ROOT / "turno_logo.png"
-st.set_page_config(page_title="Turno · EV SoH Prediction Modeling", layout="wide",
+st.set_page_config(page_title="Turno · Battery SoH Prediction Pipeline", layout="wide",
                    page_icon=str(_ico) if _ico.exists() else "🔋")
 
 TEAL, AMBER, RED, GREEN, GREY = "#1f9e8f", "#e0922b", "#d4504e", "#2ec16b", "#9fb3c8"
@@ -108,7 +109,7 @@ def _split(vins, drop, seed=0, force_train=frozenset()):
     return out
 
 
-@st.cache_data(show_spinner="Training the model for this lesson…")
+@st.cache_data(show_spinner="Training the model…")
 def diagnostics(oem_key, deg_only=False):
     """Train one model on the TRAIN split; report per-transition RMSE on each split + feature importance."""
     cfg = OEMS[oem_key]
@@ -188,13 +189,29 @@ def forecast_demo(oem_key, m, deg_only=False):
     return run(order[0])
 
 
-# Representative warranty term (years) per OEM — drawn as the warranty deadline on the prediction plots.
-# (Euler 5 yr; Mahindra Treo 3 yr = the cohort majority; Bajaj ~3 yr.)
-WARRANTY_YR = {"Euler": 3, "Mahindra": 3, "Bajaj": 5}   # Euler HiLoad = 3yr (CORRECTED 2026-06-30; the old 5yr was
-# borrowed from the passenger HiCity/NEO model — our cohort is 100% HiLoad cargo). PROVISIONAL/unverified — get an
-# official Euler doc; src/config.py still encodes the wrong 5yr for the decision dashboard/reports. Bajaj RE = 5yr.
-WARRANTY_KM = {"Euler": 80000, "Mahindra": 120000, "Bajaj": 120000}   # Euler HiLoad ~80k km (was 125k = passenger term)
+# Per-OEM representative warranty — SINGLE SOURCE = config.FLEET_WARRANTY (so config and dashboard never drift).
+# Euler HiLoad 3yr/80k (provisional); Mahindra Treo 3yr; Bajaj RE battery 5yr/120k (km usually binds first).
+WARRANTY_YR = {o: config.FLEET_WARRANTY[o.lower()][0] for o in ("Euler", "Mahindra", "Bajaj")}
+WARRANTY_KM = {o: config.FLEET_WARRANTY[o.lower()][1] for o in ("Euler", "Mahindra", "Bajaj")}
+ODO_OK = {"Euler": False, "Mahindra": False, "Bajaj": True}   # odometer reliable enough for a km-bound deadline?
 EOL_PCT = {"Euler": 80, "Mahindra": 80, "Bajaj": 70}   # end-of-life SoH threshold per OEM (Bajaj = 70%)
+
+
+def eff_warr_months(oem, g, wyr):
+    """Effective warranty deadline (age-months) = min(time term, time to hit the km limit at recent pace) —
+    'whichever of time / km comes first'. Falls back to time-only where the odometer is unreliable (Euler
+    noisy / Mahindra sparse) so a bad km projection is never trusted."""
+    time_m = wyr * 12.0
+    if not ODO_OK.get(oem) or "km_month" not in g.columns:
+        return time_m
+    kmcol = "cum_km" if "cum_km" in g.columns else ("odo_max" if "odo_max" in g.columns else None)
+    if kmcol is None:
+        return time_m
+    cur_km = float(g[kmcol].iloc[-1]); cur_age = float(g["age_months"].iloc[-1])
+    kmpm = float(pd.Series(g["km_month"]).tail(6).median())
+    if not (kmpm > 50 and 0 < cur_km < WARRANTY_KM[oem]):      # need a sane pace, not already over the limit
+        return time_m
+    return float(min(time_m, cur_age + (WARRANTY_KM[oem] - cur_km) / kmpm))
 # Euler/Mahindra SoH is renormalised to 100% at registration (so we anchor the curve at 100 there); Bajaj
 # uses the ABSOLUTE BMS-reported SoH, so it legitimately starts below 100 — no 100% anchor (no fake drop).
 RENORM100 = {"Euler": True, "Mahindra": True, "Bajaj": False}
@@ -257,7 +274,7 @@ def test_predictions(oem_key, deg_only=False):
         # from a 60% cut. Operationally we want "where is it now and where is it heading", so the green
         # forecast begins exactly where the measured (teal) line ends.
         hist = gg; cut_age = float(gg["age_months"].iloc[-1])
-        warr_age = wmap.get(vin, wdef) * 12                     # registration + warranty term, on the age axis
+        warr_age = eff_warr_months(oem_key, gg, wmap.get(vin, wdef))   # km-bound: min(time term, time-to-120k-km)
         H_MAX = 120                                             # cap (months) to avoid absurd extrapolation
         if euler:
             fc = mod.forecast(hist, fmodel, H_MAX); p10, p50, p90 = fc[0.1], fc[0.5], fc[0.9]
@@ -281,7 +298,7 @@ def test_predictions(oem_key, deg_only=False):
     return out
 
 
-def concept(t): st.info("💡 **Concept** — " + t)
+def concept(t): st.info("💡 **Why it matters** — " + t)
 def takeaway(t): st.success("✅ **Takeaway** — " + t)
 
 
@@ -290,7 +307,7 @@ _logo = next((p for p in (ROOT / "turno_logo.png", ROOT / "turno.gif", ROOT / "i
                            ROOT / "dashboard" / "image.png", ROOT / "assets" / "image.png") if p.exists()), None)
 if _logo:
     st.sidebar.image(str(_logo), width=110)
-st.sidebar.title("EV SoH Prediction Modeling")
+st.sidebar.title("Battery SoH · Prediction Pipeline")
 st.sidebar.caption("How our battery-health models are built — explained from scratch, **comparing all "
                    "three fleets side by side.**")
 SMOOTH = st.sidebar.checkbox("Smooth SoH curves", value=True,
@@ -309,7 +326,7 @@ def smooth(s, win=5):
     return s.rolling(win, center=True, min_periods=1).mean() if SMOOTH else s
 
 
-STEPS = ["👋 Start here", "1 · The problem", "2 · The data", "3 · The target (SoH)", "4 · Features",
+STEPS = ["📋 Overview", "1 · The problem", "2 · The data", "3 · The target (SoH)", "4 · Features",
          "5 · Train / Validation / Test", "6 · Training the model", "7 · Which clues matter?",
          "8 · Errors & overfitting", "9 · A tougher test (LOVO)", "10 · Predicting the future",
          "11 · Range & km left", "12 · Data quality", "13 · Limits & retraining"]
@@ -650,51 +667,64 @@ def _rul_soh_fig(oem, infos, h=230):
 
 
 
+# Four outcome groups for held-out test vehicles (used by _testgrid_fig).  Order = panel order.
+TESTCAT = [("At-risk", RED), ("Safe", GREEN), ("Genuinely flat", TEAL), ("Flat (unproven)", AMBER)]
+FLAT_DROP = 3.0      # < this much observed decline = "flat"
+PROVEN_SPAN = 18.0   # ... and observed for >= this many months = "genuinely" flat (else "unproven")
+
+
+def _bucketise(preds, eol):
+    """Sort each test vehicle into one of the four outcome groups."""
+    cats = {k: [] for k, _ in TESTCAT}
+    for p in preds:
+        soh = np.asarray(p["soh"], float); age = np.asarray(p["age"], float)
+        drop = float(soh[0] - soh.min())                  # observed decline so far
+        span = float(age[-1] - age[0])                    # how long we've actually watched it
+        if _fc_at_warranty(p, "p50") < eol:
+            cats["At-risk"].append(p)                     # forecast crosses EoL by warranty
+        elif drop >= FLAT_DROP:
+            cats["Safe"].append(p)                        # really declining, but projects to survive
+        elif span >= PROVEN_SPAN:
+            cats["Genuinely flat"].append(p)              # flat AND watched long enough to trust it
+        else:
+            cats["Flat (unproven)"].append(p)             # flat but young/short — could still decline
+    return cats
+
+
 def _testgrid_fig(oem):
+    """2x2 panel: held-out test vehicles grouped by outcome (one panel per group, vehicles overlaid)."""
     preds = test_predictions(oem, DEG_ONLY)
     if not preds:
-        return None, 0
-    ncols = 4; nrows = int(np.ceil(len(preds) / ncols))
-    titles = [f"{p['vin']} · reg {p['reg']}" for p in preds]
-    fig = make_subplots(rows=nrows, cols=ncols, subplot_titles=titles,
-                        vertical_spacing=0.06, horizontal_spacing=0.04)
-    eol = EOL_PCT[oem]; risk = []
-    for i, p in enumerate(preds):
-        r, c = i // ncols + 1, i % ncols + 1
-        atrisk = _fc_at_warranty(p, "p50") < eol; risk.append(atrisk)   # below EoL at warranty = at-risk
-        clr = RED if atrisk else GREEN
-        fillc = "rgba(212,80,78,.16)" if atrisk else "rgba(46,193,107,.15)"
-        sm = smooth(pd.Series(p["soh"]))
-        age = np.array(p["age"]) / 12.0; fage = np.array(p["fage"]) / 12.0   # months -> years
-        if RENORM100[oem]:
-            fig.add_scatter(x=[0, age[0]], y=[100, sm.iloc[0]], mode="lines",
-                            line=dict(color=TEAL, width=1, dash="dot"), row=r, col=c, showlegend=False)
-        else:                                          # Bajaj: telemetry starts months after registration
-            fig.add_scatter(x=[0, age[0]], y=[sm.iloc[0], sm.iloc[0]], mode="lines",
-                            line=dict(color=GREY, width=1, dash="dot"), row=r, col=c, showlegend=False)
-        fig.add_scatter(x=age, y=sm.tolist(), mode="lines",
-                        line=dict(color=TEAL, width=1.4), row=r, col=c, showlegend=False)
-        fig.add_scatter(x=fage, y=p["p90"], mode="lines", line=dict(width=0, color=GREY),
-                        row=r, col=c, showlegend=False)
-        fig.add_scatter(x=fage, y=p["p10"], mode="lines", fill="tonexty",
-                        fillcolor=fillc, line=dict(width=0), row=r, col=c, showlegend=False)
-        fig.add_scatter(x=fage, y=p["p50"], mode="lines",
-                        line=dict(color=clr, width=1.8, dash="dash"), row=r, col=c, showlegend=False)
-        fig.add_vline(x=p["warr_age"] / 12, line=dict(color="#9aa7b6", width=1, dash="dashdot"), row=r, col=c)
-    fig.add_hline(y=eol, line=dict(color=AMBER, width=1, dash="dot"), row="all", col="all")
-    if not RENORM100[oem]:                                 # shade reg→first-telemetry gap (after row="all" hline)
-        for i, p in enumerate(preds):
-            r, c = i // ncols + 1, i % ncols + 1
-            fig.add_vrect(x0=0, x1=p["age"][0] / 12.0, fillcolor="rgba(159,179,200,.06)",
-                          line_width=0, layer="below", row=r, col=c)
-    fig.update_yaxes(range=[min(eol - 10, 45), 101], **AX); fig.update_xaxes(dtick=1, **AX)
-    fig.update_annotations(font_size=10)
-    for i, flag in enumerate(risk):                       # red subplot title for at-risk vehicles
-        if flag and i < len(fig.layout.annotations):
-            fig.layout.annotations[i].font.color = RED
-    fig.update_layout(**lay(height=max(nrows * 175, 300), showlegend=False,
-                            margin=dict(l=30, r=12, t=26, b=24)))
-    return fig, len(preds)
+        return None, {}
+    eol = EOL_PCT[oem]; a100 = RENORM100[oem]
+    cats = _bucketise(preds, eol)
+    titles = [f"{k} — {len(cats[k])}" for k, _ in TESTCAT]
+    fig = make_subplots(rows=2, cols=2, subplot_titles=titles, vertical_spacing=0.12, horizontal_spacing=0.07)
+    pos = [(1, 1), (1, 2), (2, 1), (2, 2)]; ymin = 101.0
+    for idx, (k, color) in enumerate(TESTCAT):
+        r, c = pos[idx]
+        wx, wy = [], []                                                          # each vehicle's OWN deadline point
+        for p in cats[k]:
+            age = np.asarray(p["age"]) / 12.0; fage = np.asarray(p["fage"]) / 12.0
+            sm = smooth(pd.Series(p["soh"]))
+            ax = ([0.0] + age.tolist()) if a100 else age.tolist()
+            sy = ([100.0] + sm.tolist()) if a100 else sm.tolist()
+            ymin = min(ymin, min(sy), min(p["p50"]))
+            fig.add_scatter(x=ax, y=sy, mode="lines", line=dict(color=color, width=0.8),
+                            opacity=0.4, row=r, col=c, showlegend=False)          # measured
+            fig.add_scatter(x=fage, y=p["p50"], mode="lines", line=dict(color=color, width=0.8, dash="dot"),
+                            opacity=0.35, row=r, col=c, showlegend=False)          # forecast P50
+            wx.append(p["warr_age"] / 12.0); wy.append(_fc_at_warranty(p, "p50"))  # this vehicle's warranty end
+        if wx:                                                                    # ◆ = each vehicle's own deadline
+            fig.add_scatter(x=wx, y=wy, mode="markers", row=r, col=c, showlegend=False, opacity=0.85,
+                            marker=dict(symbol="diamond", size=5, color="#e8edf2",
+                                        line=dict(color="#0e1726", width=0.6)))
+        fig.add_hline(y=eol, line=dict(color=AMBER, width=1, dash="dot"), row=r, col=c)
+    fig.update_yaxes(range=[max(min(ymin - 3, eol - 8), 40), 101], title_text="SoH %", **AX)
+    fig.update_xaxes(title_text="age (years)", dtick=1, **AX)
+    fig.update_annotations(font_size=12)
+    fig.update_layout(**lay(height=640, showlegend=False, margin=dict(l=44, r=16, t=46, b=40)))
+    return fig, {k: len(cats[k]) for k, _ in TESTCAT}
 
 
 def _feature_grid_fig(oem):
@@ -732,15 +762,15 @@ def _fc_at_warranty(p, q="p50"):
 
 # ═════════════════════════════════ STEP 0 ═════════════════════════════════
 if step == STEPS[0]:
-    st.title("🎓 How a Machine-Learning model is built")
+    st.title("🔧 The battery-health prediction pipeline we built")
     st.markdown(
-        "Welcome! This teaches **machine learning (ML) from zero**, using a real project: predicting the "
-        "**health of EV batteries** — across **three fleets at once (Euler · Mahindra · Bajaj)**. Every "
-        "page shows all three side by side, so you can see how the *same* pipeline adapts to each OEM's "
-        "data — especially **which sensors each feed provides and which clues each model relies on.**")
-    concept("**Machine learning** = instead of writing rules by hand, we show a computer many examples and "
-            "let it *find the patterns itself*. Here: we show it many batteries aging over time, and it "
-            "learns to predict how a new battery will age.")
+        "This walks through the **State-of-Health (SoH) prediction pipeline we built at Turno** — end to end, "
+        "on a real problem: forecasting the **health of EV batteries** across **three fleets at once "
+        "(Euler · Mahindra · Bajaj)**. Every stage shows all three side by side, so you can see how the *same* "
+        "pipeline adapts to each OEM's data — **which sensors each feed provides, and what each model relies on.**")
+    concept("Rather than hand-coding rules for how a battery ages, we **let the model learn the patterns from "
+            "the fleet itself** — thousands of batteries aging over time — and use them to forecast how any "
+            "given battery will age. That engine drives everything that follows.")
     cols = st.columns(3)
     for col, oem in zip(cols, OEM_KEYS):
         F = FEATS_BY[oem]
@@ -748,8 +778,9 @@ if step == STEPS[0]:
         col.caption(OEMS[oem]["label"])
         col.metric("Vehicles tracked", F.vin.nunique())
         col.markdown(f"**SoH method:** {OEMS[oem]['soh_method']}")
-    takeaway("Work through the steps in order. By the end you'll understand the whole pipeline — and where "
-             "the three fleets differ is exactly where the interesting comparison lives.")
+    takeaway("Walk the stages left-to-right to follow the whole pipeline — from raw telemetry to a "
+             "warranty-risk call. Where the three fleets differ is exactly where the interesting engineering "
+             "decisions live.")
 
 # ═════════════════════════════════ STEP 1 ═════════════════════════════════
 elif step == STEPS[1]:
@@ -907,7 +938,7 @@ elif step == STEPS[4]:
 # ═════════════════════════════════ STEP 5 ═════════════════════════════════
 elif step == STEPS[5]:
     st.title("5 · Splitting the data — train / validation / test")
-    st.markdown("The golden rule of ML: **never judge a model on data it learned from.** For each fleet we "
+    st.markdown("A rule we hold to: **never judge a model on data it learned from.** For each fleet we "
                 "split the *vehicles* (never rows) into three groups — 🟢 train · 🟡 validation · 🔴 test — "
                 "stratified so each keeps degraders and flat vehicles. **Columns = fleets, rows = the three "
                 "groups** (each shown on its own so you can see who's in it):")
@@ -1056,9 +1087,9 @@ elif step == STEPS[5]:
                "✅ **Euler now uses the corrected 3-yr / 36-mo warranty** (the old 5-yr was borrowed from the "
                "passenger HiCity/NEO model; our cohort is 100% HiLoad cargo) — this cut Euler at-risk **22→9** "
                "and lifted graceful-aged **21→39**. Still PROVISIONAL: unverified pending an official Euler doc.")
-    concept("Like studying for an exam: **train** = the textbook you study, **validation** = practice "
-            "papers to adjust your approach, **test** = the *real* exam (questions you've never seen). Only "
-            "the test score is honest.")
+    concept("**Train** = the vehicles the model learns from · **validation** = a held-out set we use to tune "
+            "it · **test** = vehicles it has never seen, scored only at the end. Only the test number is an "
+            "honest estimate of real-world accuracy.")
     st.warning("⚠️ **We split by *whole vehicle*, never by row.** If two months of the *same* battery were "
                "in both train and test, the model could 'peek' at that battery's future — cheating, called "
                "**data leakage**.")
@@ -1127,8 +1158,9 @@ elif step == STEPS[8]:
         col.markdown(f"**{oem}** — test **{e['test']:.2f}** · gap {gap:.1f}×")
         col.plotly_chart(_err_fig(oem), use_container_width=True)
     concept("**Training error is always optimistically low** — the model has seen that data. The **test "
-            "error** is the honest one. Tiny train + large test = the model **memorised** instead of "
-            "learning general patterns (**overfitting**: acing practice, failing the real exam).")
+            "error** is the honest one. A tiny train error with a large test error means the model "
+            "**memorised** the training vehicles instead of learning general patterns — what we call "
+            "**overfitting**.")
     takeaway("A modest train→test gap is normal across all three fleets. Always quote the "
              "**test/validation** number, never the training one.")
 
@@ -1176,30 +1208,40 @@ elif step == STEPS[10]:
              "Life**. This is exactly what powers the main SoH dashboard.")
 
     st.markdown("---")
-    st.markdown("### 📋 Forecast from today — every held-out **test** vehicle")
-    st.caption("Pick a fleet's tab. For each test vehicle (never seen in training): its **full measured "
-               "history** (teal — Euler/Mahindra anchored to 100% at registration; Bajaj shows the absolute "
-               "reported SoH, so it starts below 100) plus the model's forecast **from its latest (present) "
-               "data point onward** (green dashed + band), out to the warranty deadline. Title = "
-               "registration date · age in years.")
+    st.markdown("### 📋 Forecast from today — held-out **test** vehicles, by outcome")
+    st.caption("For every test vehicle (never seen in training) we forecast SoH from its latest data point to "
+               "its warranty deadline, then sort it into **four outcome groups**. Each panel overlays that "
+               "group's vehicles — **solid = measured, dotted = forecast P50**; amber = EoL line; each **◆ "
+               "marks that vehicle's OWN warranty deadline** (whichever of its time term or the km limit it "
+               "reaches first — so deadlines differ by how hard each vehicle is driven). ◆ above EoL = safe, "
+               "below = at-risk.")
     tabs = st.tabs(OEM_KEYS)
     for tab, oem in zip(tabs, OEM_KEYS):
         with tab:
             try:
-                preds = test_predictions(oem, DEG_ONLY); eol = EOL_PCT[oem]
-                fig, n = _testgrid_fig(oem)
+                eol = EOL_PCT[oem]
+                fig, counts = _testgrid_fig(oem)
                 if not fig:
                     st.info("No test vehicles with enough history to forecast.")
                 else:
-                    ar50 = sum(1 for p in preds if _fc_at_warranty(p, "p50") < eol)
-                    ar10 = sum(1 for p in preds if _fc_at_warranty(p, "p10") < eol)
-                    cc = st.columns(3)
+                    n = sum(counts.values())
+                    cc = st.columns(5)
                     cc[0].metric(f"{oem} test vehicles", n)
-                    cc[1].metric(f"🔴 At-risk by warranty (P50 < {eol}%)", f"{ar50} / {n}")
-                    cc[2].metric("Worst-case at-risk (P10)", f"{ar10} / {n}")
+                    cc[1].metric("🔴 At-risk", counts["At-risk"])
+                    cc[2].metric("🟢 Safe", counts["Safe"])
+                    cc[3].metric("🟦 Genuinely flat", counts["Genuinely flat"])
+                    cc[4].metric("🟡 Flat (unproven)", counts["Flat (unproven)"])
                     st.plotly_chart(fig, use_container_width=True)
-                    st.caption(f"At-risk = forecast below the amber {eol}% line at the warranty deadline. "
-                               f"Flip **Train on degraders only** in the sidebar to see how the count moves.")
+                    st.caption(f"**At-risk** = P50 forecast below the {eol}% EoL "
+                               "line at warranty · **Safe** = really declining (≥3pp) but projects to survive · "
+                               "**Genuinely flat** = <3pp decline, observed ≥18 months (trustworthy) · **Flat "
+                               "(unproven)** = <3pp decline but observed <18 months (could still decline — just "
+                               "young). **Warranty deadline = whichever of time *or* the 120k-km limit comes "
+                               "first** (km-bound for Bajaj; time-only for Euler/Mahindra) — each vehicle's "
+                               "**◆** marker. **Note: 'safe' = won't trigger a warranty *claim*** (its warranty "
+                               "ends, on time or km, before SoH crosses EoL) — *not* that the battery is "
+                               "necessarily healthy: a hard-driven vehicle can be degraded yet 'safe' because "
+                               "its km warranty expired early. Flip *Train on degraders only* to watch the split move.")
             except Exception as ex:
                 st.warning(f"Test-vehicle grid unavailable ({ex}).")
 
@@ -1373,6 +1415,6 @@ elif step == STEPS[13]:
         import json
         st.markdown("#### Euler model registry — every retrain is tracked")
         st.dataframe(pd.DataFrame(json.load(open(reg))), use_container_width=True)
-    takeaway("You now understand the full pipeline across three fleets: problem → data → target → features "
-             "→ split → train → inspect → validate → forecast → retrain. That's machine learning, end to "
-             "end. 🎓")
+    takeaway("That's the full pipeline across three fleets: problem → data → target → features → split → "
+             "train → inspect → validate → forecast → retrain — raw telemetry to a warranty-risk call, "
+             "end to end.")
