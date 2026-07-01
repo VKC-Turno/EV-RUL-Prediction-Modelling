@@ -53,10 +53,22 @@ def model_map():
     return dict(zip(v["vin"], v["make"].fillna("") + " " + v["model"].fillna("")))
 
 
+def load_cohort(oem, ft):
+    """Mirror the dashboard's load_cohort: run the manifest on the FULL Redshift STORE feature table
+    (data/redshift/<oem>_featengg.parquet) when it's larger than the local one, so data-quality reflects
+    the cohort the pipeline actually trains on — not the older, smaller local download subset."""
+    p = f"data/redshift/{oem.lower()}_featengg.parquet"
+    if Path(p).exists():
+        s = pd.read_parquet(p).rename(columns={"ymd": "month"}); s["vin"] = s["vin"].astype(str)
+        if s["vin"].nunique() > pd.read_parquet(ft)["vin"].nunique():
+            return s
+    return pd.read_parquet(ft)
+
+
 VMODEL = model_map()
 rows = []
 for oem, ft in FT.items():
-    m = pd.read_parquet(ft); m["month"] = pd.to_datetime(m["month"])
+    m = load_cohort(oem, ft); m["month"] = pd.to_datetime(m["month"].astype(str))
     reg = reg_dates(oem); q = QUAL[oem]
     dens = next((c for c in ["n_rows", "n_sessions", "n_rows_ic", "n_soh"] if c in m.columns), None)
     for vin, g in m.sort_values("month").groupby("vin"):
