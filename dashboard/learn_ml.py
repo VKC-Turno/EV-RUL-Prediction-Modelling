@@ -176,7 +176,7 @@ def forecaster(oem_key, deg_only=False):
 def forecast_demo(oem_key, m, deg_only=False):
     """Pick a clear teaching example (decent history, real decline, sensible non-cliff forecast)."""
     mod, fmodel = forecaster(oem_key, deg_only)          # model trained on degraders only when toggled
-    H = 18 if oem_key == "Bajaj" else 30                  # Bajaj: short history + fast, steady decline
+    H = 120                                               # forecast far ahead; _forecast_fig truncates at EoL
     m = data_quality.apply_quality(m, oem_key)           # never forecast a data-thin vehicle
     grp = m.groupby("vin")
     o = pd.DataFrame({"months": grp.size(), "s0": grp.soh.first(), "s1": grp.soh.last()})
@@ -194,7 +194,7 @@ def forecast_demo(oem_key, m, deg_only=False):
 
     for vin in order:
         res = run(vin)
-        if res[2][-1] >= 50:                             # P50 doesn't cliff to ~0 — a clean teaching arc
+        if res[2][min(29, len(res[2]) - 1)] >= 50:       # P50 still sensible at ~2.5 yr (not an instant cliff)
             return res
     return run(order[0])
 
@@ -508,7 +508,13 @@ def _lovo_fig(oem, h=300):
 def _forecast_fig(oem, h=330):
     F = FEATS_BY[oem]
     g, p10, p50, p90 = forecast_demo(oem, F, DEG_ONLY)
-    sm = smooth(g.soh); a0 = g.age_months.iloc[-1]; fa = np.arange(a0 + 1, a0 + len(p50) + 1)
+    eol = EOL_PCT[oem]; a0 = g.age_months.iloc[-1]
+    wdef, wmap = warranty_map(oem); wyr = wmap.get(g.vin.iloc[0], wdef)
+    # show the prediction until P50 reaches EoL (+ a few months); if it never does, stop ~a year past warranty
+    hit = np.where(np.asarray(p50) <= eol)[0]
+    keep = int(np.clip((int(hit[0]) + 4) if len(hit) else int(round(wyr * 12 - a0)) + 12, 6, len(p50)))
+    p10, p50, p90 = p10[:keep], p50[:keep], p90[:keep]
+    sm = smooth(g.soh); fa = np.arange(a0 + 1, a0 + len(p50) + 1)
     xc = np.concatenate([[a0], fa]) / 12.0                      # months -> years for the age axis
     c10 = np.concatenate([[sm.iloc[-1]], p10]); c50 = np.concatenate([[sm.iloc[-1]], p50])
     c90 = np.concatenate([[sm.iloc[-1]], p90])
@@ -531,7 +537,6 @@ def _forecast_fig(oem, h=330):
     fig.add_scatter(x=xc, y=c50, mode="lines", line=dict(color=GREEN, width=2.5, dash="dash"),
                     showlegend=False)
     fig.add_hline(y=EOL_PCT[oem], line=dict(color=AMBER, dash="dash"))
-    wdef, wmap = warranty_map(oem); wyr = wmap.get(g.vin.iloc[0], wdef)
     fig.add_vline(x=wyr, line=dict(color="#9aa7b6", dash="dashdot"))
     fig.update_xaxes(title="age (years)", dtick=1, **AX)
     fig.update_yaxes(range=[60, 101], **AX)            # common 60–100% scale across all fleets
@@ -574,6 +579,10 @@ def _rul_order(oem):
     return list(pd.unique(m["vin"])), False
 
 
+# Manually-pinned Step-11 pairs (full VINs) — [gentler/green, harder/purple]: same distance, different usage.
+_RUL_PAIR_OVERRIDE = {"Euler": ["MD9EMHDL24C217135", "MD9EMHDL24C217054"]}
+
+
 @st.cache_data(show_spinner=False)
 def _rul_pair(oem):
     """Two REAL degraders that started ~100%, drove a SIMILAR distance, but degraded at DIFFERENT rates —
@@ -581,6 +590,9 @@ def _rul_pair(oem):
     artifact), so it's a fair rate-vs-rate comparison: the point that the same kilometres age batteries very
     differently (usage intensity + heat). Returns [gentler_vin, harder_vin]; falls back to worst-SoH pair."""
     m = data_quality.apply_quality(FEATS_BY[oem], oem)
+    ov = _RUL_PAIR_OVERRIDE.get(oem)
+    if ov and set(ov).issubset(set(m["vin"].unique())):
+        return list(ov)                                            # user-pinned pair (same distance, different usage)
     a = m.groupby("vin").agg(n=("soh", "size"), first=("soh", "first"), last=("soh", "last"),
                              odo=("odo_max", "max"))
     a["drp"] = a["first"] - a["last"]
@@ -1399,8 +1411,8 @@ elif step == STEPS[10]:
             fig, vin, hmon, wyr = _forecast_fig(oem)
             col.markdown(f"**{oem}** · {vin[-6:]}")
             col.plotly_chart(fig, use_container_width=True)
-            col.caption(f"{hmon}-mo forecast · band ≈ 80% range · amber {EOL_PCT[oem]}% EoL · dash-dot "
-                        f"{wyr}-yr warranty")
+            col.caption(f"predicted to end-of-life · band ≈ 80% range · amber {EOL_PCT[oem]}% EoL · "
+                        f"dash-dot {wyr}-yr warranty")
         except Exception as ex:
             col.warning(f"{oem}: demo unavailable ({ex}).")
     concept("The dashed line is the **best single estimate**; the shaded band says 'we're ~80% sure the "
