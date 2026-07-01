@@ -67,6 +67,15 @@ OEMS = {
                    "it leans on age, temperature, charge habits and mileage",
         lovo=dict(overall=1.14, model=1.04, persist=3.08, trend=2.06, band=None),
         label="Bajaj RE / cargo electric-3-wheelers"),
+    "Piaggio": dict(
+        ft="data/piaggio/features/feature_table.parquet", module="model",
+        soh_method="Coulomb counting",
+        soh_explain="Like Mahindra, we integrate the pack **current** from the intellicar feed "
+                    "(∫ current · time) to track remaining capacity — coulomb counting, the gold-standard method.",
+        model_desc="**gradient-boosted decision trees** (LightGBM, predicting monthly SoH loss at several "
+                   "confidence levels) — the same model as Mahindra",
+        lovo=dict(overall=2.83, model=2.96, persist=2.70, trend=3.13, band=None),
+        label="Piaggio Ape E-Xtra FX electric-3-wheelers"),
 }
 
 
@@ -201,10 +210,10 @@ def forecast_demo(oem_key, m, deg_only=False):
 
 # Per-OEM representative warranty — SINGLE SOURCE = config.FLEET_WARRANTY (so config and dashboard never drift).
 # Euler HiLoad 3yr/80k (provisional); Mahindra Treo 3yr; Bajaj RE battery 5yr/120k (km usually binds first).
-WARRANTY_YR = {o: config.FLEET_WARRANTY[o.lower()][0] for o in ("Euler", "Mahindra", "Bajaj")}
-WARRANTY_KM = {o: config.FLEET_WARRANTY[o.lower()][1] for o in ("Euler", "Mahindra", "Bajaj")}
-ODO_OK = {"Euler": False, "Mahindra": False, "Bajaj": True}   # odometer reliable enough for a km-bound deadline?
-EOL_PCT = {"Euler": 80, "Mahindra": 80, "Bajaj": 70}   # end-of-life SoH threshold per OEM (Bajaj = 70%)
+WARRANTY_YR = {o: config.FLEET_WARRANTY[o.lower()][0] for o in ("Euler", "Mahindra", "Bajaj", "Piaggio")}
+WARRANTY_KM = {o: config.FLEET_WARRANTY[o.lower()][1] for o in ("Euler", "Mahindra", "Bajaj", "Piaggio")}
+ODO_OK = {"Euler": False, "Mahindra": False, "Bajaj": True, "Piaggio": False}   # odometer reliable enough for a km-bound deadline?
+EOL_PCT = {"Euler": 80, "Mahindra": 80, "Bajaj": 70, "Piaggio": 80}   # end-of-life SoH threshold per OEM (Bajaj = 70%)
 
 
 def eff_warr_months(oem, g, wyr):
@@ -224,7 +233,7 @@ def eff_warr_months(oem, g, wyr):
     return float(min(time_m, cur_age + (WARRANTY_KM[oem] - cur_km) / kmpm))
 # Euler/Mahindra SoH is renormalised to 100% at registration (so we anchor the curve at 100 there); Bajaj
 # uses the ABSOLUTE BMS-reported SoH, so it legitimately starts below 100 — no 100% anchor (no fake drop).
-RENORM100 = {"Euler": True, "Mahindra": True, "Bajaj": False}
+RENORM100 = {"Euler": True, "Mahindra": True, "Bajaj": False, "Piaggio": True}
 
 # vin -> registration date (= age 0 on the SoH curves), per OEM's registration file
 REG_FILES = {
@@ -236,6 +245,8 @@ REG_FILES = {
 
 @st.cache_data(show_spinner=False)
 def reg_dates(oem_key):
+    if oem_key not in REG_FILES:                 # Piaggio has no reg file -> first-telemetry anchoring
+        return {}
     f, col, fmt = REG_FILES[oem_key]
     if not Path(f).exists():
         return {}
@@ -583,11 +594,12 @@ def _forecast_fig(oem, h=330):
 
 
 # ── SoH → kilometres: range now (rated × SoH) + remaining km to EoL (× usage rate), mirrors src/rul_km.py ──
-RATED_KM = {"Euler": 120, "Mahindra": 80, "Bajaj": 178}   # rated (ARAI) full-charge range, km (OEM_Model_Specs.csv)
+RATED_KM = {"Euler": 120, "Mahindra": 80, "Bajaj": 178, "Piaggio": 110}   # rated full-charge range, km (Piaggio=PROVISIONAL, Ape spec unverified)
 RATED_KM_SRC = {                                          # OEM source for the promised range (per OEM_Model_Specs.csv)
     "Euler": "https://eulermotors.com/en/hiload",
     "Mahindra": "https://www.mahindralastmilemobility.com/treo-zor-dv",
     "Bajaj": "https://www.bajajauto.com",
+    "Piaggio": "https://www.piaggio-cv.co.in",   # PROVISIONAL — Ape E-Xtra FX rated range unverified
 }
 
 
@@ -1023,7 +1035,7 @@ if step == STEPS[0]:
     concept("Rather than hand-coding rules for how a battery ages, we **let the model learn the patterns from "
             "the fleet itself** — thousands of batteries aging over time — and use them to forecast how any "
             "given battery will age. That engine drives everything that follows.")
-    cols = st.columns(3)
+    cols = st.columns(len(OEM_KEYS))
     for col, oem in zip(cols, OEM_KEYS):
         F = FEATS_BY[oem]
         col.markdown(f"### {oem}")
@@ -1040,7 +1052,7 @@ elif step == STEPS[1]:
     st.markdown("Every EV battery slowly **wears out**. We measure that wear as **State of Health (SoH)** — "
                 "the percentage of the battery's *original* capacity that remains. Each fleet has its own "
                 "**end-of-life threshold** we forecast it to cross:")
-    cols = st.columns(3)
+    cols = st.columns(len(OEM_KEYS))
     for col, oem in zip(cols, OEM_KEYS):
         col.markdown(f"### {oem}")
         col.metric("End of life", f"{EOL_PCT[oem]}% SoH")
@@ -1109,7 +1121,7 @@ elif step == STEPS[2]:
     concept("Two kinds of columns everywhere: **the target** (`soh`, the answer we predict) and "
             "**features** (the clues). What changes per fleet is *which clues exist*.")
     st.markdown("#### A real slice of each fleet's rows")
-    cols = st.columns(3)
+    cols = st.columns(len(OEM_KEYS))
     for col, oem in zip(cols, OEM_KEYS):
         F = FEATS_BY[oem]
         col.markdown(f"**{oem}** — {F.vin.nunique()} veh · {len(F):,} rows · {F.shape[1]} cols")
@@ -1118,7 +1130,7 @@ elif step == STEPS[2]:
     st.markdown("#### When does each fleet's data start — and who was captured *from new*?")
     st.markdown("A vehicle only truly starts at **~100% SoH** if telemetry begins near its registration. If the "
                 "feed turned on *after* the vehicle was already in service, its first reading is already aged.")
-    wcols = st.columns(3)
+    wcols = st.columns(len(OEM_KEYS))
     for col, oem in zip(wcols, OEM_KEYS):
         F = FEATS_BY[oem]; m = pd.to_datetime(F["month"]); fa = F.groupby("vin")["age_months"].min()
         n = len(fa); new = int((fa <= 3).sum())
@@ -1150,15 +1162,15 @@ elif step == STEPS[3]:
                 "handle into separate rows: **degraders** (lost ≥2% — real aging) and **still-near-new** "
                 "(flat) vehicles.")
     st.markdown("##### 🔴 Degraders — what real aging looks like")
-    _ncol = 4 if NATIVE_SOH is not None else 3
+    _ncol = len(OEM_KEYS) + (1 if NATIVE_SOH is not None else 0)
     cols = st.columns(_ncol)
-    for col, oem in zip(cols[:3], OEM_KEYS):
+    for col, oem in zip(cols[:len(OEM_KEYS)], OEM_KEYS):
         o = ov(FEATS_BY[oem]); eol = EOL_PCT[oem]
         col.markdown(f"**{oem}** · _{OEMS[oem]['soh_method']}_ · {int((o.s0-o.s1>=2).sum())} degraders")
         col.plotly_chart(_soh_fig(oem, which="deg"), use_container_width=True)
         col.caption(f"reached {eol}%: {int((o.smin<=eol).sum())} · median history {int(o.months.median())} mo")
     if NATIVE_SOH is not None:
-        col = cols[3]; o = ov(NATIVE_SOH); rise = int((o.s0 - o.s1 <= -2).sum())
+        col = cols[len(OEM_KEYS)]; o = ov(NATIVE_SOH); rise = int((o.s0 - o.s1 <= -2).sum())
         col.markdown(f"**Mahindra Native** · _distance-per-SoC (native-only)_ · {int((o.s0-o.s1>=2).sum())} 'degraders'")
         col.plotly_chart(_native_soh_fig(which="deg"), use_container_width=True)
         col.caption(f"**Separate OEM — native feed only, never mixed with intellicar.** ⚠️ Noise, not aging: "
@@ -1166,12 +1178,12 @@ elif step == STEPS[3]:
                     f"{NATIVE_SOH.vin.nunique()} vins.")
     st.markdown("##### ⚪ Still near-new — flat (lost <2%)")
     cols2 = st.columns(_ncol)
-    for col, oem in zip(cols2[:3], OEM_KEYS):
+    for col, oem in zip(cols2[:len(OEM_KEYS)], OEM_KEYS):
         o = ov(FEATS_BY[oem])
         col.markdown(f"**{oem}** · {int((o.s0-o.s1<2).sum())} flat vehicles")
         col.plotly_chart(_soh_fig(oem, which="flat"), use_container_width=True)
     if NATIVE_SOH is not None:
-        col = cols2[3]; o = ov(NATIVE_SOH)
+        col = cols2[len(OEM_KEYS)]; o = ov(NATIVE_SOH)
         col.markdown(f"**Mahindra Native** · {int((o.s0-o.s1<2).sum())} flat")
         col.plotly_chart(_native_soh_fig(which="flat"), use_container_width=True)
         col.caption("**Its own OEM** — the ~12k native-only Mahindra fleet, distance-per-SoC on native data, "
@@ -1194,8 +1206,10 @@ elif step == STEPS[4]:
                     "\n\n_the richest feed (coulomb + location)_",
         "Bajaj": "✅ age · heat · **ambient temp** · SoC habits · **charge cycles** · mileage · curvature"
                  "\n\n❌ **no current, no voltage** — must age-predict without electrical stress signals",
+        "Piaggio": "✅ age · **current / Ah throughput** · **voltage** · SoC habits · charge cycles · mileage · "
+                   "curvature\n\n_coulomb (intellicar), like Mahindra; motor-temp proxy only, no pack temp_",
     }
-    cols = st.columns(3)
+    cols = st.columns(len(OEM_KEYS))
     for col, oem in zip(cols, OEM_KEYS):
         col.markdown(f"### {oem}"); col.markdown(groups[oem])
     concept("**Feature engineering** = turning raw data into meaningful clues. `inv_sqrt_age` encodes the "
@@ -1220,7 +1234,7 @@ elif step == STEPS[5]:
                 "split the *vehicles* (never rows) into three groups — 🟢 train · 🟡 validation · 🔴 test — "
                 "stratified so each keeps degraders and flat vehicles. **Columns = fleets, rows = the three "
                 "groups** (each shown on its own so you can see who's in it):")
-    cols = st.columns(3)
+    cols = st.columns(len(OEM_KEYS))
     aged_rows = []; risk_by_oem = {}
     for col, oem in zip(cols, OEM_KEYS):
         d = diagnostics(oem, DEG_ONLY); s = d["sizes"]; tr = d["splits"]["train"]
@@ -1385,7 +1399,7 @@ elif step == STEPS[6]:
     concept("**Gradient boosting** = build *hundreds* of small trees in sequence. Each new tree focuses on "
             "fixing the **mistakes** of the ones before it. Added together, they capture subtle, combined "
             "patterns no single rule could.")
-    cols = st.columns(3)
+    cols = st.columns(len(OEM_KEYS))
     for col, oem in zip(cols, OEM_KEYS):
         col.markdown(f"**{oem}**"); col.markdown(OEMS[oem]["model_desc"])
     st.markdown("Why trees and not a neural network / LSTM? We have only a **few hundred** batteries with "
@@ -1401,7 +1415,7 @@ elif step == STEPS[7]:
                 "used more). Compare the three — they're **not the same**, because their feeds differ. The "
                 "line under each chart flags **thinly-populated features** — a clue can rank low simply "
                 "because it's mostly *missing data*, not because it doesn't matter.")
-    cols = st.columns(3)
+    cols = st.columns(len(OEM_KEYS))
     for col, oem in zip(cols, OEM_KEYS):
         col.markdown(f"**{oem}**"); col.plotly_chart(_fi_fig(oem), use_container_width=True)
         # data coverage of the model's features — surfaces e.g. Mahindra temp_max being ~7% populated
@@ -1430,7 +1444,7 @@ elif step == STEPS[8]:
     st.markdown("We measure error as **RMSE** — roughly the typical size of the model's mistake (in "
                 "percentage-points of monthly SoH loss). **Lower is better.** Checked on all three splits, "
                 "per fleet — the Test ÷ Train gap reveals overfitting:")
-    cols = st.columns(3)
+    cols = st.columns(len(OEM_KEYS))
     for col, oem in zip(cols, OEM_KEYS):
         e = diagnostics(oem, DEG_ONLY)["errors"]; gap = e["test"] / max(e["train"], 1e-9)
         col.markdown(f"**{oem}** — test **{e['test']:.2f}** · gap {gap:.1f}×")
@@ -1452,7 +1466,7 @@ elif step == STEPS[9]:
                 "- **Trend line:** 'fit a simple curve and extend it.'\n\n"
                 "Each bar below is **forecast error** — RMSE in SoH percentage-points, on the batteries that "
                 "actually decline. **Lower is better.**")
-    cols = st.columns(3)
+    cols = st.columns(len(OEM_KEYS))
     for col, oem in zip(cols, OEM_KEYS):
         L = OEMS[oem]["lovo"]
         col.markdown(f"**{oem}** — model **{L['model']}** vs persist {L['persist']}")
@@ -1469,7 +1483,7 @@ elif step == STEPS[10]:
     st.title("10 · Predicting the future — with honest uncertainty")
     st.markdown("The payoff: feed a battery's history to the trained model and it projects SoH **forward** — "
                 "not as one over-confident number, but as a **range**. One clear example per fleet:")
-    cols = st.columns(3)
+    cols = st.columns(len(OEM_KEYS))
     for col, oem in zip(cols, OEM_KEYS):
         try:
             fig, vin, hmon, wyr = _forecast_fig(oem)
@@ -1544,7 +1558,7 @@ elif step == STEPS[11]:
     st.caption("For each fleet we pick **two vehicles that both started ~100%, drove a similar distance, but aged "
                "at different rates** — so the *same* kilometres leave them at very different SoH, range and "
                "remaining life. Distance alone doesn't set health: usage intensity and heat do.")
-    cols = st.columns(3)
+    cols = st.columns(len(OEM_KEYS))
     for col, oem in zip(cols, OEM_KEYS):
         pair = _rul_pair(oem)
         infos = [_rul_demo(oem, DEG_ONLY, v) for v in pair]
@@ -1587,7 +1601,7 @@ elif step == STEPS[12]:
     dq = Path("data/manifests/vehicle_data_quality.csv")
     if dq.exists():
         q = pd.read_csv(dq)
-        cols = st.columns(3)
+        cols = st.columns(len(OEM_KEYS))
         for col, oem in zip(cols, OEM_KEYS):
             d = q[q["oem"] == oem]; thin = d[d["quality"] == "thin"]
             col.markdown(f"### {oem}")
@@ -1658,7 +1672,7 @@ elif step == STEPS[12]:
     st.markdown("**This whole dashboard runs on the full Redshift store cohort** — *not* a local subset. Below: the "
                 "true registered fleet (Redshift `oem_fleet_kpis`) → how many we can model → the training-quality "
                 "gate → curation + artifact audit at that scale:")
-    _REGDEF = {"Euler": 2125, "Mahindra": 10933, "Bajaj": 1781}
+    _REGDEF = {"Euler": 2125, "Mahindra": 10933, "Bajaj": 1781, "Piaggio": 1913}
     REG = {o: int(FLEET_COV.get(o, {}).get("fleet") or _REGDEF[o]) for o in OEM_KEYS}
     cov = []
     for oem in OEM_KEYS:
@@ -1686,7 +1700,7 @@ elif step == STEPS[12]:
 elif step == STEPS[13]:
     st.title("13 · Limits, honesty & retraining")
     st.markdown("Good ML is **honest about what it doesn't know.** Each fleet's real data limits:")
-    cols = st.columns(3)
+    cols = st.columns(len(OEM_KEYS))
     for col, oem in zip(cols, OEM_KEYS):
         o = ov(FEATS_BY[oem]); eol = EOL_PCT[oem]
         col.markdown(f"### {oem}")
@@ -1715,7 +1729,7 @@ elif step == STEPS[14]:
     st.markdown("Three checks: **(a)** real held-out vehicles' measured SoH vs what the model predicted from "
                 "only **half** their history · **(b)** how accuracy improves as we feed it more months · "
                 "**(c)** whether accuracy holds across usage levels.")
-    OEMCOL = {"Euler": TEAL, "Mahindra": AMBER, "Bajaj": "#6f7fd6"}
+    OEMCOL = {"Euler": TEAL, "Mahindra": AMBER, "Bajaj": "#6f7fd6", "Piaggio": "#c792ff"}
 
     # ---- (a) actual vs predicted ----
     st.markdown("#### (a) Actual vs predicted — forecast from half a vehicle's history")
@@ -1781,7 +1795,7 @@ elif step == STEPS[14]:
     st.caption("Held-out vehicles split into low / medium / high **km-per-month** bands — to check the model "
                "isn't biased for any usage regime. The scatter flags **fast-decline + low-usage** vehicles: "
                "the likeliest **SoH artifacts or defective packs**, since real wear needs real use.")
-    ucols = st.columns(3)
+    ucols = st.columns(len(OEM_KEYS))
     for col, oem in zip(ucols, OEM_KEYS):
         ru = [r for r in _backtest_eval(oem, DEG_ONLY) if r["usage"] == r["usage"] and r["usage"] > 0]
         col.markdown(f"**{oem}**")
