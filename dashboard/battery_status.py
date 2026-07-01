@@ -125,25 +125,46 @@ def load_oem(oem: str) -> pd.DataFrame:
 
 @st.cache_data(show_spinner=False)
 def vehicle_index(oem: str) -> pd.DataFrame:
-    """One row per vehicle with stats used to rank demo-worthy vehicles."""
+    """One row per vehicle with stats + a quick safe / at-risk estimate (a fast √t fit vs the warranty
+    deadline — the detailed view uses the full model). Sorted oldest-first."""
     df = load_oem(oem)
+    eol = EOL[oem]; warr_yr, warr_km = FLEET_WARRANTY[OEM_KEY[oem]]; warr_mo = warr_yr * 12
     rows = []
     for vin, g in df.groupby("vin"):
-        g = g.dropna(subset=["soh"])
+        g = g.dropna(subset=["soh"]).sort_values("age_months")
         n = len(g)
         if n == 0:
             continue
+        soh = g["soh"].to_numpy(dtype=float); age = g["age_months"].to_numpy(dtype=float)
+        now_soh = float(soh[-1]); now_age = float(age[-1]) if np.isfinite(age[-1]) else np.nan
+        # effective warranty deadline (age-months): km-bound where the odometer is usable, else the time term
+        odo = None
+        for c in ("odo_max", "cum_km"):
+            s = pd.to_numeric(g[c], errors="coerce").dropna() if c in g.columns else None
+            if s is not None and len(s):
+                odo = float(s.iloc[-1]); break
+        km_s = pd.to_numeric(g["km_month"], errors="coerce").dropna() if "km_month" in g.columns else None
+        kmpm = float(km_s.mean()) if (km_s is not None and len(km_s)) else None
+        eff_age = warr_mo
+        if odo and kmpm and kmpm > 0 and 0 < odo < warr_km and np.isfinite(now_age):
+            eff_age = now_age + min(max(warr_mo - now_age, 0.0), (warr_km - odo) / kmpm)
+        if now_soh <= eol:
+            status = "⚠️ at-risk"
+        else:
+            pj = project(age, soh, eol)
+            at_dl = (float(pj["fit"](eff_age)) if (pj and np.isfinite(now_age) and now_age < eff_age)
+                     else now_soh)
+            status = "⚠️ at-risk" if at_dl < eol else "✅ safe"
         drop = float(g["soh"].head(3).mean() - g["soh"].tail(3).mean())
-        rows.append(dict(vin=vin, n_months=n, last_soh=float(g["soh"].iloc[-1]),
-                         soh_start=float(g["soh"].iloc[0]),
+        rows.append(dict(vin=vin, n_months=n, last_soh=now_soh, soh_start=float(soh[0]),
                          drop=drop if np.isfinite(drop) else 0.0,
-                         age=float(g["age_months"].max()) if "age_months" in g else np.nan))
+                         age=now_age if np.isfinite(now_age) else 0.0, status=status))
     idx = pd.DataFrame(rows)
     if idx.empty:
         return idx
     idx["demo_score"] = (idx["n_months"].clip(upper=24)
                          + idx["drop"].clip(lower=0, upper=25) * 1.5)
-    return idx.sort_values("demo_score", ascending=False).reset_index(drop=True)
+    return idx.sort_values("age", ascending=False).reset_index(drop=True)   # oldest first
 
 
 @st.cache_data(show_spinner=False)
@@ -549,6 +570,33 @@ def gauge(soh: float, eol: float, color: str):
     return fig
 
 
+def range_gauge(range_now: float, rated: float, eol: float, color: str):
+    """Range shown the same way as SoH — a gauge from 0 to the rated full-charge range, with the
+    end-of-life range (rated × EoL%) marked as the threshold and the same health-coloured zones."""
+    eol_range = rated * eol / 100.0
+    fig = go.Figure(go.Indicator(
+        mode="gauge+number",
+        value=round(range_now),
+        number={"suffix": " km", "font": {"size": 44, "color": TEXT}},
+        gauge={
+            "axis": {"range": [0, rated], "tickwidth": 1, "tickcolor": FAINT,
+                     "tickfont": {"size": 11, "color": MUTE}},
+            "bar": {"color": color, "thickness": 0.32},
+            "bgcolor": PANEL, "borderwidth": 0,
+            "steps": [
+                {"range": [0, eol_range], "color": "rgba(239,93,99,0.18)"},
+                {"range": [eol_range, eol_range + rated * 0.08], "color": "rgba(243,177,78,0.18)"},
+                {"range": [eol_range + rated * 0.08, rated], "color": "rgba(52,209,127,0.16)"},
+            ],
+            "threshold": {"line": {"color": AMBER, "width": 4}, "thickness": 0.8,
+                          "value": eol_range},
+        },
+    ))
+    fig.update_layout(height=240, margin=dict(l=18, r=18, t=10, b=4),
+                      paper_bgcolor="rgba(0,0,0,0)", font={"color": TEXT})
+    return fig
+
+
 # ===========================================================================
 # Global dark styling — full-width premium shell
 # ===========================================================================
@@ -601,8 +649,8 @@ if idx.empty:
     st.error("No vehicle data available for this brand right now.")
     st.stop()
 
-demo_vins = idx["vin"].head(8).tolist()
-ordered = demo_vins + [v for v in idx["vin"].tolist() if v not in demo_vins]
+demo_vins = idx.nlargest(8, "demo_score")["vin"].tolist()     # ⭐ = long history + visible decline
+ordered = idx["vin"].tolist()                                 # already sorted oldest-first
 
 
 def _vin_label(v: str) -> str:
@@ -611,7 +659,8 @@ def _vin_label(v: str) -> str:
     if row.empty:
         return v + star
     r0 = row.iloc[0]
-    return f"{v}  ·  {int(r0['n_months'])} mo history · started {r0['soh_start']:.0f}%{star}"
+    return (f"{v}  ·  {int(r0['n_months'])} mo · started {r0['soh_start']:.0f}% · "
+            f"{r0['status']}{star}")
 
 
 vcol1, _ = st.columns([0.55, 0.45])
@@ -665,11 +714,21 @@ proj = (model_project(oem, g, eol)                             # the pipeline mo
 # 1) HERO — Battery health gauge
 # ===========================================================================
 section("BATTERY HEALTH", "How your battery is doing")
-hero_l, hero_r = st.columns([0.4, 0.6], gap="large")
+hero_l, hero_r = st.columns([0.52, 0.48], gap="large")
 with hero_l:
-    with st.container(border=True):
-        st.plotly_chart(gauge(soh_now, eol, status_color), use_container_width=True,
-                        config={"displayModeBar": False})
+    gc1, gc2 = st.columns(2, gap="small")
+    with gc1:
+        with st.container(border=True):
+            st.plotly_chart(gauge(soh_now, eol, status_color), use_container_width=True,
+                            config={"displayModeBar": False}, key="g_soh")
+            st.markdown(f"<div style='text-align:center;color:{MUTE};font-size:0.85rem;margin-top:-6px;'>"
+                        f"Battery health</div>", unsafe_allow_html=True)
+    with gc2:
+        with st.container(border=True):
+            st.plotly_chart(range_gauge(range_now, rated, eol, status_color), use_container_width=True,
+                            config={"displayModeBar": False}, key="g_range")
+            st.markdown(f"<div style='text-align:center;color:{MUTE};font-size:0.85rem;margin-top:-6px;'>"
+                        f"Range now · {rated:.0f} km when new</div>", unsafe_allow_html=True)
 with hero_r:
     with st.container(border=True):
         st.markdown(f"<span class='pill' style='background:{status_color}26;color:{status_color};'>"
@@ -696,7 +755,6 @@ with hero_r:
 st.write("")
 stat_strip([
     ("Battery health", f"{soh_now:.0f}%", None, status_color),
-    ("Range now", f"{range_now:.0f} km", f"{range_now - rated:+.0f} km vs new"),
     ("Battery age", fmt_age(age_now)),
     ("Distance driven", f"{odo:,.0f} km" if odo and odo > 0 else "—"),
     ("Charge cycles", f"{cycles:,.0f}" if cycles and np.isfinite(cycles) and cycles > 0 else "—"),
@@ -747,7 +805,7 @@ if proj is not None:
     xp = np.linspace(proj["now_age"], chart_end, 40)
     fig.add_trace(go.Scatter(x=xp / 12, y=proj["fit"](xp), mode="lines",
                              line=dict(color=status_color, width=2, dash="dash"),
-                             name="Projected"))
+                             name="Predicted"))
 fig.add_hline(y=eol, line=dict(color=AMBER, width=2, dash="dot"),
               annotation_text=f"End-of-life ({eol:.0f}%)", annotation_position="bottom right",
               annotation_font=dict(color=AMBER, size=12))
@@ -811,7 +869,7 @@ with wr:
         st.markdown(f"<span class='pill' style='background:{vcolor}26;color:{vcolor};'>"
                     f"{'✅' if survives else '👀'} {verdict}</span>", unsafe_allow_html=True)
         st.write("")
-        st.metric("Projected health at warranty end", f"{proj_at_deadline:.0f}%",
+        st.metric("Predicted health at warranty end", f"{proj_at_deadline:.0f}%",
                   delta=f"{proj_at_deadline - eol:+.0f} pts vs end-of-life",
                   delta_color="normal" if survives else "inverse")
         if survives:
@@ -1089,10 +1147,10 @@ if soh_now <= eol:
     bg = RED
 elif status_label == "Healthy" and survives:
     summary = (f"Your battery is healthy and ageing normally — at {soh_now:.0f}% health and "
-               f"projected to stay above the warranty threshold. Nothing to worry about. 🎉")
+               f"predicted to stay above the warranty threshold. Nothing to worry about. 🎉")
     bg = GREEN
 elif survives:
-    summary = (f"Your battery is ageing at a normal pace ({soh_now:.0f}% health) and is projected "
+    summary = (f"Your battery is ageing at a normal pace ({soh_now:.0f}% health) and is predicted "
                f"to stay healthy through the warranty. Keep charging and driving as usual.")
     bg = GREEN
 else:
@@ -1106,6 +1164,6 @@ st.markdown(f"<div style='background:{PANEL};border:1px solid {LINE};border-left
             f"💬 {summary}</div>", unsafe_allow_html=True)
 st.write("")
 st.markdown(f"<div style='color:{FAINT};font-size:0.82rem;'>Turno · Sample customer "
-            f"battery-health view. Health, range and projections are estimates from your "
+            f"battery-health view. Health, range and predictions are estimates from your "
             f"vehicle's monthly battery data and may vary with real-world use.</div>",
             unsafe_allow_html=True)
