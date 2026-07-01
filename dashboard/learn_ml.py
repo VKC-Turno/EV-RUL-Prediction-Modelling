@@ -1254,7 +1254,7 @@ elif step == STEPS[5]:
     splitnames = ["train", "validation", "test"]
     rowlab = {"train": "🟢 Training", "validation": "🟡 Validation", "test": "🔴 Test"}
     colmap = {"train": GREEN, "validation": AMBER, "test": RED}
-    fig = make_subplots(rows=3, cols=3, column_titles=list(OEM_KEYS),
+    fig = make_subplots(rows=3, cols=len(OEM_KEYS), column_titles=list(OEM_KEYS),
                         row_titles=[rowlab[k] for k in splitnames],
                         vertical_spacing=0.05, horizontal_spacing=0.05)
     for ci, oem in enumerate(OEM_KEYS, start=1):
@@ -1269,7 +1269,7 @@ elif step == STEPS[5]:
                                 opacity=0.5, row=ri, col=ci, showlegend=False)
             fig.add_hline(y=EOL_PCT[oem], line=dict(color=AMBER, width=1, dash="dot"), row=ri, col=ci)
     fig.update_yaxes(range=[55, 101], **AX); fig.update_xaxes(dtick=1, **AX)
-    for ci in range(1, 4):
+    for ci in range(1, len(OEM_KEYS) + 1):
         fig.update_xaxes(title_text="age (years)", row=3, col=ci)
     fig.update_annotations(font_size=12)
     fig.update_layout(**lay(height=640, showlegend=False, margin=dict(l=42, r=44, t=44, b=40)))
@@ -1294,7 +1294,7 @@ elif step == STEPS[5]:
     aged_set = {o: set(risk_by_oem.get(o, [])) for o in OEM_KEYS}
     gated = {o: data_quality.apply_quality(FEATS_BY[o], o) for o in OEM_KEYS}
     ymin = 101.0
-    fig2 = make_subplots(rows=1, cols=3, horizontal_spacing=0.06, subplot_titles=[
+    fig2 = make_subplots(rows=1, cols=len(OEM_KEYS), horizontal_spacing=0.06, subplot_titles=[
         f"{o} — {gated[o].vin.nunique()} vehicles · {len(aged_set[o])} reached EoL" for o in OEM_KEYS])
     for ci, oem in enumerate(OEM_KEYS, start=1):
         Fg = gated[oem]; eol = EOL_PCT[oem]; a100 = RENORM100[oem]
@@ -1344,7 +1344,7 @@ elif step == STEPS[5]:
                       "✅ Good total": int(cur[o].bucket.isin(training_curation.GOOD).sum())})
     st.table(pd.DataFrame(crows).set_index("Fleet"))
     cmin = 101.0
-    cfig = make_subplots(rows=1, cols=3, horizontal_spacing=0.06, subplot_titles=list(OEM_KEYS))
+    cfig = make_subplots(rows=1, cols=len(OEM_KEYS), horizontal_spacing=0.06, subplot_titles=list(OEM_KEYS))
     for ci, o in enumerate(OEM_KEYS, start=1):
         Fg = data_quality.apply_quality(FEATS_BY[o], o); eol = EOL_PCT[o]; a100 = RENORM100[o]; warr = WARR_MO[o]
         bk = cur[o].set_index("vin")
