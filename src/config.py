@@ -19,7 +19,10 @@ INTELLICAR = {
     "cols_by_oem": {
         "mahindra": ["vin", "eventAt", "make", "model", "soc", "current",
                      "batteryVoltage", "odometer", "dte"],
-        # "piaggio": [...],  # TODO audit; piaggio additionally has chargeCycle, batteryTemp
+        # Audited 2026-07: MBX rows carry signed current(98%)+voltage(84%)+soc(100%)+chargeCycle(94%)+
+        # odometer(84%) → coulomb-ready. No batterySoh/remainingCapacity/batteryTemperature in intellicar.
+        "piaggio": ["vin", "eventAt", "make", "model", "soc", "current", "batteryVoltage",
+                    "chargeCycle", "odometer", "controllerTemperature", "motorTemperature"],
     },
 }
 
@@ -69,8 +72,23 @@ OEM_FEEDS = {
                   "NO remaining-capacity -> coulomb & BMS-capacity SoH both impossible; use reported "
                   "essBmsSohcEstPercValue. odometer is in metres. Span 2025-09..2026-06 (~10 mo)."),
     },
+    "piaggio": {
+        "prefix": "battery-oem-data/parquet/piaggio/vehicle-data/",
+        "split": "vehicle-data/",
+        "dense_files": True,             # dense native feed (NOT the mahindra 70M-tiny-files problem)
+        "reserved_cols": set(),
+        "has_current": False,            # native has only batteryDischargeCurrent (discharge-only, often null)
+        "has_reported_soh": False,       # no batterySoh / remaining-capacity in native
+        # Native uses lowercase `eventat`; VIN prefix MBX; batteryVoltage is 100% NULL here.
+        "cols": ["eventat", "vin", "soc", "odometer", "batteryDischargeCurrent", "batteryCharging",
+                 "distanceTillEmpty", "controllerTemperature", "motorTemperature", "latitude",
+                 "longitude", "speed", "driveMode", "keyOn"],
+        "notes": ("Native feed: dense, VIN prefix MBX, 2023→2026. soc+odometer present; batteryVoltage "
+                  "100% NULL; NO batterySoh / remaining-capacity; only batteryDischargeCurrent "
+                  "(discharge-only). SoH is built from the INTELLICAR feed (signed current) via COULOMB; "
+                  "native supplies thermal/usage features + a distance-per-SoC cross-check."),
+    },
     # Not yet audited — add prefix + audited cols before extracting:
-    # "piaggio": {"prefix": "battery-oem-data/parquet/piaggio/...", ...},
     # "montra": {...}, "jbm": {...},
 }
 
@@ -95,7 +113,8 @@ DEFAULT_WARRANTY = (5, 120000)
 # Fleet-level representative warranty (years, km) per OEM — the cohort-majority variant. SINGLE SOURCE for
 # the one-warranty-line-per-OEM dashboard views (so config and the dashboard never drift apart again).
 # Euler = HiLoad (3yr, provisional); Mahindra = Treo (3yr); Bajaj = RE E-TEC battery (5yr; km usually binds first).
-FLEET_WARRANTY = {"euler": (3, 80000), "mahindra": (3, 120000), "bajaj": (5, 120000)}
+FLEET_WARRANTY = {"euler": (3, 80000), "mahindra": (3, 120000), "bajaj": (5, 120000),
+                  "piaggio": (3, 100000)}   # Ape E-Xtra FX; from WARRANTY["piaggio"]
 
 
 def warranty_for(oem, model):
@@ -113,7 +132,7 @@ def warranty_for(oem, model):
 # builds — high-SoC band, isotonic fit); 'reported' = the BMS-reported SoH field directly (Bajaj).
 # (Euler's 'batterySoh' reported field is garbage 0/>70000, so Euler uses bms_capacity, NOT 'reported'.)
 SOH_METHOD = {"intellicar": "coulomb", "mahindra": "distance_per_soc", "euler": "bms_capacity",
-              "bajaj": "reported"}
+              "bajaj": "reported", "piaggio": "coulomb"}   # piaggio: coulomb via intellicar current (Tier A)
 
 # Monthly-sample cadence: dense feeds tolerate more days/month.
 DAYS_PER_MONTH = {"intellicar": [8, 16, 24], "default": [15]}

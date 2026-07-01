@@ -16,6 +16,8 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 import boto3, pandas as pd
 from botocore.config import Config
 from dotenv import load_dotenv
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import config as _cfg                                 # OEM registry (prefixes, per-OEM columns, cadence)
 
 FEED = sys.argv[1]                                   # 'intellicar' | the OEM's own feed name
 OEM = sys.argv[2] if len(sys.argv) > 2 else "mahindra"
@@ -24,21 +26,25 @@ load_dotenv(".env")
 B = os.environ["S3_BUCKET"]
 COHORT = pd.read_csv(f"data/manifests/{OEM}_cohort.csv")["vin"].tolist()
 
-# Per-OEM data lives under data/<oem>/{intellicar,feed}. See src/config.py for the registry.
-CFG = {
-    "intellicar": dict(
-        prefix="battery-oem-data/parquet/intellicar/battery-data/",
-        out=f"data/{OEM}/intellicar", cap=2500, days_per_month=[8, 16, 24], skip_year="0000",
-        # current is reserved -> quoted in SELECT
-        cols=["vin", "eventAt", "make", "model", "soc", "current", "batteryVoltage", "odometer", "dte"],
-        split="battery-data/"),
-    "mahindra": dict(
-        prefix="battery-oem-data/parquet/mahindra/vehicle-data/",
-        out=f"data/{OEM}/feed", cap=15000, days_per_month=[15], skip_year=None,
-        cols=["eventAt", "vin", "soc", "odometer", "distanceToEmpty", "latitude", "longitude",
-              "gearPosition", "batteryTemp", "state", "kwh", "vehicleModel"],
-        split="vehicle-data/"),
-}[FEED]
+# Config-driven so a new OEM is a src/config.py entry, not a code fork. Columns/prefix/cadence come from
+# INTELLICAR (shared feed) or OEM_FEEDS[<oem>] (native feed). `current` is reserved -> quoted in SELECT below.
+_IC_DEFAULT = ["vin", "eventAt", "make", "model", "soc", "current", "batteryVoltage", "odometer", "dte"]
+if FEED == "intellicar":
+    CFG = dict(
+        prefix=_cfg.INTELLICAR["prefix"], out=f"data/{OEM}/intellicar",
+        cap=_cfg.FILES_PER_DAY_CAP.get("intellicar", 2500),
+        days_per_month=_cfg.DAYS_PER_MONTH.get("intellicar", [8, 16, 24]),
+        skip_year=_cfg.INTELLICAR.get("skip_year", "0000"),
+        cols=_cfg.INTELLICAR["cols_by_oem"].get(OEM, _IC_DEFAULT),
+        split=_cfg.INTELLICAR["split"])
+elif FEED in _cfg.OEM_FEEDS:
+    f = _cfg.OEM_FEEDS[FEED]
+    CFG = dict(
+        prefix=f["prefix"], out=f"data/{OEM}/feed", cap=_cfg.FILES_PER_DAY_CAP.get("default", 15000),
+        days_per_month=([8, 16, 24] if f.get("dense_files") else _cfg.DAYS_PER_MONTH.get("default", [15])),
+        skip_year=None, cols=f["cols"], split=f["split"])
+else:
+    raise SystemExit(f"unknown feed '{FEED}' — add it to src/config.py OEM_FEEDS")
 
 OUT = Path(CFG["out"]); OUT.mkdir(parents=True, exist_ok=True)
 MW = 44
