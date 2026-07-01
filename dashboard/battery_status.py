@@ -649,6 +649,127 @@ stat_strip([
 
 
 # ===========================================================================
+# 6) LIFESPAN — degradation history + projection (the centrepiece chart)
+# ===========================================================================
+section("LIFESPAN", "How your battery is aging")
+life_left = (fmt_months_human(proj["months_to_eol"])
+             if proj and proj["months_to_eol"] is not None
+             else ("reached end-of-life" if soh_now <= eol else "no decline yet"))
+stat_strip([
+    ("Health today", f"{soh_now:.0f}%", None, status_color),
+    ("Healthy life left", life_left),
+    ("End-of-life line", f"{eol:.0f}%"),
+    ("Warranty term", f"{warr_years} yr / {warr_km / 1000:.0f}k km"),
+])
+st.write("")
+
+# Extend the x-axis all the way to where the projection crosses end-of-life, so the dashed line
+# actually reaches the 80% line. Cap at ~25 yr so a near-flat vehicle can't produce a runaway axis.
+eol_age = (proj["now_age"] + proj["months_to_eol"]) if (proj and proj["months_to_eol"] is not None) else None
+_base = max(warr_months + 6, (age_now + 12) if np.isfinite(age_now) else 60, 60)
+chart_end = float(min(max(_base, (eol_age + 6) if eol_age is not None else 0), 300))
+
+fig = go.Figure()
+try:
+    fl = df.dropna(subset=["soh", "age_months"]).copy()
+    fl["bin"] = (fl["age_months"] / 3).round() * 3
+    band = fl.groupby("bin")["soh"].agg(
+        lo=lambda s: s.quantile(0.10), hi=lambda s: s.quantile(0.90), n="size").reset_index()
+    band = band[band["n"] >= 5].sort_values("bin")
+    if len(band) >= 3:
+        fig.add_trace(go.Scatter(
+            x=[b / 12 for b in band["bin"]] + [b / 12 for b in band["bin"][::-1]],
+            y=list(band["hi"]) + list(band["lo"][::-1]),
+            fill="toself", fillcolor="rgba(90,169,247,0.10)", line=dict(width=0),
+            hoverinfo="skip", name="Typical for the fleet"))
+except Exception:
+    pass
+
+fig.add_trace(go.Scatter(x=g["age_months"] / 12, y=g["soh"], mode="lines+markers",
+                         line=dict(color=status_color, width=3), marker=dict(size=6),
+                         name="Your battery"))
+if proj is not None:
+    xp = np.linspace(proj["now_age"], chart_end, 40)
+    fig.add_trace(go.Scatter(x=xp / 12, y=proj["fit"](xp), mode="lines",
+                             line=dict(color=status_color, width=2, dash="dash"),
+                             name="Projected"))
+fig.add_hline(y=eol, line=dict(color=AMBER, width=2, dash="dot"),
+              annotation_text=f"End-of-life ({eol:.0f}%)", annotation_position="bottom right",
+              annotation_font=dict(color=AMBER, size=12))
+fig.add_vline(x=warr_years, line=dict(color=MUTE, width=1.5, dash="dash"),
+              annotation_text=f"Warranty ({warr_years} yr)", annotation_position="top left",
+              annotation_font=dict(color=MUTE, size=11))
+if eol_age is not None and eol_age <= chart_end + 1:
+    fig.add_vline(x=eol_age / 12, line=dict(color=status_color, width=1.4, dash="dot"),
+                  annotation_text=f"Est. end-of-life · {fmt_months_human(proj['months_to_eol'])} left",
+                  annotation_position="top right",
+                  annotation_font=dict(color=status_color, size=11))
+fig.update_layout(xaxis=dict(title="Battery age (years)"),
+                  yaxis=dict(title="Battery health (%)", range=[eol - 18, 102]),
+                  hovermode="x unified")
+chart(fig, height=400, legend=True)
+
+
+# ===========================================================================
+# 7) WARRANTY CARD + verdict
+# ===========================================================================
+section("WARRANTY", "What's next")
+time_used_frac = float(np.clip(age_now / warr_months, 0, 1)) if np.isfinite(age_now) else 0.0
+km_used_frac = months_to_km_limit = None
+if km_month and km_month > 0 and odo is not None:
+    km_used_frac = float(np.clip(odo / warr_km, 0, 1))
+    months_to_km_limit = max(0.0, (warr_km - odo) / km_month)
+
+time_remaining = max(0.0, warr_months - age_now) if np.isfinite(age_now) else warr_months
+if months_to_km_limit is not None:
+    eff_remaining = min(time_remaining, months_to_km_limit)
+    eff_bound = "distance" if months_to_km_limit < time_remaining else "time"
+else:
+    eff_remaining, eff_bound = time_remaining, "time"
+eff_deadline_age = (age_now if np.isfinite(age_now) else 0.0) + eff_remaining
+proj_at_deadline = float(proj["fit"](eff_deadline_age)) if proj is not None else soh_now
+survives = proj_at_deadline >= eol
+
+wl, wr = st.columns([0.5, 0.5], gap="large")
+with wl:
+    with st.container(border=True):
+        st.markdown(f"**Warranty term** — {warr_years} years or {warr_km:,.0f} km "
+                    f"(whichever comes first)")
+        st.write("")
+        st.markdown(f"Time used — **{fmt_age(age_now)}** of {warr_years} years")
+        st.progress(time_used_frac)
+        if km_used_frac is not None:
+            st.markdown(f"Distance used — **{odo:,.0f} km** of {warr_km:,.0f} km")
+            st.progress(km_used_frac)
+        else:
+            st.caption("Distance usage not available for this vehicle.")
+        st.write("")
+        if eff_remaining > 0:
+            st.markdown(f"⏳ About **{fmt_months_human(eff_remaining)}** of warranty left "
+                        f"(reaches its {eff_bound} limit first).")
+        else:
+            st.markdown("⏳ This vehicle is **past its warranty window**.")
+with wr:
+    with st.container(border=True):
+        vcolor = GREEN if survives else AMBER
+        verdict = "On track to stay healthy through warranty" if survives else "Worth watching"
+        st.markdown(f"<span class='pill' style='background:{vcolor}26;color:{vcolor};'>"
+                    f"{'✅' if survives else '👀'} {verdict}</span>", unsafe_allow_html=True)
+        st.write("")
+        st.metric("Projected health at warranty end", f"{proj_at_deadline:.0f}%",
+                  delta=f"{proj_at_deadline - eol:+.0f} pts vs end-of-life",
+                  delta_color="normal" if survives else "inverse")
+        if survives:
+            st.markdown(f"At its current ageing pace, your battery should still be around "
+                        f"**{proj_at_deadline:.0f}%** when the warranty ends — comfortably above "
+                        f"the {eol:.0f}% end-of-life line.")
+        else:
+            st.markdown(f"At its current ageing pace, your battery may approach the "
+                        f"**{eol:.0f}%** end-of-life line near the end of warranty. Keep an eye on "
+                        f"range and book a check-up if it drops noticeably.")
+
+
+# ===========================================================================
 # 2) STATE OF CHARGE  (LFP-correct: high SoC is tolerated; heat is the stressor)
 # ===========================================================================
 soc_high = mean_val(g, "frac_soc_high")
@@ -747,15 +868,15 @@ if usage_items:
 if has_km or has_chg:
     fig = go.Figure()
     if has_km:
-        fig.add_trace(go.Bar(x=gm["age_months"], y=gm["km_month"], name="km / month",
+        fig.add_trace(go.Bar(x=gm["age_months"] / 12, y=gm["km_month"], name="km / month",
                              marker_color=BLUE, opacity=0.85))
     if has_chg:
-        fig.add_trace(go.Scatter(x=gm["age_months"], y=chg_y, name=chg_name, yaxis="y2",
+        fig.add_trace(go.Scatter(x=gm["age_months"] / 12, y=chg_y, name=chg_name, yaxis="y2",
                                  mode="lines+markers", line=dict(color=AMBER, width=2.4),
                                  marker=dict(size=5)))
     fig.update_layout(
         bargap=0.32,
-        xaxis=dict(title="Battery age (months)"),
+        xaxis=dict(title="Battery age (years)"),
         yaxis=dict(title="km / month"),
     )
     if has_chg:
@@ -888,134 +1009,20 @@ if "driveeff_mean" in g.columns and g["driveeff_mean"].notna().any():
     ])
     st.write("")
     fig = go.Figure()
-    fig.add_trace(go.Scatter(x=ge["age_months"], y=ge["driveeff_mean"],
+    fig.add_trace(go.Scatter(x=ge["age_months"] / 12, y=ge["driveeff_mean"],
                              mode="lines+markers", line=dict(color=GREEN, width=2.6),
                              marker=dict(size=5), name="Your efficiency"))
     if fs is not None:
         fig.add_hline(y=fs["med"], line=dict(color=MUTE, width=1.2, dash="dot"),
                       annotation_text="fleet typical", annotation_position="bottom right",
                       annotation_font=dict(color=MUTE, size=11))
-    fig.update_layout(xaxis=dict(title="Battery age (months)"),
+    fig.update_layout(xaxis=dict(title="Battery age (years)"),
                       yaxis=dict(title="efficiency score"))
     chart(fig, height=300)
     why("How efficiently your vehicle turns battery energy into distance. Smoother, "
         "steadier driving keeps this high; lots of hard acceleration and stop-start "
         "traffic pulls it down. It doesn't damage the battery directly, but a higher "
         "score means more range from the same charge.")
-
-
-# ===========================================================================
-# 6) LIFESPAN — degradation history + projection (the centrepiece chart)
-# ===========================================================================
-section("LIFESPAN", "How your battery is aging")
-life_left = (fmt_months_human(proj["months_to_eol"])
-             if proj and proj["months_to_eol"] is not None
-             else ("reached end-of-life" if soh_now <= eol else "no decline yet"))
-stat_strip([
-    ("Health today", f"{soh_now:.0f}%", None, status_color),
-    ("Healthy life left", life_left),
-    ("End-of-life line", f"{eol:.0f}%"),
-    ("Warranty term", f"{warr_years} yr / {warr_km / 1000:.0f}k km"),
-])
-st.write("")
-
-chart_end = max(warr_months, age_now if np.isfinite(age_now) else 0,
-                (proj["months_to_eol"] + proj["now_age"]) if (proj and proj["months_to_eol"]) else 0)
-chart_end = float(min(chart_end + 3, max(warr_months + 6, 90)))
-
-fig = go.Figure()
-try:
-    fl = df.dropna(subset=["soh", "age_months"]).copy()
-    fl["bin"] = (fl["age_months"] / 3).round() * 3
-    band = fl.groupby("bin")["soh"].agg(
-        lo=lambda s: s.quantile(0.10), hi=lambda s: s.quantile(0.90), n="size").reset_index()
-    band = band[band["n"] >= 5].sort_values("bin")
-    if len(band) >= 3:
-        fig.add_trace(go.Scatter(
-            x=list(band["bin"]) + list(band["bin"][::-1]),
-            y=list(band["hi"]) + list(band["lo"][::-1]),
-            fill="toself", fillcolor="rgba(90,169,247,0.10)", line=dict(width=0),
-            hoverinfo="skip", name="Typical for the fleet"))
-except Exception:
-    pass
-
-fig.add_trace(go.Scatter(x=g["age_months"], y=g["soh"], mode="lines+markers",
-                         line=dict(color=status_color, width=3), marker=dict(size=6),
-                         name="Your battery"))
-if proj is not None:
-    xp = np.linspace(proj["now_age"], chart_end, 40)
-    fig.add_trace(go.Scatter(x=xp, y=proj["fit"](xp), mode="lines",
-                             line=dict(color=status_color, width=2, dash="dash"),
-                             name="Projected"))
-fig.add_hline(y=eol, line=dict(color=AMBER, width=2, dash="dot"),
-              annotation_text=f"End-of-life ({eol:.0f}%)", annotation_position="bottom right",
-              annotation_font=dict(color=AMBER, size=12))
-fig.add_vline(x=warr_months, line=dict(color=MUTE, width=1.5, dash="dash"),
-              annotation_text=f"Warranty ({warr_years} yr)", annotation_position="top left",
-              annotation_font=dict(color=MUTE, size=11))
-fig.update_layout(xaxis=dict(title="Battery age (months)"),
-                  yaxis=dict(title="Battery health (%)", range=[eol - 18, 102]),
-                  hovermode="x unified")
-chart(fig, height=400, legend=True)
-
-
-# ===========================================================================
-# 7) WARRANTY CARD + verdict
-# ===========================================================================
-section("WARRANTY", "What's next")
-time_used_frac = float(np.clip(age_now / warr_months, 0, 1)) if np.isfinite(age_now) else 0.0
-km_used_frac = months_to_km_limit = None
-if km_month and km_month > 0 and odo is not None:
-    km_used_frac = float(np.clip(odo / warr_km, 0, 1))
-    months_to_km_limit = max(0.0, (warr_km - odo) / km_month)
-
-time_remaining = max(0.0, warr_months - age_now) if np.isfinite(age_now) else warr_months
-if months_to_km_limit is not None:
-    eff_remaining = min(time_remaining, months_to_km_limit)
-    eff_bound = "distance" if months_to_km_limit < time_remaining else "time"
-else:
-    eff_remaining, eff_bound = time_remaining, "time"
-eff_deadline_age = (age_now if np.isfinite(age_now) else 0.0) + eff_remaining
-proj_at_deadline = float(proj["fit"](eff_deadline_age)) if proj is not None else soh_now
-survives = proj_at_deadline >= eol
-
-wl, wr = st.columns([0.5, 0.5], gap="large")
-with wl:
-    with st.container(border=True):
-        st.markdown(f"**Warranty term** — {warr_years} years or {warr_km:,.0f} km "
-                    f"(whichever comes first)")
-        st.write("")
-        st.markdown(f"Time used — **{fmt_age(age_now)}** of {warr_years} years")
-        st.progress(time_used_frac)
-        if km_used_frac is not None:
-            st.markdown(f"Distance used — **{odo:,.0f} km** of {warr_km:,.0f} km")
-            st.progress(km_used_frac)
-        else:
-            st.caption("Distance usage not available for this vehicle.")
-        st.write("")
-        if eff_remaining > 0:
-            st.markdown(f"⏳ About **{fmt_months_human(eff_remaining)}** of warranty left "
-                        f"(reaches its {eff_bound} limit first).")
-        else:
-            st.markdown("⏳ This vehicle is **past its warranty window**.")
-with wr:
-    with st.container(border=True):
-        vcolor = GREEN if survives else AMBER
-        verdict = "On track to stay healthy through warranty" if survives else "Worth watching"
-        st.markdown(f"<span class='pill' style='background:{vcolor}26;color:{vcolor};'>"
-                    f"{'✅' if survives else '👀'} {verdict}</span>", unsafe_allow_html=True)
-        st.write("")
-        st.metric("Projected health at warranty end", f"{proj_at_deadline:.0f}%",
-                  delta=f"{proj_at_deadline - eol:+.0f} pts vs end-of-life",
-                  delta_color="normal" if survives else "inverse")
-        if survives:
-            st.markdown(f"At its current ageing pace, your battery should still be around "
-                        f"**{proj_at_deadline:.0f}%** when the warranty ends — comfortably above "
-                        f"the {eol:.0f}% end-of-life line.")
-        else:
-            st.markdown(f"At its current ageing pace, your battery may approach the "
-                        f"**{eol:.0f}%** end-of-life line near the end of warranty. Keep an eye on "
-                        f"range and book a check-up if it drops noticeably.")
 
 
 # ===========================================================================
