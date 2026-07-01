@@ -52,9 +52,10 @@ def train_quantiles(t, alphas=(0.1, 0.5, 0.9)):
 
 
 def _row(state, stress):
+    # Direct numpy feature vector (no per-step DataFrame) — same values / FEATS order; big Step-10 speedup.
     isa, dfc = _curv(state["age_months"], state["soh"])
-    return pd.DataFrame([{**{s: state[s] for s in STATE}, **stress,
-                          "inv_sqrt_age": isa, "soh_deficit": dfc}])[FEATS].to_numpy()
+    d = {**{s: state[s] for s in STATE}, **stress, "inv_sqrt_age": isa, "soh_deficit": dfc}
+    return np.array([[float(d[f]) for f in FEATS]])
 
 
 def simulate(g, models, horizon, recent_k=6):

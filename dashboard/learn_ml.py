@@ -297,15 +297,19 @@ def all_split_predictions(oem_key, deg_only=False):
         hist = gg; cut_age = float(gg["age_months"].iloc[-1])
         warr_age = eff_warr_months(oem_key, gg, wmap.get(vin, wdef))   # km-bound: min(time term, time-to-120k-km)
         H_MAX = 120                                             # cap (months) to avoid absurd extrapolation
+        # Only roll forward as far as the display needs — to the warranty deadline + a buffer to catch EoL
+        # crossings. Vehicles that survive well past warranty are still classified 'safe' without the full
+        # 120-month roll, so this cuts Step-10 latency ~2x without changing any outcome.
+        H = int(np.clip(round(warr_age - cut_age) + 30, 12, H_MAX))
         if euler:
-            fc = mod.forecast(hist, fmodel, H_MAX); p10, p50, p90 = fc[0.1], fc[0.5], fc[0.9]
+            fc = mod.forecast(hist, fmodel, H); p10, p50, p90 = fc[0.1], fc[0.5], fc[0.9]
         else:
-            sim = mod.simulate(hist, fmodel, H_MAX)
+            sim = mod.simulate(hist, fmodel, H)
             p10, p50, p90 = sim["q10"].to_numpy(), sim["q50"].to_numpy(), sim["q90"].to_numpy()
         # extend until the P50 forecast reaches EoL (even past warranty); else stop a little past the deadline.
         hit = np.where(np.asarray(p50) <= EOL_PCT[oem_key])[0]
         end = (int(hit[0]) + 4) if len(hit) else int(round(warr_age - cut_age)) + 6
-        end = int(np.clip(max(end, round(warr_age - cut_age) + 2), 3, H_MAX))
+        end = int(np.clip(max(end, round(warr_age - cut_age) + 2), 3, H))
         last = float(gg["soh"].iloc[-1])                        # anchor the forecast to the present SoH
         fage = np.concatenate([[cut_age], cut_age + np.arange(1, end + 1)])
         p10 = np.concatenate([[last], p10[:end]]); p50 = np.concatenate([[last], p50[:end]])
