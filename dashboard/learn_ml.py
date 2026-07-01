@@ -389,9 +389,9 @@ def _fleet_coverage():
 
 FLEET_COV = _fleet_coverage()                                            # registered fleet vs modeled, from Redshift
 
-# Native-only Mahindra SoH via the distance-per-SoC proxy on the whole-fleet MONTHLY sample
-# (built by src/mahindra_native_soh.py). Kept SEPARATE from the intellicar coulomb Mahindra — shown as its
-# own Step-3 column to expose that the native feed (no current) yields only a flat/noisy range proxy.
+# "Mahindra Native" — a SEPARATE OEM: the ~12k native-only Mahindra fleet, SoH via the distance-per-SoC
+# proxy on native data ALONE (built by src/mahindra_native_soh.py, zero intellicar). Never combined with the
+# intellicar coulomb "Mahindra"; shown as its own Step-3 column to expose the native feed's lack of SoH signal.
 _NAT_SOH_PATH = "data/mahindra/native_monthly_soh.parquet"
 NATIVE_SOH = pd.read_parquet(_NAT_SOH_PATH) if os.path.exists(_NAT_SOH_PATH) else None
 _tv = sum(F.vin.nunique() for F in FEATS_BY.values()); _tm = sum(len(F) for F in FEATS_BY.values())
@@ -1159,10 +1159,11 @@ elif step == STEPS[3]:
         col.caption(f"reached {eol}%: {int((o.smin<=eol).sum())} · median history {int(o.months.median())} mo")
     if NATIVE_SOH is not None:
         col = cols[3]; o = ov(NATIVE_SOH); rise = int((o.s0 - o.s1 <= -2).sum())
-        col.markdown(f"**Mahindra · native monthly** · _distance-per-SoC proxy_ · {int((o.s0-o.s1>=2).sum())} 'degraders'")
+        col.markdown(f"**Mahindra Native** · _distance-per-SoC (native-only)_ · {int((o.s0-o.s1>=2).sum())} 'degraders'")
         col.plotly_chart(_native_soh_fig(which="deg"), use_container_width=True)
-        col.caption(f"⚠️ noise, not aging — **{rise}** other vehicles' proxy went *up* ≥2pp (~coin-flip). "
-                    f"No current → no true SoH. {NATIVE_SOH.vin.nunique()} vins, {int(ov(NATIVE_SOH).months.median())} mo median.")
+        col.caption(f"**Separate OEM — native feed only, never mixed with intellicar.** ⚠️ Noise, not aging: "
+                    f"**{rise}** vehicles' proxy went *up* ≥2pp (~coin-flip). No current → no true SoH. "
+                    f"{NATIVE_SOH.vin.nunique()} vins.")
     st.markdown("##### ⚪ Still near-new — flat (lost <2%)")
     cols2 = st.columns(_ncol)
     for col, oem in zip(cols2[:3], OEM_KEYS):
@@ -1171,10 +1172,10 @@ elif step == STEPS[3]:
         col.plotly_chart(_soh_fig(oem, which="flat"), use_container_width=True)
     if NATIVE_SOH is not None:
         col = cols2[3]; o = ov(NATIVE_SOH)
-        col.markdown(f"**Mahindra · native monthly** · {int((o.s0-o.s1<2).sum())} flat")
+        col.markdown(f"**Mahindra Native** · {int((o.s0-o.s1<2).sum())} flat")
         col.plotly_chart(_native_soh_fig(which="flat"), use_container_width=True)
-        col.caption("Same fleet, **native feed** (no current) — a distance-per-SoC proxy on monthly data, kept "
-                    "**separate** from the intellicar coulomb column. Wobbles both ways: no clean aging signal.")
+        col.caption("**Its own OEM** — the ~12k native-only Mahindra fleet, distance-per-SoC on native data, "
+                    "**never combined with the intellicar coulomb Mahindra**. Wobbles both ways: no clean aging signal.")
     concept("How SoH is *measured* differs per fleet — Euler reads BMS remaining-capacity, Mahindra "
             "coulomb-counts current, Bajaj trusts the BMS-reported value. (Euler/Mahindra are anchored to "
             "100% at registration; Bajaj uses the absolute reported value, so its lines start below 100%.)")
