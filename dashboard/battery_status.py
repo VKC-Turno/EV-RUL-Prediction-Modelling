@@ -158,6 +158,7 @@ def vehicle_index(oem: str) -> pd.DataFrame:
         drop = float(g["soh"].head(3).mean() - g["soh"].tail(3).mean())
         rows.append(dict(vin=vin, n_months=n, last_soh=now_soh, soh_start=float(soh[0]),
                          drop=drop if np.isfinite(drop) else 0.0,
+                         flat=("flat" if (not np.isfinite(drop) or drop < 2) else "declining"),
                          age=now_age if np.isfinite(now_age) else 0.0, status=status))
     idx = pd.DataFrame(rows)
     if idx.empty:
@@ -355,25 +356,41 @@ def project(age_months, soh, eol: float) -> dict | None:
 _MODEL_MODULE = {"Euler": "euler_model", "Mahindra": "model", "Bajaj": "bajaj_model"}
 
 
+# Training populations compared in the Lifespan chart. safe = never observed at/below EoL.
+POPULATIONS = [("all", "All vehicles", GREEN), ("deg", "Degraders only", AMBER),
+               ("safe", "Safe (incl. flat)", BLUE), ("safe_deg", "Safe degraders", "#c792ff")]
+
+
 @st.cache_resource(show_spinner=False)
-def customer_forecaster(oem: str):
-    """Train (once, cached) the pipeline model for an OEM on its full quality-gated cohort."""
-    df = load_oem(oem)
+def customer_forecaster(oem: str, pop: str = "all"):
+    """Train (cached) the pipeline model for an OEM on a chosen training population:
+    all · deg (drop≥2) · safe (never reached EoL) · safe_deg (safe AND drop≥2)."""
+    df = load_oem(oem); eol = EOL[oem]
+    gg = df.groupby("vin"); drop = gg["soh"].first() - gg["soh"].last(); smin = gg["soh"].min()
+    if pop == "deg":
+        keep = set(drop[drop >= 2].index)
+    elif pop == "safe":
+        keep = set(smin[smin > eol].index)
+    elif pop == "safe_deg":
+        keep = set(drop[drop >= 2].index) & set(smin[smin > eol].index)
+    else:
+        keep = set(df["vin"].unique())
+    df = df[df["vin"].isin(keep)]
     mod = importlib.import_module(_MODEL_MODULE[oem])
     if oem == "Euler":
         return mod, mod.train_traj(mod.build_traj_samples(df))
     return mod, mod.train_quantiles(mod.build_transitions(df))
 
 
-def model_project(oem: str, g, eol: float, horizon: int = 120) -> dict | None:
-    """Forecast this vehicle with the pipeline model, exposing the same interface as project():
-    fit(age)->SoH, months_to_eol, now_age, now_soh. The central line is anchored at the present SoH."""
+def model_project(oem: str, g, eol: float, horizon: int = 120, pop: str = "all") -> dict | None:
+    """Forecast this vehicle with the pipeline model (trained on population `pop`), exposing the same
+    interface as project(): fit(age)->SoH, months_to_eol, now_age, now_soh. Anchored at the present SoH."""
     gg = g.dropna(subset=["soh", "age_months"]).sort_values("month")
     if len(gg) < 4:
         return None
     now_age = float(gg["age_months"].iloc[-1]); now_soh = float(gg["soh"].iloc[-1])
     try:
-        mod, fmodel = customer_forecaster(oem)
+        mod, fmodel = customer_forecaster(oem, pop)
         if oem == "Euler":
             p50 = np.asarray(mod.forecast(gg, fmodel, horizon)[0.5], dtype=float)
         else:
@@ -504,24 +521,53 @@ def chart(fig, height: int = 320, legend: bool = False):
                         config={"displayModeBar": False})
 
 
-def soc_density_fig(soc_mean, frac_low, frac_high):
-    """Approximate SoC distribution from the summary stats we track (time at low / typical / high charge).
-    We don't get the full per-percent histogram, so the shape is representative — the mass is real."""
+def _soc_curve(soc_mean, frac_low, frac_high):
     fl = max(float(frac_low or 0.0), 0.0); fh = max(float(frac_high or 0.0), 0.0)
     fm = max(1.0 - fl - fh, 0.05); mid = float(np.clip(soc_mean if soc_mean else 55.0, 35.0, 78.0))
     x = np.linspace(0, 100, 240)
     y = (fl * np.exp(-0.5 * ((x - 16) / 9) ** 2) + fm * np.exp(-0.5 * ((x - mid) / 13) ** 2)
          + fh * np.exp(-0.5 * ((x - 88) / 8) ** 2))
-    y = y / (y.max() or 1.0)
-    fig = go.Figure(go.Scatter(x=x, y=y, mode="lines", fill="tozeroy",
+    return x, y / (y.max() or 1.0)
+
+
+def soc_density_fig(soc_mean, frac_low, frac_high, overlays=None):
+    """Approximate SoC distribution from the summary stats we track. `overlays` = list of
+    (label, soc_mean, frac_low, frac_high, colour) drawn as comparison lines (e.g. best / worst vehicle)."""
+    x, y = _soc_curve(soc_mean, frac_low, frac_high)
+    fig = go.Figure(go.Scatter(x=x, y=y, mode="lines", fill="tozeroy", name="You",
                                line=dict(color=GREEN, width=2.4), fillcolor=GREEN_FILL))
     if soc_mean:
         fig.add_vline(x=float(soc_mean), line=dict(color=MUTE, width=1.2, dash="dot"),
-                      annotation_text=f"typical {soc_mean:.0f}%", annotation_font_size=11,
+                      annotation_text=f"you {soc_mean:.0f}%", annotation_font_size=11,
                       annotation_font_color=MUTE)
+    for label, sm, flo, fhi, color in (overlays or []):
+        xo, yo = _soc_curve(sm, flo, fhi)
+        fig.add_scatter(x=xo, y=yo, mode="lines", name=label, line=dict(color=color, width=2, dash="dash"))
     fig.update_layout(xaxis=dict(title="state of charge (%)", range=[0, 100]),
                       yaxis=dict(visible=False))
     return fig
+
+
+@st.cache_data(show_spinner=False)
+def best_worst_soc(oem: str):
+    """Healthiest + most-degraded vehicle (by current SoH) among REAL decliners with enough history
+    (≥15 months, ≥2pp drop — never flat / too new) for the SoC comparison overlay. Returns dict or None."""
+    df = load_oem(oem)
+    rows = []
+    for vin, g in df.groupby("vin"):
+        gg = g.dropna(subset=["soh"]).sort_values("age_months")
+        if len(gg) < 15:                                   # not too new
+            continue
+        if float(gg["soh"].iloc[0] - gg["soh"].iloc[-1]) < 2:   # not flat
+            continue
+        sm = mean_val(g, "soc_mean"); fh = mean_val(g, "frac_soc_high"); fl = mean_val(g, "frac_soc_low")
+        if sm is None or fh is None:
+            continue
+        rows.append((vin, float(gg["soh"].iloc[-1]), sm, fl, fh))
+    if len(rows) < 2:
+        return None
+    rows.sort(key=lambda r: r[1])
+    return {"worst": rows[0], "best": rows[-1]}
 
 
 def temp_dist_fig(values, marker):
@@ -660,7 +706,7 @@ def _vin_label(v: str) -> str:
         return v + star
     r0 = row.iloc[0]
     return (f"{v}  ·  {int(r0['n_months'])} mo · started {r0['soh_start']:.0f}% · "
-            f"{r0['status']}{star}")
+            f"{r0['status']} · {r0['flat']}{star}")
 
 
 vcol1, _ = st.columns([0.55, 0.45])
@@ -778,9 +824,13 @@ st.write("")
 
 # Extend the x-axis all the way to where the projection crosses end-of-life, so the dashed line
 # actually reaches the 80% line. Cap at ~25 yr so a near-flat vehicle can't produce a runaway axis.
+# Forecast the vehicle under each training population (overlaid below); hero/warranty use the 'all' proj.
+pop_projs = {pop: model_project(oem, g, eol, pop=pop) for pop, _, _ in POPULATIONS}
 eol_age = (proj["now_age"] + proj["months_to_eol"]) if (proj and proj["months_to_eol"] is not None) else None
+_cross = [(p["now_age"] + p["months_to_eol"]) for p in pop_projs.values() if p and p["months_to_eol"] is not None]
+_latest = max(_cross) if _cross else (eol_age or 0)
 _base = max(warr_months + 6, (age_now + 12) if np.isfinite(age_now) else 60, 60)
-chart_end = float(min(max(_base, (eol_age + 6) if eol_age is not None else 0), 300))
+chart_end = float(min(max(_base, _latest + 6), 300))
 
 fig = go.Figure()
 try:
@@ -801,11 +851,13 @@ except Exception:
 fig.add_trace(go.Scatter(x=g["age_months"] / 12, y=g["soh"], mode="lines+markers",
                          line=dict(color=status_color, width=3), marker=dict(size=6),
                          name="Your battery"))
-if proj is not None:
-    xp = np.linspace(proj["now_age"], chart_end, 40)
-    fig.add_trace(go.Scatter(x=xp / 12, y=proj["fit"](xp), mode="lines",
-                             line=dict(color=status_color, width=2, dash="dash"),
-                             name="Predicted"))
+for pop, label, color in POPULATIONS:                          # one predicted line per training population
+    pj = pop_projs.get(pop)
+    if pj is None:
+        continue
+    xp = np.linspace(pj["now_age"], chart_end, 40)
+    fig.add_trace(go.Scatter(x=xp / 12, y=pj["fit"](xp), mode="lines",
+                             line=dict(color=color, width=2, dash="dash"), name=f"Predicted · {label}"))
 fig.add_hline(y=eol, line=dict(color=AMBER, width=2, dash="dot"),
               annotation_text=f"End-of-life ({eol:.0f}%)", annotation_position="bottom right",
               annotation_font=dict(color=AMBER, size=12))
@@ -817,10 +869,47 @@ if eol_age is not None and eol_age <= chart_end + 1:
                   annotation_text=f"Est. end-of-life · {fmt_months_human(proj['months_to_eol'])} left",
                   annotation_position="top right",
                   annotation_font=dict(color=status_color, size=11))
-fig.update_layout(xaxis=dict(title="Battery age (years)"),
-                  yaxis=dict(title="Battery health (%)", range=[eol - 18, 102]),
-                  hovermode="x unified")
-chart(fig, height=400, legend=True)
+# Registration date = age 0. If recoverable (first timestamp − first age), show a dual x-axis
+# (calendar date on the bottom, battery age on top) + a vertical line at registration.
+reg = None
+try:
+    _m0 = pd.Timestamp(g["month"].iloc[0])
+    if pd.notna(_m0):
+        reg = (_m0 - pd.DateOffset(months=int(round(float(g["age_months"].iloc[0]))))).normalize()
+except Exception:
+    reg = None
+
+if reg is not None and pd.notna(reg):
+    _reglbl = reg.strftime("%b '%y")
+    fig.add_vline(x=0, line=dict(color=FAINT, width=1.5, dash="dot"),
+                  annotation_text=f"Registered {_reglbl}", annotation_position="bottom right",
+                  annotation_font=dict(color=FAINT, size=10))
+    _yrmax = max(1, int(np.ceil(chart_end / 12)))
+    _yrs = list(range(0, _yrmax + 1))
+    _dates = [(reg + pd.DateOffset(years=y)).strftime("%b '%y") for y in _yrs]
+    fig.add_trace(go.Scatter(x=[0, _yrmax], y=[eol, eol], mode="lines", line=dict(width=0),
+                             xaxis="x2", showlegend=False, hoverinfo="skip"))     # anchors the top age axis
+    fig.update_layout(
+        height=440, paper_bgcolor=PANEL, plot_bgcolor=PANEL, font=dict(color=MUTE, size=12),
+        margin=dict(l=44, r=16, t=52, b=40), hovermode="x unified",
+        legend=dict(orientation="h", y=-0.22, x=0, font=dict(size=11)),
+        xaxis=dict(title="Date", range=[0, _yrmax], gridcolor=LINE, color=MUTE, zeroline=False,
+                   tickmode="array", tickvals=_yrs, ticktext=_dates),
+        xaxis2=dict(title="Battery age (years)", overlaying="x", side="top", range=[0, _yrmax],
+                    color=MUTE, showgrid=False, zeroline=False, tickmode="array",
+                    tickvals=_yrs, ticktext=[str(y) for y in _yrs]),
+        yaxis=dict(title="Battery health (%)", range=[eol - 18, 102], gridcolor=LINE, color=MUTE, zeroline=False))
+    with st.container(border=True):
+        st.plotly_chart(fig, use_container_width=True, config={"displayModeBar": False})
+else:
+    fig.update_layout(xaxis=dict(title="Battery age (years)"),
+                      yaxis=dict(title="Battery health (%)", range=[eol - 18, 102]),
+                      hovermode="x unified")
+    chart(fig, height=400, legend=True)
+st.caption("Each dashed line is the *same* forecast model trained on a different **population** of vehicles — "
+           "All · Degraders-only (lost ≥2%) · Safe (never reached end-of-life) · Safe-degraders (safe **and** "
+           "declining). Where they diverge shows how much the training set shapes the prediction. The "
+           "headline health & warranty figures above use the **All-vehicles** model.")
 
 
 # ===========================================================================
@@ -895,8 +984,14 @@ if soc_high is not None:
         ("Time at low charge", f"{fl * 100:.0f}%" if fl is not None else "—"),
     ])
     st.write("")
-    chart(soc_density_fig(sm, fl, soc_high), height=300)
-    st.caption("Approximate shape, built from how much time you spend at low / typical / high charge.")
+    _bw = best_worst_soc(oem); _ov = []
+    if _bw:
+        _b = _bw["best"]; _w = _bw["worst"]
+        _ov = [(f"Healthiest · {_b[1]:.0f}% SoH", _b[2], _b[3], _b[4], BLUE),
+               (f"Most degraded · {_w[1]:.0f}% SoH", _w[2], _w[3], _w[4], RED)]
+    chart(soc_density_fig(sm, fl, soc_high, _ov), height=300, legend=bool(_ov))
+    st.caption("Approximate shape, from how much time you spend at low / typical / high charge. Dashed = the "
+               "fleet's **healthiest** and **most-degraded** vehicles (both real decliners with long history).")
     why(
         "Your fleet runs <b>LFP (lithium iron phosphate)</b> batteries. Unlike the "
         "nickel-based cells in many cars, LFP is <b>very tolerant of sitting at a high "
