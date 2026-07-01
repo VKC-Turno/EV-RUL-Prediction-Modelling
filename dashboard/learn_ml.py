@@ -82,13 +82,23 @@ def load_ft(path):
     return pd.read_parquet(path).sort_values(["vin", "month"])
 
 
-def deg_filter(m, on):
-    """When `on`, keep only DEGRADER vehicles (>=2 pp total SoH drop), excluding flat/near-new ones from
-    the train/validation/test sets. Off (default) uses the full dataset."""
-    if not on:
+def deg_filter(m, mode):
+    """Restrict the frame to a training population: 'deg' = degraders (≥2pp SoH drop), 'safe' = flat/near-new
+    (<2pp drop), 'all'/False = full dataset. (Callers filter only the TRAIN split; val/test stay fixed.)"""
+    if mode in (None, False, "all"):
         return m
     d = m.groupby("vin")["soh"].agg(lambda s: s.iloc[0] - s.iloc[-1])
-    return m[m["vin"].isin(d[d >= 2].index)]
+    keep = d[d >= 2].index if mode == "deg" else d[d < 2].index
+    return m[m["vin"].isin(keep)]
+
+
+def _train_vins(vins, drop, mode):
+    """Filter a vin set to the chosen training population ('deg' ≥2pp / 'safe' <2pp / else all)."""
+    if mode == "deg":
+        return {v for v in vins if drop[v] >= 2}
+    if mode == "safe":
+        return {v for v in vins if drop[v] < 2}
+    return set(vins)
 
 
 def _split(vins, drop, seed=0, force_train=frozenset()):
@@ -120,7 +130,7 @@ def diagnostics(oem_key, deg_only=False):
     drop = (g["soh"].first() - g["soh"].last())
     smin = g["soh"].min(); aged = set(smin[smin <= EOL_PCT[oem_key]].index)   # completely-aged -> always train
     TR, VA, TE = _split(list(m["vin"].unique()), drop, force_train=aged)
-    tr = {v for v in TR if drop[v] >= 2} if deg_only else TR   # toggle filters TRAIN only (val/test fixed)
+    tr = _train_vins(TR, drop, deg_only)                       # toggle filters TRAIN only (val/test fixed)
     t_tr = mod.build_transitions(m[m["vin"].isin(tr)])
     if hasattr(mod, "train"):                       # Euler rate model (XGBoost regression)
         reg = mod.train(t_tr); bias = float(getattr(reg, "_cal_bias", 0.0))
@@ -154,7 +164,7 @@ def forecaster(oem_key, deg_only=False):
     mod = importlib.import_module(cfg["module"])
     m = deg_filter(data_quality.apply_quality(load_cohort(oem_key), oem_key), deg_only)
     if oem_key == "Euler":
-        if not deg_only:                                  # use the persisted all-vehicle model
+        if deg_only in (False, "all"):                    # use the persisted all-vehicle model
             import euler_train
             b = euler_train.load_latest()
             if b and b.get("traj_model"):
@@ -248,31 +258,31 @@ def warranty_map(oem_key):
     return default, {}
 
 
-@st.cache_data(show_spinner="Forecasting every test vehicle…")
-def test_predictions(oem_key, deg_only=False):
-    """Train on the NON-test vehicles, then for each TEST vehicle forecast from its latest data out to
-    its own warranty deadline (= registration + warranty term). Returns per-vehicle actual + forecast."""
+@st.cache_data(show_spinner="Forecasting every vehicle…")
+def all_split_predictions(oem_key, deg_only=False):
+    """Train ONCE on the TRAIN split, then forecast every vehicle in each split from its latest data out to
+    its own warranty deadline. Returns {'train':[...], 'validation':[...], 'test':[...]}.
+    NOTE: 'train' vehicles were used to fit the model (in-sample); validation & test are held out."""
     cfg = OEMS[oem_key]
-    m = data_quality.apply_quality(load_cohort(oem_key), oem_key)   # drop data-thin; TEST set FIXED regardless of deg_only
+    m = data_quality.apply_quality(load_cohort(oem_key), oem_key)   # drop data-thin; splits FIXED regardless of deg_only
     mod = importlib.import_module(cfg["module"])
     g = m.groupby("vin")
     drop = g["soh"].first() - g["soh"].last()
     smin = g["soh"].min(); aged = set(smin[smin <= EOL_PCT[oem_key]].index)   # completely-aged -> always train
     TR, VA, TE = _split(list(m["vin"].unique()), drop, force_train=aged)
-    tr_vins = {v for v in (TR | VA) if drop[v] >= 2} if deg_only else (TR | VA)  # filter TRAIN only
+    tr_vins = _train_vins(TR, drop, deg_only)                                # fit on the TRAIN split only
     train = m[m["vin"].isin(tr_vins)]
     euler = oem_key == "Euler"
     fmodel = (mod.train_traj(mod.build_traj_samples(train)) if euler
               else mod.train_quantiles(mod.build_transitions(train)))
     reg = reg_dates(oem_key); wdef, wmap = warranty_map(oem_key)
-    out = []
-    for vin in sorted(TE):
+
+    def forecast_vin(vin):
         gg = m[m["vin"] == vin].sort_values("month").reset_index(drop=True); n = len(gg)
         if n < 6:
-            continue
-        # Forecast from the LATEST (present) data point using the vehicle's FULL observed history — not
-        # from a 60% cut. Operationally we want "where is it now and where is it heading", so the green
-        # forecast begins exactly where the measured (teal) line ends.
+            return None
+        # Forecast from the LATEST (present) data point using the vehicle's FULL observed history, so the
+        # forecast begins exactly where the measured line ends.
         hist = gg; cut_age = float(gg["age_months"].iloc[-1])
         warr_age = eff_warr_months(oem_key, gg, wmap.get(vin, wdef))   # km-bound: min(time term, time-to-120k-km)
         H_MAX = 120                                             # cap (months) to avoid absurd extrapolation
@@ -281,8 +291,7 @@ def test_predictions(oem_key, deg_only=False):
         else:
             sim = mod.simulate(hist, fmodel, H_MAX)
             p10, p50, p90 = sim["q10"].to_numpy(), sim["q50"].to_numpy(), sim["q90"].to_numpy()
-        # extend the x-axis until the P50 forecast reaches the end-of-life line (even past warranty); if it
-        # never does, stop a little past the warranty deadline. Always show through the warranty line.
+        # extend until the P50 forecast reaches EoL (even past warranty); else stop a little past the deadline.
         hit = np.where(np.asarray(p50) <= EOL_PCT[oem_key])[0]
         end = (int(hit[0]) + 4) if len(hit) else int(round(warr_age - cut_age)) + 6
         end = int(np.clip(max(end, round(warr_age - cut_age) + 2), 3, H_MAX))
@@ -291,10 +300,14 @@ def test_predictions(oem_key, deg_only=False):
         p10 = np.concatenate([[last], p10[:end]]); p50 = np.concatenate([[last], p50[:end]])
         p90 = np.concatenate([[last], p90[:end]])
         rd = reg.get(vin)
-        out.append(dict(vin=vin[-6:], reg=(rd.strftime("%b '%y") if pd.notna(rd) else "?"),
-                        warr_age=warr_age, age=gg["age_months"].to_numpy().tolist(),
-                        soh=gg["soh"].to_numpy().tolist(), fage=fage.tolist(),
-                        p10=p10.tolist(), p50=p50.tolist(), p90=p90.tolist()))
+        return dict(vin=vin[-6:], reg=(rd.strftime("%b '%y") if pd.notna(rd) else "?"),
+                    warr_age=warr_age, age=gg["age_months"].to_numpy().tolist(),
+                    soh=gg["soh"].to_numpy().tolist(), fage=fage.tolist(),
+                    p10=p10.tolist(), p50=p50.tolist(), p90=p90.tolist())
+
+    out = {}
+    for name, vins in (("train", TR), ("validation", VA), ("test", TE)):
+        out[name] = [p for p in (forecast_vin(v) for v in sorted(vins)) if p]
     return out
 
 
@@ -313,13 +326,15 @@ st.sidebar.caption("How our battery-health models are built — explained from s
 SMOOTH = st.sidebar.checkbox("Smooth SoH curves", value=True,
                              help="Round the staircase from the monotonic SoH envelope into a curve "
                                   "(display only — the model still uses the raw monthly SoH).")
-DEG_ONLY = st.sidebar.checkbox("Train on degraders only", value=False,
-                               help="Exclude flat/near-new vehicles (lost <2% SoH) from the TRAINING set "
-                                    "only — the validation/test vehicles stay the SAME, so the warranty-risk "
-                                    "counts are a fair with-vs-without-flat comparison on identical "
-                                    "vehicles. Affects Steps 5/7/8/10. OFF is the default.")
-if DEG_ONLY:
-    st.sidebar.warning("⚠️ Degraders-only TRAINING (validation/test vehicles held fixed).")
+# DEG_ONLY holds the training-population MODE: "all" | "deg" (degraders, ≥2pp drop) | "safe" (flat/near-new,
+# <2pp). Only the TRAIN split is filtered — validation/test stay the SAME, so it's a fair comparison.
+_TRAIN_ON = st.sidebar.radio("Train on", ["All vehicles", "Degraders only", "Safe only"], index=0,
+                             help="Which vehicles the model is FIT on. Degraders lost ≥2% SoH; Safe lost <2% "
+                                  "(flat / near-new). Validation & test vehicles stay identical, so the warranty-"
+                                  "risk counts are a fair comparison. Affects Steps 5/7/8/10. 'All vehicles' is default.")
+DEG_ONLY = {"All vehicles": "all", "Degraders only": "deg", "Safe only": "safe"}[_TRAIN_ON]
+if DEG_ONLY != "all":
+    st.sidebar.warning(f"⚠️ Training on **{_TRAIN_ON}** (validation/test held fixed).")
 
 
 def smooth(s, win=5):
@@ -560,15 +575,47 @@ def _rul_order(oem):
 
 
 @st.cache_data(show_spinner=False)
-def _rul_demo(oem, deg_only, rank=0):
+def _rul_pair(oem):
+    """Two REAL degraders that started ~100%, drove a SIMILAR distance, but degraded at DIFFERENT rates —
+    ending at different SoH (=> different range & remaining life). Both are declining (neither is a flat
+    artifact), so it's a fair rate-vs-rate comparison: the point that the same kilometres age batteries very
+    differently (usage intensity + heat). Returns [gentler_vin, harder_vin]; falls back to worst-SoH pair."""
+    m = data_quality.apply_quality(FEATS_BY[oem], oem)
+    a = m.groupby("vin").agg(n=("soh", "size"), first=("soh", "first"), last=("soh", "last"),
+                             odo=("odo_max", "max"))
+    a["drp"] = a["first"] - a["last"]
+    for start_hi, min_drop in ((97, 5.0), (90, 4.0), (0, 3.0)):     # prefer 'started ~100 & a clear decline'
+        d = a[(a["n"] >= 8) & (a["odo"] < 3e5) & (a["odo"] > 5000)
+              & (a["first"] >= start_hi) & (a["drp"] >= min_drop)].sort_values("odo")
+        if len(d) < 2:
+            continue
+        v = d.index.to_numpy(); od = d["odo"].to_numpy(); ls = d["last"].to_numpy()
+        tol = max(0.10 * float(np.median(od)), 5000.0)             # "same distance" window
+        best = None
+        for i in range(len(d)):
+            j = i + 1
+            while j < len(d) and od[j] - od[i] <= tol:
+                gap = abs(ls[i] - ls[j]); score = gap + (od[i] + od[j]) / 2 / 1e5   # different endpoints, tie-break higher km
+                if gap >= 5 and (best is None or score > best[0]):
+                    best = (score, i, j)
+                j += 1
+        if best is not None:
+            _, i, j = best
+            hi, lo = (i, j) if ls[i] >= ls[j] else (j, i)
+            return [v[hi], v[lo]]                                   # gentler degrader (green), harder degrader (purple)
+    order, _ = _rul_order(oem)
+    return order[:2]
+
+
+@st.cache_data(show_spinner=False)
+def _rul_demo(oem, deg_only, vin):
     m = data_quality.apply_quality(FEATS_BY[oem], oem)
     eol, wyr, wkm = EOL_PCT[oem], WARRANTY_YR[oem], WARRANTY_KM[oem]
-    order, reached_flag = _rul_order(oem)
-    vin = order[min(rank, len(order) - 1)]
     g = m[m.vin == vin].sort_values("month").reset_index(drop=True)
     cur = float(g.soh.iloc[-1]); a0m = float(g["age_months"].iloc[-1])
     has_odo = "odo_max" in g.columns and bool((g["odo_max"] < 3e5).any())
     odo_now = float(g["odo_max"][g["odo_max"] < 3e5].max()) if has_odo else None
+    reached_flag = (a0m / 12.0 >= wyr) or (odo_now is not None and odo_now >= wkm)   # did THIS vehicle reach warranty?
     reach_by = "km" if (odo_now is not None and odo_now >= wkm) else "age"
     # near-term degradation rate from the model, then a LINEAR projection to EoL — avoids the rate model's
     # asymptotic flattening (its predicted monthly loss decays to ~0 over a long horizon).
@@ -628,11 +675,14 @@ def _range_fig(oem, infos, h=230):
     return fig
 
 
-def _rul_soh_fig(oem, infos, h=230):
-    """SoH for two warranty-vehicles overlaid: each measured (solid) + forecast (dashed) to EoL, with the binding
-    warranty limit marked. X-axis adapts: AGE (years) when time-bound, ODOMETER (km) when distance-bound."""
+def _rul_soh_fig(oem, infos, h=230, on_km=None):
+    """SoH for two vehicles overlaid: each measured (solid) + forecast (dashed) to EoL, with the warranty limit
+    marked. X-axis: ODOMETER (km) when on_km (the same-distance comparison), else AGE / auto."""
     info0 = infos[0]; eol = info0["eol"]
-    use_km = info0.get("reach_by") == "km" and info0.get("odo_hist") and len(info0["odo_hist"]) >= 2
+    auto_km = info0.get("reach_by") == "km" and info0.get("odo_hist") and len(info0["odo_hist"]) >= 2
+    use_km = auto_km if on_km is None else on_km
+    if use_km and not (info0.get("odo_hist") and len(info0["odo_hist"]) >= 2):
+        use_km = False                                                # no odo history -> fall back to age
     fig = go.Figure(); hi = 0.0
     for j, info in enumerate(infos):
         c = _PAIRCOL[j % 2]
@@ -692,9 +742,9 @@ def _bucketise(preds, eol):
     return cats
 
 
-def _testgrid_fig(oem):
-    """2x2 panel: held-out test vehicles grouped by outcome (one panel per group, vehicles overlaid)."""
-    preds = test_predictions(oem, DEG_ONLY)
+def _testgrid_fig(oem, which="test"):
+    """2x2 panel: one split's vehicles grouped by outcome (one panel per group, vehicles overlaid)."""
+    preds = all_split_predictions(oem, DEG_ONLY).get(which, [])
     if not preds:
         return None, {}
     eol = EOL_PCT[oem]; a100 = RENORM100[oem]
@@ -726,6 +776,40 @@ def _testgrid_fig(oem):
     fig.update_annotations(font_size=12)
     fig.update_layout(**lay(height=640, showlegend=False, margin=dict(l=44, r=16, t=46, b=40)))
     return fig, {k: len(cats[k]) for k, _ in TESTCAT}
+
+
+@st.cache_data(show_spinner=False)
+def atrisk_compare(oem):
+    """At-risk (n, count) per split for each training population (all / degraders / safe); splits held fixed."""
+    eol = EOL_PCT[oem]; res = {}
+    for mode in ("all", "deg", "safe"):
+        preds = all_split_predictions(oem, mode); d = {}; tn = ta = 0
+        for which in ("test", "validation", "train"):
+            c = _bucketise(preds[which], eol)
+            n = sum(len(v) for v in c.values()); a = len(c["At-risk"])
+            d[which] = (n, a); tn += n; ta += a
+        d["fleet"] = (tn, ta); res[mode] = d
+    return res
+
+
+def _atrisk_fig(oem):
+    """Grouped bar: at-risk % per split for each training population (all / degraders / safe); splits fixed."""
+    res = atrisk_compare(oem)
+    order = [("test", "Test"), ("validation", "Validation"), ("train", "Train"), ("fleet", "Fleet (all)")]
+    x = [lbl for _, lbl in order]
+    pct = lambda md: [(100 * res[md][k][1] / res[md][k][0]) if res[md][k][0] else 0.0 for k, _ in order]
+    txt = lambda md: [f"{res[md][k][1]}/{res[md][k][0]}<br>{100 * res[md][k][1] / res[md][k][0]:.0f}%"
+                      if res[md][k][0] else "—" for k, _ in order]
+    fig = go.Figure()
+    for md, name, color in (("all", "All vehicles", TEAL), ("deg", "Degraders-only", AMBER),
+                            ("safe", "Safe-only", GREEN)):
+        fig.add_bar(x=x, y=pct(md), name=name, marker_color=color,
+                    text=txt(md), textposition="outside", textfont=dict(size=10), cliponaxis=False)
+    ymax = (max(pct("all") + pct("deg") + pct("safe")) or 1) * 1.3
+    fig.update_layout(barmode="group", **lay(height=360, margin=dict(l=46, r=16, t=40, b=30)))
+    fig.update_yaxes(title_text="At-risk %", range=[0, ymax], **AX)
+    fig.update_xaxes(**AX)
+    return fig
 
 
 def _feature_grid_fig(oem):
@@ -772,7 +856,7 @@ def _backtest_eval(oem_key, deg_only=False):
     gb = m.groupby("vin"); drop = gb["soh"].first() - gb["soh"].last()
     smin = gb["soh"].min(); aged = set(smin[smin <= EOL_PCT[oem_key]].index)
     TR, VA, TE = _split(list(m["vin"].unique()), drop, force_train=aged)
-    tr_vins = {v for v in (TR | VA) if drop[v] >= 2} if deg_only else (TR | VA)
+    tr_vins = _train_vins(TR | VA, drop, deg_only)
     model = (mod.train_traj(mod.build_traj_samples(m[m["vin"].isin(tr_vins)])) if euler
              else mod.train_quantiles(mod.build_transitions(m[m["vin"].isin(tr_vins)])))
     eol = EOL_PCT[oem_key]; recs = []
@@ -1326,42 +1410,53 @@ elif step == STEPS[10]:
              "Life**. This is exactly what powers the main SoH dashboard.")
 
     st.markdown("---")
-    st.markdown("### 📋 Forecast from today — held-out **test** vehicles, by outcome")
-    st.caption("For every test vehicle (never seen in training) we forecast SoH from its latest data point to "
-               "its warranty deadline, then sort it into **four outcome groups**. Each panel overlays that "
-               "group's vehicles — **solid = measured, dotted = forecast P50**; amber = EoL line; each **◆ "
-               "marks that vehicle's OWN warranty deadline** (whichever of its time term or the km limit it "
-               "reaches first — so deadlines differ by how hard each vehicle is driven). ◆ above EoL = safe, "
-               "below = at-risk.")
+    st.markdown("### 📋 Forecast from today — by split, grouped by outcome")
+    st.caption("For **train**, **validation** and **test** vehicles we forecast SoH from each vehicle's latest "
+               "data point to its warranty deadline, then sort it into **four outcome groups**. Each panel "
+               "overlays that group's vehicles — **solid = measured, dotted = forecast P50**; amber = EoL line; "
+               "each **◆ marks that vehicle's OWN warranty deadline** (whichever of its time term or km limit it "
+               "reaches first). ◆ above EoL = safe, below = at-risk. Validation & test are held out; train is the "
+               "in-sample set the model learned from.")
+    SPLIT_SECTIONS = [("test", "🔴 Test vehicles — held out (final check)", True),
+                      ("validation", "🟡 Validation vehicles — held out (tuning)", False),
+                      ("train", "🟢 Train vehicles — in-sample (the model learned from these)", False)]
     tabs = st.tabs(OEM_KEYS)
     for tab, oem in zip(tabs, OEM_KEYS):
         with tab:
+            eol = EOL_PCT[oem]
+            st.markdown("**At-risk vehicles — effect of the *training population*** "
+                        "(held-out vehicles are identical across all bars; only the training set changes):")
             try:
-                eol = EOL_PCT[oem]
-                fig, counts = _testgrid_fig(oem)
-                if not fig:
-                    st.info("No test vehicles with enough history to forecast.")
-                else:
-                    n = sum(counts.values())
-                    cc = st.columns(5)
-                    cc[0].metric(f"{oem} test vehicles", n)
-                    cc[1].metric("🔴 At-risk", counts["At-risk"])
-                    cc[2].metric("🟢 Safe", counts["Safe"])
-                    cc[3].metric("🟦 Genuinely flat", counts["Genuinely flat"])
-                    cc[4].metric("🟡 Flat (unproven)", counts["Flat (unproven)"])
-                    st.plotly_chart(fig, use_container_width=True)
-                    st.caption(f"**At-risk** = P50 forecast below the {eol}% EoL "
-                               "line at warranty · **Safe** = really declining (≥3pp) but projects to survive · "
-                               "**Genuinely flat** = <3pp decline, observed ≥18 months (trustworthy) · **Flat "
-                               "(unproven)** = <3pp decline but observed <18 months (could still decline — just "
-                               "young). **Warranty deadline = whichever of time *or* the 120k-km limit comes "
-                               "first** (km-bound for Bajaj; time-only for Euler/Mahindra) — each vehicle's "
-                               "**◆** marker. **Note: 'safe' = won't trigger a warranty *claim*** (its warranty "
-                               "ends, on time or km, before SoH crosses EoL) — *not* that the battery is "
-                               "necessarily healthy: a hard-driven vehicle can be degraded yet 'safe' because "
-                               "its km warranty expired early. Flip *Train on degraders only* to watch the split move.")
+                st.plotly_chart(_atrisk_fig(oem), use_container_width=True, key=f"arcmp_{oem}")
             except Exception as ex:
-                st.warning(f"Test-vehicle grid unavailable ({ex}).")
+                st.caption(f"(at-risk comparison unavailable: {ex})")
+            for which, label, is_open in SPLIT_SECTIONS:
+                with st.expander(label, expanded=is_open):
+                    try:
+                        fig, counts = _testgrid_fig(oem, which)
+                        if not fig:
+                            st.info(f"No {which} vehicles with enough history to forecast.")
+                            continue
+                        n = sum(counts.values())
+                        cc = st.columns(5)
+                        cc[0].metric(f"{oem} {which} vehicles", n)
+                        cc[1].metric("🔴 At-risk", counts["At-risk"])
+                        cc[2].metric("🟢 Safe", counts["Safe"])
+                        cc[3].metric("🟦 Genuinely flat", counts["Genuinely flat"])
+                        cc[4].metric("🟡 Flat (unproven)", counts["Flat (unproven)"])
+                        st.plotly_chart(fig, use_container_width=True, key=f"grid_{oem}_{which}")
+                        if which == "train":
+                            st.caption("⚠️ In-sample — these vehicles trained the model, so their fit flatters it; "
+                                       "shown for completeness, not as evidence of accuracy.")
+                    except Exception as ex:
+                        st.warning(f"{which.title()} grid unavailable ({ex}).")
+            st.caption(f"**At-risk** = P50 forecast below the {eol}% EoL line at warranty · **Safe** = really "
+                       "declining (≥3pp) but projects to survive · **Genuinely flat** = <3pp decline, observed "
+                       "≥18 months (trustworthy) · **Flat (unproven)** = <3pp decline but observed <18 months "
+                       "(could still decline — just young). **Warranty deadline = whichever of time *or* the "
+                       "120k-km limit comes first** — each vehicle's **◆** marker. **'Safe' = won't trigger a "
+                       "warranty *claim***, not that the battery is necessarily healthy. Switch *Train on* in the "
+                       "sidebar to watch the split move.")
 
 # ═════════════════════════════════ STEP 11 ═════════════════════════════════
 elif step == STEPS[11]:
@@ -1370,31 +1465,30 @@ elif step == STEPS[11]:
     st.markdown("- **Range now ≈ rated full-charge range × SoH** — a 90%-SoH pack goes ~90% as far.\n"
                 "- **Remaining km to end-of-life = km/month × months-until-SoH-hits-EoL** (read off the forecast). "
                 "A high-utilisation vehicle therefore delivers *more* km before the same calendar-driven EoL.")
-    st.caption("Shown for the most-degraded vehicle in each fleet that has **reached its warranty boundary** "
-               "(time *or* distance, whichever it hit) — the real test of whether a battery survives the warranty. "
-               "Where the fleet is too young for any to have reached it, the **oldest** vehicle is shown and flagged.")
+    st.caption("For each fleet we pick **two vehicles that both started ~100%, drove a similar distance, but aged "
+               "at different rates** — so the *same* kilometres leave them at very different SoH, range and "
+               "remaining life. Distance alone doesn't set health: usage intensity and heat do.")
     cols = st.columns(3)
     for col, oem in zip(cols, OEM_KEYS):
-        order, reached = _rul_order(oem)
-        ranks = [0] if len(order) < 2 else ([0, max(1, len(order) // 4)] if reached else [0, 1])  # worst + a moderate one
-        infos, seen = [], set()
-        for r in ranks:                                              # two vehicles per OEM, for comparison
-            inf = _rul_demo(oem, DEG_ONLY, r)
-            if inf["vin"] not in seen:
-                seen.add(inf["vin"]); infos.append(inf)
-        col.markdown(f"**{oem}** · comparing {len(infos)} vehicles")
+        pair = _rul_pair(oem)
+        infos = [_rul_demo(oem, DEG_ONLY, v) for v in pair]
+        started = [(i["soh_hist"][0] if i.get("soh_hist") else i["cur"]) for i in infos]
+        dist = np.mean([i["odo"] for i in infos if i.get("odo")]) if any(i.get("odo") for i in infos) else None
+        rgap = abs(infos[0]["range_now"] - infos[1]["range_now"]) if len(infos) == 2 else 0.0
+        col.markdown(f"**{oem}** · both from ~100%, ~**{dist/1000:.0f}k km** — aged differently"
+                     if dist else f"**{oem}**")
         for j, info in enumerate(infos):
             dot = "🟢" if j == 0 else "🟣"
-            if info["reached"]:
-                at = f"{info['odo']/1000:.0f}k km" if info["reach_by"] == "km" else f"{info['age_yr']:.1f} yr"
-                mark = "✅" if info["cur"] > info["eol"] + 2 else "⚠️"
-                col.caption(f"{dot} …{info['vin'][-6:]}: {mark} reached warranty (**{at}**) at **SoH "
-                            f"{info['cur']:.0f}%** · range {info['range_now']:.0f} km")
-            else:
-                col.caption(f"{dot} …{info['vin'][-6:]}: oldest **{info['age_yr']:.1f} yr** at **SoH "
-                            f"{info['cur']:.0f}%** (not yet at warranty) · range {info['range_now']:.0f} km")
-        col.plotly_chart(_rul_soh_fig(oem, infos), use_container_width=True)
-        col.caption("SoH measured → forecast (dashed); grey dash-dot = warranty (axis = the binding limit).")
+            d = f"{info['odo']/1000:.0f}k km" if info.get("odo") else f"{info['age_yr']:.1f} yr"
+            col.caption(f"{dot} …{info['vin'][-6:]}: **{started[j]:.0f}% → {info['cur']:.0f}%** "
+                        f"(−{started[j]-info['cur']:.0f}pp) · **{d}** · range **{info['range_now']:.0f} km**")
+        if len(infos) == 2:
+            drops = sorted(started[k] - infos[k]["cur"] for k in (0, 1))
+            col.caption(f"↳ Same distance — one lost **{drops[0]:.0f}pp**, the other **{drops[1]:.0f}pp** → "
+                        f"**{rgap:.0f} km** apart in range.")
+        col.plotly_chart(_rul_soh_fig(oem, infos, on_km=True), use_container_width=True)
+        col.caption("SoH vs **distance** — both from ~100%, same km, aged differently. Measured → forecast (dashed); "
+                    "grey dash-dot = warranty km.")
         col.plotly_chart(_range_fig(oem, infos), use_container_width=True)
         col.caption(f"…converts to range. Grey dotted = OEM promised **{infos[0]['rated']:.0f} km** "
                     f"(ARAI · [source]({RATED_KM_SRC[oem]})); blue line = rated × SoH.")
