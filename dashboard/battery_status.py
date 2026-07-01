@@ -10,7 +10,9 @@ Run:
     .venv/bin/streamlit run dashboard/battery_status.py --server.port 8502
 
 Data: data/redshift/{euler,mahindra,bajaj}_featengg.parquet (real monthly data).
-Projection: a simple robust √t fit per vehicle, clamped so health never rises with age.
+Projection: the same conditioned pipeline models as the internal dashboard (Euler trajectory ·
+Mahindra expected-loss quantiles · Bajaj quantiles), anchored at the present SoH; falls back to a
+robust √t fit for vehicles with too little history for the model.
 
 Fleet is LFP across all three OEMs. Unlike NMC/NCA cells, LFP tolerates sitting at
 high state-of-charge well — for LFP the dominant calendar-aging stressor is HEAT
@@ -23,6 +25,7 @@ styler so every section looks identical and premium.
 """
 from __future__ import annotations
 
+import importlib
 import os
 import sys
 from pathlib import Path
@@ -322,6 +325,57 @@ def project(age_months, soh, eol: float) -> dict | None:
                 now_soh=now_soh, months_to_eol=months_to_eol)
 
 
+# ---------------------------------------------------------------------------
+# Model-based projection — the SAME conditioned models the internal pipeline uses
+# (euler_model trajectory · Mahindra expected-loss quantiles · Bajaj quantiles),
+# so the customer forecast matches the pipeline. Falls back to the √t fit above
+# for vehicles with too little history for the model.
+# ---------------------------------------------------------------------------
+_MODEL_MODULE = {"Euler": "euler_model", "Mahindra": "model", "Bajaj": "bajaj_model"}
+
+
+@st.cache_resource(show_spinner=False)
+def customer_forecaster(oem: str):
+    """Train (once, cached) the pipeline model for an OEM on its full quality-gated cohort."""
+    df = load_oem(oem)
+    mod = importlib.import_module(_MODEL_MODULE[oem])
+    if oem == "Euler":
+        return mod, mod.train_traj(mod.build_traj_samples(df))
+    return mod, mod.train_quantiles(mod.build_transitions(df))
+
+
+def model_project(oem: str, g, eol: float, horizon: int = 120) -> dict | None:
+    """Forecast this vehicle with the pipeline model, exposing the same interface as project():
+    fit(age)->SoH, months_to_eol, now_age, now_soh. The central line is anchored at the present SoH."""
+    gg = g.dropna(subset=["soh", "age_months"]).sort_values("month")
+    if len(gg) < 4:
+        return None
+    now_age = float(gg["age_months"].iloc[-1]); now_soh = float(gg["soh"].iloc[-1])
+    try:
+        mod, fmodel = customer_forecaster(oem)
+        if oem == "Euler":
+            p50 = np.asarray(mod.forecast(gg, fmodel, horizon)[0.5], dtype=float)
+        else:
+            p50 = mod.simulate(gg, fmodel, horizon)["q50"].to_numpy()
+    except Exception:
+        return None
+    if p50.size == 0:
+        return None
+    ages = now_age + np.arange(0, len(p50) + 1)                    # now, now+1, … now+H
+    central = np.concatenate([[now_soh], p50])                     # anchor at the present measured SoH
+    below = np.where(central <= eol)[0]
+    months_to_eol = float(ages[below[0]] - now_age) if len(below) else None
+    tail_slope = min(float(central[-1] - central[-2]), 0.0) if len(central) >= 2 else 0.0
+
+    def fit(t):
+        t = np.asarray(t, dtype=float)
+        y = np.interp(t, ages, central)                           # flat before now, model curve through horizon
+        return np.where(t > ages[-1], central[-1] + tail_slope * (t - ages[-1]), y)   # extrapolate past horizon
+
+    return dict(fit=fit, slope=tail_slope, now_age=now_age, now_soh=now_soh,
+                months_to_eol=months_to_eol)
+
+
 # ===========================================================================
 # Formatting + UI helpers
 # ===========================================================================
@@ -603,7 +657,8 @@ if (km_month is None or km_month <= 0) and odo and np.isfinite(age_now) and age_
 
 range_now = rated * soh_now / 100.0
 status_label, status_color, _ = health_status(soh_now, eol)
-proj = project(g["age_months"].to_numpy(), g["soh"].to_numpy(), eol)
+proj = (model_project(oem, g, eol)                             # the pipeline model (matches the internal dashboard)
+        or project(g["age_months"].to_numpy(), g["soh"].to_numpy(), eol))   # √t fallback for thin history
 
 
 # ===========================================================================
