@@ -79,8 +79,9 @@ def simulate(g, models, horizon, recent_k=6):
         lo = max(lo - min(max(lo_m.predict(x)[0], 0.0), MAX_STEP), 0.0)   # 0.1-loss quantile -> upper band
         mid = max(mid - min(max(mid_m.predict(x)[0], 0.0), MAX_STEP), 0.0)  # expected loss -> central
         hi = max(hi - min(max(hi_m.predict(x)[0], 0.0), MAX_STEP), 0.0)   # 0.9-loss quantile -> lower band
-        st.update(soh=mid, age_months=st["age_months"] + 1,
-                  cum_ah=st["cum_ah"] + stress.get("ah_throughput", 0))
+        # Freeze cum_ah: growing it past the training range makes the tree extrapolate to ~0 loss and
+        # flatline the forecast (see bajaj_model). Age + soh_deficit still evolve the prediction.
+        st.update(soh=mid, age_months=st["age_months"] + 1)
         out.append([lo, mid, hi])
     return pd.DataFrame(out, columns=["q10", "q50", "q90"])
 

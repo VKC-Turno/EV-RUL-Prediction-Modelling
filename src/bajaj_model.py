@@ -42,9 +42,13 @@ def build_transitions(m, max_gap=3.0):
 
 def train_quantiles(t, alphas=(0.1, 0.5, 0.9)):
     X, y, w = t[FEATS].to_numpy(), t["loss"].to_numpy(), t["w"].to_numpy()
-    return {a: lgb.LGBMRegressor(objective="quantile", alpha=a, n_estimators=400, learning_rate=0.03,
-                                 num_leaves=15, min_child_samples=20, verbose=-1).fit(X, y, sample_weight=w)
-            for a in alphas}
+    common = dict(n_estimators=400, learning_rate=0.03, num_leaves=15, min_child_samples=20, verbose=-1)
+    models = {a: lgb.LGBMRegressor(objective="quantile", alpha=a, **common).fit(X, y, sample_weight=w)
+              for a in alphas}
+    # Expected (mean) monthly loss for the CENTRAL line: ~46% of Bajaj months lose nothing, so the conditional
+    # median loss is ~0 for gentle vehicles and a q50 forecast stays flat; the mean bends it toward EoL.
+    models["mean"] = lgb.LGBMRegressor(objective="regression", **common).fit(X, y, sample_weight=w)
+    return models
 
 
 def _row(state, stress):
@@ -54,18 +58,23 @@ def _row(state, stress):
 
 
 def simulate(g, models, horizon, recent_k=6):
-    """Roll forward assuming recent-median stress persists. Returns quantile SoH columns (q10/q50/q90)."""
+    """Roll forward assuming recent stress persists. Central (q50) uses EXPECTED (mean) loss so a gentle
+    vehicle whose conditional MEDIAN loss is ~0 still bends toward EoL; q10/q90 stay genuine quantile bands.
+    Per-step loss is capped so the knee feedback can't run away. Returns q10/q50/q90 SoH columns."""
     g = g.sort_values("month"); last = g.iloc[-1]
     stress = g.iloc[-recent_k:][STRESS].median().to_dict()
     st = {s: float(last[s]) for s in STATE}
-    sh = {q: float(last["soh"]) for q in models}
-    qs = sorted(models); out = []
+    lo_m, hi_m = models[0.1], models[0.9]
+    mid_m = models.get("mean", models[0.5])          # expected loss (falls back to median if absent)
+    MAX_STEP = 1.2
+    lo = mid = hi = float(last["soh"]); out = []
     for _ in range(max(int(horizon), 1)):
         x = _row(st, stress)
-        for q in qs:
-            sh[q] = sh[q] - max(models[q].predict(x)[0], 0)
-        st.update(soh=sh[qs[len(qs) // 2]], age_months=st["age_months"] + 1,
-                  cum_km=st["cum_km"] + stress.get("km_month", 0.0),
-                  cum_cycles=st["cum_cycles"] + stress.get("cyc_month", 0.0))
-        out.append([sh[q] for q in qs])
-    return pd.DataFrame(out, columns=[f"q{int(q*100)}" for q in qs])
+        lo = max(lo - min(max(lo_m.predict(x)[0], 0.0), MAX_STEP), 0.0)   # 0.1-loss quantile -> upper band
+        mid = max(mid - min(max(mid_m.predict(x)[0], 0.0), MAX_STEP), 0.0)  # expected loss -> central
+        hi = max(hi - min(max(hi_m.predict(x)[0], 0.0), MAX_STEP), 0.0)   # 0.9-loss quantile -> lower band
+        # Freeze cum_km / cum_cycles: growing them past the (young-fleet) training range makes the tree
+        # extrapolate to ~0 loss and the forecast flatlines. Age + soh_deficit still evolve the prediction.
+        st.update(soh=mid, age_months=st["age_months"] + 1)
+        out.append([lo, mid, hi])
+    return pd.DataFrame(out, columns=["q10", "q50", "q90"])
