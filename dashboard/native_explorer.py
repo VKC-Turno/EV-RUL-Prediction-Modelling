@@ -237,14 +237,8 @@ st.caption("Charging = consecutive readings where SoC **rises**; discharging = S
            "flaky `vehicleStatus`). Shows the SoC band each mode operates over — how deep vehicles run down while "
            "driving, and from what level they charge back up.")
 
-# ── 8. Individual SoC vs time — daily charge/discharge cycles ──
-st.header("8 · Individual SoC vs time — daily cycles (charge green / discharge red)")
-
-
-@st.cache_data(show_spinner=False)
-def _best_day(v):
-    g = load_raw().query("vin == @v")
-    return g.groupby("day").size().idxmax() if len(g) else None
+# ── 8. Individual SoC vs time — full timeline ──
+st.header("8 · Individual SoC vs time — full timeline (charge green / discharge red)")
 
 
 @st.cache_data(show_spinner=False)
@@ -253,25 +247,22 @@ def _rich_vins(n=6):
 
 
 all_vins = sorted(raw.vin.unique())
-sel = st.multiselect("Pick vehicles (each panel = that vehicle's richest day)", all_vins,
-                     default=_rich_vins(6), format_func=lambda v: v[-8:], max_selections=12)
-mode = st.radio("Day", ["Richest day", "Latest day"], horizontal=True, key="s8mode")
+sel = st.multiselect("Pick vehicles", all_vins, default=_rich_vins(6), format_func=lambda v: v[-8:], max_selections=9)
 if not sel:
     st.info("Select at least one vehicle above.")
 else:
-    ncol = min(3, len(sel)); nrow = (len(sel) + ncol - 1) // ncol
-    days = {v: (_best_day(v) if mode == "Richest day" else raw.loc[raw.vin == v, "day"].max()) for v in sel}
-    grid = make_subplots(rows=nrow, cols=ncol, subplot_titles=[f"…{v[-6:]} · {days[v]}" for v in sel],
-                         vertical_spacing=0.16 if nrow > 1 else 0.1, horizontal_spacing=0.05)
+    ncol = min(2, len(sel)); nrow = (len(sel) + ncol - 1) // ncol
+    grid = make_subplots(rows=nrow, cols=ncol, subplot_titles=[f"…{v[-6:]}" for v in sel],
+                         vertical_spacing=0.12 if nrow > 1 else 0.1, horizontal_spacing=0.06)
     for i, v in enumerate(sel):
         r, c = i // ncol + 1, i % ncol + 1
-        g = raw[(raw.vin == v) & (raw.day == days[v])].sort_values("t").assign(dsoc=lambda x: x.soc.diff())
-        grid.add_scatter(x=g.t, y=g.soc, mode="lines", line=dict(color="#3a4a60", width=1), row=r, col=c, showlegend=False)
-        up = g[g.dsoc > 0]; dn = g[g.dsoc < 0]
-        grid.add_scatter(x=up.t, y=up.soc, mode="markers", marker=dict(color=GREEN, size=3), row=r, col=c, showlegend=False)
-        grid.add_scatter(x=dn.t, y=dn.soc, mode="markers", marker=dict(color=RED, size=3), row=r, col=c, showlegend=False)
-    grid.update_yaxes(range=[0, 105], **AX); grid.update_xaxes(showticklabels=False, **AX)
-    grid.update_layout(**lay(height=max(260, 230 * nrow), title="SoC over the day · charge green / discharge red"))
+        g = raw[raw.vin == v].sort_values("t").assign(dsoc=lambda x: x.soc.diff()).iloc[::2]   # light downsample
+        up = g[g.dsoc > 0]; dn = g[g.dsoc <= 0]
+        grid.add_scattergl(x=up.t, y=up.soc, mode="markers", marker=dict(color=GREEN, size=2), row=r, col=c, showlegend=False)
+        grid.add_scattergl(x=dn.t, y=dn.soc, mode="markers", marker=dict(color=RED, size=2), row=r, col=c, showlegend=False)
+    grid.update_yaxes(range=[0, 105], **AX); grid.update_xaxes(**AX)
+    grid.update_layout(**lay(height=max(300, 230 * nrow), title="Full-timeline SoC · charge green / discharge red"))
     st.plotly_chart(grid, use_container_width=True)
-st.caption("The raw intraday SoC cycle per vehicle: discharge while driving (red), charge back up (green) — the "
-           "behaviour the range proxy is derived from. Note the coarse ~2-min cadence and flat parked stretches.")
+st.caption("Each vehicle's **complete** SoC history across the ~20 months (data is 3 sampled days/month, so "
+           "you'll see clusters of activity separated by gaps). Charge = SoC rising (green), discharge = falling "
+           "(red). The SoC operating band stays flat over time — another view of 'no degradation signal'.")
