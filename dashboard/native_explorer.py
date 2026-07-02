@@ -317,28 +317,37 @@ def _fixed_window_rate(HI, LO):
             if len(la):
                 km = odo[la[0]] - odo[hi]
                 if 0 < km < 200:
-                    ev.append((t[hi], km / (HI - LO)))
-    return pd.DataFrame(ev, columns=["t", "rate"])
+                    ev.append((v, t[hi], km / (HI - LO)))
+    return pd.DataFrame(ev, columns=["vin", "t", "rate"])
 
 
 cW = st.columns(2)
 HI = cW[0].slider("Window high SoC %", 60, 95, 80, 5)
 LO = cW[1].slider("Window low SoC %", 20, 55, 40, 5)
 E = _fixed_window_rate(HI, LO)
-if len(E) < 20:
+top5 = E["vin"].value_counts().head(5).index.tolist()
+if not top5:
     st.info("Too few events for this window — widen it.")
 else:
-    E["mon"] = E.t.dt.to_period("M").dt.to_timestamp()
-    mt = E.groupby("mon")["rate"].median().reset_index()
-    fig = go.Figure()
-    fig.add_scattergl(x=E.t, y=E.rate, mode="markers", marker=dict(color=GREY, size=3, opacity=0.22), name="events")
-    fig.add_scatter(x=mt.mon, y=mt.rate, mode="lines+markers", line=dict(color=TEAL, width=2.5), name="monthly median")
-    fig.update_yaxes(title=f"km per %SoC ({HI}→{LO}% window)", range=[0.6, 2.0], **AX); fig.update_xaxes(**AX)
-    fig.update_layout(**lay(height=400, legend=dict(orientation="h", y=1.1),
-                            title=f"Range per %SoC over a fixed {HI}→{LO}% discharge window · {len(E):,} events"))
-    st.plotly_chart(fig, use_container_width=True)
-    st.caption(f"By measuring km per %SoC over the SAME {HI}→{LO}% window each discharge, we control for the "
-               "SoC-dependence of range — the cleanest capacity proxy this feed allows. The rate is a stable "
-               "**~1.25 km/%SoC (~125 km full charge)** that barely drifts over 20 months: a faint downward lean "
-               "(~55–60% of vehicles) but still inside the ~10% noise, so no confident degradation on this young "
-               "fleet yet. This is the method to re-run as the fleet ages.")
+    nr = len(top5); meta = {}; titles = []
+    for v in top5:
+        ev = E[E.vin == v].sort_values("t")
+        x = ((ev.t.astype("int64") - ev.t.astype("int64").min()) / 8.64e13 / 30.4).values
+        b = np.polyfit(x, ev.rate.values, 1)
+        meta[v] = (ev, b, x); titles.append(f"…{v[-6:]} · {len(ev)} events · trend {b[0] / ev.rate.mean() * 100:+.2f}%/mo")
+    grid = make_subplots(rows=nr, cols=1, subplot_titles=titles, vertical_spacing=0.06)
+    for i, v in enumerate(top5, start=1):
+        ev, b, x = meta[v]
+        grid.add_scattergl(x=ev.t, y=ev.rate, mode="markers", marker=dict(color=GREY, size=4, opacity=0.5), row=i, col=1, showlegend=False)
+        mm = ev.assign(mon=ev.t.dt.to_period("M").dt.to_timestamp()).groupby("mon")["rate"].median().reset_index()
+        grid.add_scatter(x=mm.mon, y=mm.rate, mode="lines+markers", line=dict(color=TEAL, width=2), row=i, col=1, showlegend=False)
+        grid.add_scatter(x=[ev.t.min(), ev.t.max()], y=[np.polyval(b, x.min()), np.polyval(b, x.max())],
+                         mode="lines", line=dict(color=RED, dash="dash", width=1.5), row=i, col=1, showlegend=False)
+    grid.update_yaxes(range=[0.6, 2.0], **AX); grid.update_xaxes(**AX)
+    grid.update_layout(**lay(height=max(320, 230 * nr),
+                       title=f"Fixed {HI}→{LO}% window · km per %SoC · the 5 richest vehicles, plotted individually"))
+    st.plotly_chart(grid, use_container_width=True)
+    st.caption("Each panel = **one vehicle** (the 5 with the most discharge events over this window — all 100 have "
+               "complete data, these just have the most discharges). Grey = individual events · teal = monthly "
+               "median · red dashed = linear trend (slope in the title). This is the **per-vehicle** view — no "
+               "cross-vehicle mixing. Watch each vehicle's own trend as the fleet ages.")
