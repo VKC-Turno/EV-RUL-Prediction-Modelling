@@ -41,6 +41,28 @@ st.caption("A **deep-dive on the 100 longest-availability vehicles** with **COMP
            "pack current, voltage, or reported SoH**, so SoH could only ever be a distance-per-SoC *range "
            "proxy*. **Verdict: even at complete resolution, there is no usable degradation signal.**")
 
+# ── Executive summary (verdict up top) ──
+with st.container(border=True):
+    st.markdown("### 📋 Findings summary — can the native feed give us a Mahindra SoH?")
+    st.error("**No — native-only Mahindra SoH is not measurable or validatable from the current feed.** Two real "
+             "levers: **(a)** get **current/voltage** into the native stream (direct measurement), or **(b)** let "
+             "the fleet **age** and re-run the fixed-window test (§10). Nothing else moves the needle.")
+    st.markdown(
+        "- **No electrical signal** — the feed carries SoC, odometer, distance-to-empty, status; **no current, "
+        "voltage, or reported SoH**. So coulomb / OCV / reported-SoH are all impossible (§1–2).\n"
+        "- **Distance-per-SoC proxy = noise** — even on *complete* data (~95 driving-segments/month), the range "
+        "proxy is a coin-flip (**40 down / 44 up**) and drifts *up* — not aging (§4, §10).\n"
+        "- **DTE is redundant with SoC** — the BMS range estimate ≈ SoC × a fixed constant (**r = 0.92**), so it "
+        "carries zero capacity information (§6).\n"
+        "- **No significant degradation** — the first-principles fixed-window rate is stable ~1.25 km/%SoC but its "
+        "trend's **95% CI spans zero**; searching for a 'better' window is p-hacking (§10).\n"
+        "- **The noise can't be controlled** — speed + season explain only **~5%** of the variance; the dominant "
+        "confound is unobservable **cargo payload** (§10).\n"
+        "- **Can't validate vs ground truth** — against the intellicar **coulomb SoH** the proxy shows **no "
+        "significant correlation (r = +0.07)**, and the feeds barely co-occur (coulomb 2023–24, native 2025–26) (§11).")
+    st.caption("~12k native-only Mahindra vehicles ride on this feed. This dashboard is the evidence behind the verdict — "
+               "the sections below walk through it. Re-run §10 as the fleet ages; the method is correct, the data isn't there *yet*.")
+
 if summ is None:
     st.error("Run `python src/native_explore_prep.py` first to build the summaries.")
     st.stop()
