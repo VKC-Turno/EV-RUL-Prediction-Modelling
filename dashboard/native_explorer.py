@@ -248,21 +248,27 @@ def _rich_vins(n=6):
 
 all_vins = sorted(raw.vin.unique())
 sel = st.multiselect("Pick vehicles", all_vins, default=_rich_vins(6), format_func=lambda v: v[-8:], max_selections=9)
+def _soc_grid(vins, rising, color, title):
+    ncol = min(2, len(vins)); nrow = (len(vins) + ncol - 1) // ncol
+    fg = make_subplots(rows=nrow, cols=ncol, subplot_titles=[f"…{v[-6:]}" for v in vins],
+                       vertical_spacing=0.12 if nrow > 1 else 0.1, horizontal_spacing=0.06)
+    for i, v in enumerate(vins):
+        r, c = i // ncol + 1, i % ncol + 1
+        g = raw[raw.vin == v].sort_values("t").assign(dsoc=lambda x: x.soc.diff())
+        pts = (g[g.dsoc > 0] if rising else g[g.dsoc < 0]).iloc[::2]
+        fg.add_scattergl(x=pts.t, y=pts.soc, mode="markers", marker=dict(color=color, size=2), row=r, col=c, showlegend=False)
+    fg.update_yaxes(range=[0, 105], **AX); fg.update_xaxes(**AX)
+    fg.update_layout(**lay(height=max(300, 230 * nrow), title=title))
+    return fg
+
+
 if not sel:
     st.info("Select at least one vehicle above.")
 else:
-    ncol = min(2, len(sel)); nrow = (len(sel) + ncol - 1) // ncol
-    grid = make_subplots(rows=nrow, cols=ncol, subplot_titles=[f"…{v[-6:]}" for v in sel],
-                         vertical_spacing=0.12 if nrow > 1 else 0.1, horizontal_spacing=0.06)
-    for i, v in enumerate(sel):
-        r, c = i // ncol + 1, i % ncol + 1
-        g = raw[raw.vin == v].sort_values("t").assign(dsoc=lambda x: x.soc.diff()).iloc[::2]   # light downsample
-        up = g[g.dsoc > 0]; dn = g[g.dsoc <= 0]
-        grid.add_scattergl(x=up.t, y=up.soc, mode="markers", marker=dict(color=GREEN, size=2), row=r, col=c, showlegend=False)
-        grid.add_scattergl(x=dn.t, y=dn.soc, mode="markers", marker=dict(color=RED, size=2), row=r, col=c, showlegend=False)
-    grid.update_yaxes(range=[0, 105], **AX); grid.update_xaxes(**AX)
-    grid.update_layout(**lay(height=max(300, 230 * nrow), title="Full-timeline SoC · charge green / discharge red"))
-    st.plotly_chart(grid, use_container_width=True)
-st.caption("Each vehicle's **complete** SoC history across the ~20 months (data is 3 sampled days/month, so "
-           "you'll see clusters of activity separated by gaps). Charge = SoC rising (green), discharge = falling "
-           "(red). The SoC operating band stays flat over time — another view of 'no degradation signal'.")
+    st.markdown("##### 🟢 Charging — SoC rising")
+    st.plotly_chart(_soc_grid(sel, True, GREEN, "SoC during charging events (full timeline)"), use_container_width=True)
+    st.markdown("##### 🔴 Discharging — SoC falling")
+    st.plotly_chart(_soc_grid(sel, False, RED, "SoC during discharging events (full timeline)"), use_container_width=True)
+st.caption("Charging (SoC rising) and discharging (SoC falling) plotted **separately**, per vehicle, across the "
+           "full ~20 months (3 sampled days/month → clustered). Same conclusion: neither the charging band nor "
+           "the discharging band drifts over time.")
