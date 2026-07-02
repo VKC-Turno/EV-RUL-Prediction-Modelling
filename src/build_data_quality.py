@@ -20,18 +20,21 @@ os.chdir(Path(__file__).resolve().parent.parent); sys.path.insert(0, "src")
 
 FT = {"Euler": "data/euler/features/feature_table.parquet",
       "Mahindra": "data/mahindra/features/feature_table.parquet",
-      "Bajaj": "data/bajaj/features/feature_table.parquet"}
+      "Bajaj": "data/bajaj/features/feature_table.parquet",
+      "Piaggio": "data/piaggio/features/feature_table.parquet"}
 REG_FILES = {"Euler": ("data/euler/Euler_Regd_Details.csv", "regd_date", "%d/%m/%y"),
              "Mahindra": ("Mh_Regd_Date.csv", "vehicle_registration_date", None),
-             "Bajaj": ("Bajaj_Regd_Details.csv", "regd_date", None)}
+             "Bajaj": ("Bajaj_Regd_Details.csv", "regd_date", None),
+             "Piaggio": ("_none.csv", "regd_date", None)}   # no reg file -> reg_dates() returns {}
 # min valid SoH months AND min age span (months) to trust a vehicle's trend
 QUAL = {"Euler": dict(min_months=6, min_span=9.0),
         "Mahindra": dict(min_months=6, min_span=9.0),
-        "Bajaj": dict(min_months=6, min_span=0.0)}   # Bajaj feed is ~9 mo for all -> no span bar
+        "Bajaj": dict(min_months=6, min_span=0.0),   # Bajaj feed is ~9 mo for all -> no span bar
+        "Piaggio": dict(min_months=6, min_span=9.0)}
 DEG = 2.0
 # A vehicle that reached end-of-life, OR dropped >= EXEMPT_DROP pp, has PROVEN a real degradation trend —
 # it is never "thin" no matter how short the window (the span rule only exists to confirm a trend exists).
-EOL = {"Euler": 80, "Mahindra": 80, "Bajaj": 70}
+EOL = {"Euler": 80, "Mahindra": 80, "Bajaj": 70, "Piaggio": 80}
 EXEMPT_DROP = 5.0
 
 

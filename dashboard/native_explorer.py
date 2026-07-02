@@ -212,3 +212,27 @@ else:
     st.plotly_chart(fig, use_container_width=True)
     if "vehicleStatus" in gd:
         st.caption(f"vehicleStatus mix: {gd.vehicleStatus.value_counts().to_dict()}")
+
+
+# ── 7. SoC during charging vs discharging events ──
+st.header("7 · SoC — charging vs discharging events (all vehicles)")
+
+
+@st.cache_data(show_spinner=False)
+def _charge_discharge():
+    r = load_raw().sort_values(["vin", "t"])
+    r["dsoc"] = r.groupby("vin")["soc"].diff()
+    return r.loc[r.dsoc > 0, "soc"].to_numpy(), r.loc[r.dsoc < 0, "soc"].to_numpy()
+
+
+chg, dis = _charge_discharge()
+f7 = go.Figure()
+f7.add_histogram(x=chg, name=f"charging (SoC rising) · {len(chg):,}", marker_color=GREEN, opacity=0.6, nbinsx=50)
+f7.add_histogram(x=dis, name=f"discharging (SoC falling) · {len(dis):,}", marker_color=RED, opacity=0.6, nbinsx=50)
+f7.update_layout(barmode="overlay", **lay(height=360, title="SoC distribution — charging vs discharging",
+                                          legend=dict(orientation="h", y=1.1)))
+f7.update_xaxes(title="SoC %", **AX); f7.update_yaxes(title="observations", **AX)
+st.plotly_chart(f7, use_container_width=True)
+st.caption("Charging = consecutive readings where SoC **rises**; discharging = SoC **falls** (more robust than the "
+           "flaky `vehicleStatus`). Shows the SoC band each mode operates over — how deep vehicles run down while "
+           "driving, and from what level they charge back up.")

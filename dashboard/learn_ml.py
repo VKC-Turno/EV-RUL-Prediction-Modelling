@@ -1613,6 +1613,14 @@ elif step == STEPS[4]:
             col.metric("🚫 Data-thin (excluded)", int(len(thin)))
             col.caption(f"{int((thin['vehicle_class']=='degrader').sum())} degraders + "
                         f"{int((thin['vehicle_class']=='flat').sum())} flat too thin to trust")
+            _F = FEATS_BY[oem]                          # data frequency = raw telemetry rows / vehicle-month
+            _dc = "n_rows" if "n_rows" in _F.columns else ("n_rows_ic" if "n_rows_ic" in _F.columns else None)
+            if _dc:
+                col.metric("📶 Data frequency", f"{int(_F[_dc].median()):,}/mo",
+                           help="median raw telemetry rows per vehicle-month (feed sampling density)")
+        st.caption("**Data frequency** = median raw telemetry rows per vehicle-month — how densely each feed "
+                   "samples. Euler's native BMS feed is sparse (~750/mo); Bajaj and the intellicar-based "
+                   "Mahindra & Piaggio are dense (15k–38k/mo). Denser sampling → more reliable monthly SoH.")
         st.markdown("#### The data-thin vehicles — excluded from training until better observed")
         cc = ["oem", "vin", "model", "months", "span_months", "current_age_mo", "soh_drop",
               "vehicle_class", "reasons"]
