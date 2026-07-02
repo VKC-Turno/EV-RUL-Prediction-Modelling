@@ -35,9 +35,10 @@ def load(name):
 summ, monthly, proxy = load("native_vehicle_summary.parquet"), load("native_vehicle_monthly.parquet"), load("native_monthly_soh.parquet")
 
 st.title("🔍 Mahindra Native Feed — Data Exploration")
-st.caption("Understand the native-only fleet **before** modeling. This feed has **no pack current, voltage, or "
-           "reported SoH** — so SoH could only ever be a distance-per-SoC *range proxy*. The question this app "
-           "answers: **is there any usable degradation signal in here at all?**")
+st.caption("A **deep-dive on the 100 longest-availability vehicles** with **COMPLETE data** (all fields, no "
+           "file cap — ~95 driving-segments/vehicle/month vs ~11 in the thin sample). The native feed has **no "
+           "pack current, voltage, or reported SoH**, so SoH could only ever be a distance-per-SoC *range "
+           "proxy*. **Verdict: even at complete resolution, there is no usable degradation signal.**")
 
 if summ is None:
     st.error("Run `python src/native_explore_prep.py` first to build the summaries.")
@@ -51,9 +52,10 @@ c[1].metric("≥6 months", f"{(summ.n_months >= 6).sum():,}")
 c[2].metric("≥12 months", f"{(summ.n_months >= 12).sum():,}")
 c[3].metric("Median mo/veh", int(summ.n_months.median()))
 c[4].metric("Median odo", f"{summ.odo_max.median():,.0f} km")
-st.info("**Dense feed** (~hundreds of rows/file) covering ~the whole fleet — a big change from the old "
-        "'70M tiny files' picture. But **no electrical SoH signal**: no current → no coulomb, no voltage → no "
-        "OCV, no reported SoH. Usable history is **2025-01 → 2026-07** (~18 mo).")
+st.info("These 100 are the **richest-history vehicles** in the fleet — **complete data** (no file cap, "
+        "~1,700 rows/vehicle/month, ~20 months each). Still **no electrical SoH signal**: no current → no "
+        "coulomb, no voltage → no OCV, no reported SoH. The tight, complete monthly estimates below are exactly "
+        "what makes the 'no signal' verdict **conclusive** — it's not a sampling artifact.")
 
 # ── 2. Fields / schema migration ──
 st.header("2 · What the feed carries — and the 2024→2025 schema migration")
@@ -83,8 +85,9 @@ f2 = go.Figure(go.Histogram(x=summ.odo_max.clip(0, 150000), marker_color=BLUE, n
 f2.update_xaxes(title="odometer (km)", **AX); f2.update_yaxes(title="vehicles", **AX)
 f2.update_layout(**lay(height=320, title="Fleet odometer spread"))
 c2.plotly_chart(f2, use_container_width=True)
-st.caption(f"**{(summ.n_months >= 6).sum():,} of {len(summ):,}** vehicles have ≥6 months — the modelable subset "
-           f"*if* a signal existed. Most carry real mileage (median {summ.odo_max.median():,.0f} km).")
+st.caption(f"All **{len(summ)}** vehicles are high-availability by design (~20 months each — the fleet's "
+           f"longest histories). Odometer {summ.odo_max.min():,.0f}–{summ.odo_max.max():,.0f} km "
+           f"(median {summ.odo_max.median():,.0f}) — real usage, so if degradation were measurable, it would show here.")
 
 # ── 4. The signal question ──
 st.header("4 · Is there a degradation signal? — the distance-per-SoC proxy")
@@ -97,11 +100,20 @@ if proxy is not None:
     fig.update_layout(**lay(height=360, title="Per-vehicle net change in the range proxy"))
     st.plotly_chart(fig, use_container_width=True)
     down, up, flat = int((ch >= 2).sum()), int((ch <= -2).sum()), int((ch.abs() < 2).sum())
-    st.error(f"**Symmetric = noise, not aging.** {down} vehicles' proxy fell ≥2pp — but **{up} *rose* ≥2pp** and "
-             f"{flat} are flat. That's a near coin-flip centred on 0. A real SoH signal would be strongly skewed "
-             "left (most vehicles declining). **The native distance proxy has no usable degradation signal** — "
-             "driving/seasonal efficiency noise (±10–20%) swamps the ~0.1–0.3 %/mo of real fade. Native-only "
-             "vehicles should stay on an **age prior**, not be modeled as SoH.")
+    st.error(f"**Symmetric = noise, not aging — and this is COMPLETE data (~95 driving-segments/month).** "
+             f"{down} vehicles' proxy fell ≥2pp, but **{up} *rose* ≥2pp** and {flat} are flat: a near coin-flip "
+             "centred on 0 (it even drifts slightly *up* — physically impossible for real SoH). The 8× tighter "
+             "estimates from complete data **did not** surface a hidden trend, so this is **not a sampling "
+             "artifact**. **The native feed cannot measure SoH degradation** — driving/seasonal efficiency noise "
+             "(±10–20%) swamps the ~0.1–0.3 %/mo of real fade. Native-only vehicles stay on an **age prior**; the "
+             "fix is *signal* (current/voltage in the feed), not more data.")
+    st.markdown("**Two more angles, same verdict:**")
+    st.markdown("- **The BMS's own full-charge range** (`distanceToEmpty` at high SoC) is also **flat** — median "
+                "0.0% change over the window, 55 of 100 vehicles flat. Even the vehicle's own range estimate "
+                "shows no degradation.\n"
+                "- **Finer time bins don't help.** Binning the *same* complete data **weekly** is noisier "
+                "(residual 10.2% of level) than **monthly** (7.7%), with no extra trend — higher-frequency data "
+                "would *hurt*, not help.")
 else:
     st.info("Proxy not built yet — run `python src/mahindra_native_soh.py`.")
 

@@ -2,7 +2,7 @@
 """Precompute lightweight summaries for the Mahindra native-feed EXPLORATION dashboard
 (dashboard/native_explorer.py), so the app never loads the 23M raw rows at runtime.
 
-Reads data/mahindra/native_monthly/*.parquet (the whole-fleet monthly sample) ->
+Reads data/mahindra/native100/*.parquet (the whole-fleet monthly sample) ->
   - data/mahindra/native_vehicle_summary.parquet   (one row per vehicle)
   - data/mahindra/native_vehicle_monthly.parquet    (one row per vehicle-month, for time-series drill-down)
 Run: .venv/bin/python src/native_explore_prep.py
@@ -10,7 +10,7 @@ Run: .venv/bin/python src/native_explore_prep.py
 import glob
 import numpy as np, pandas as pd
 
-fs = sorted(glob.glob("data/mahindra/native_monthly/*.parquet"))
+fs = sorted(glob.glob("data/mahindra/native100/*.parquet"))
 print(f"reading {len(fs)} monthly files…", flush=True)
 
 

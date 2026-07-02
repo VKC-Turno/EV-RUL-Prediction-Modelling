@@ -3,7 +3,7 @@
 
 The native feed carries no current/voltage/reported-SoH, so the only SoH-like signal is km-per-%SoC while
 driving (odometer-up & soc-down segments) — a range/capacity proxy. This builds it per (vin, month) from
-data/mahindra/native_monthly/ and NORMALISES each vehicle to its own first-6-month baseline.
+data/mahindra/native100/ and NORMALISES each vehicle to its own first-6-month baseline.
 
 Deliberately NO monotone envelope: forcing monotonicity on a noisy proxy would ratchet noise dips into fake
 "degraders" (the iso-floor artifact). We show the RAW normalised proxy so the flat/noisy reality is honest.
@@ -16,7 +16,7 @@ import glob
 from pathlib import Path
 import numpy as np, pandas as pd
 
-fs = sorted(glob.glob("data/mahindra/native_monthly/*.parquet"))
+fs = sorted(glob.glob("data/mahindra/native100/*.parquet"))
 cols = ["vin", "eventAt", "soc", "odometer"]
 df = pd.concat([pd.read_parquet(f)[[c for c in cols if c in pd.read_parquet(f, columns=None).columns]]
                 for f in fs], ignore_index=True)
