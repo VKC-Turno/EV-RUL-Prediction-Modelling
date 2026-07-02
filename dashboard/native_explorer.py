@@ -9,7 +9,7 @@ Runs off precomputed summaries (src/native_explore_prep.py) + the proxy SoH (src
 so there is no raw 23M-row load at runtime.
 Run: streamlit run dashboard/native_explorer.py --server.port 8503
 """
-import os
+import os, json
 import numpy as np, pandas as pd, streamlit as st
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
@@ -46,7 +46,8 @@ with st.container(border=True):
     st.markdown("### 📋 Findings summary — can the native feed give us a Mahindra SoH?")
     st.error("**No — native-only Mahindra SoH is not measurable or validatable from the current feed.** Two real "
              "levers: **(a)** get **current/voltage** into the native stream (direct measurement), or **(b)** let "
-             "the fleet **age** and re-run the fixed-window test (§10). Nothing else moves the needle.")
+             "the fleet **age** and re-run the **charge-rate proxy (§12)** — the cleanest native signal. Nothing "
+             "else moves the needle.")
     st.markdown(
         "- **No electrical signal** — the feed carries SoC, odometer, distance-to-empty, status; **no current, "
         "voltage, or reported SoH**. So coulomb / OCV / reported-SoH are all impossible (§1–2).\n"
@@ -59,9 +60,16 @@ with st.container(border=True):
         "- **The noise can't be controlled** — speed + season explain only **~5%** of the variance; the dominant "
         "confound is unobservable **cargo payload** (§10).\n"
         "- **Can't validate vs ground truth** — against the intellicar **coulomb SoH** the proxy shows **no "
-        "significant correlation (r = +0.07)**, and the feeds barely co-occur (coulomb 2023–24, native 2025–26) (§11).")
+        "significant correlation (r = +0.07)**; even the one vehicle with rich native *and* a 9-month coulomb "
+        "overlap (a real 100→89% degrader) has the proxy tracking the **wrong way** (r = −0.60, spurious). The "
+        "other four both-feeds vehicles barely co-occur at all (coulomb 2023–24, native 2025–26) (§11).\n"
+        "- **Charge-rate is the best remaining lever** — a charger's ~constant current means **%SoC/hr rises as "
+        "capacity fades**, and its confound (charger type) is *controllable*: it cuts within-vehicle noise from "
+        "**~28% to ~8%** (vs discharge's uncontrollable payload). Still flat on this young fleet, but this is the "
+        "**test to re-run as it ages** (§12).")
     st.caption("~12k native-only Mahindra vehicles ride on this feed. This dashboard is the evidence behind the verdict — "
-               "the sections below walk through it. Re-run §10 as the fleet ages; the method is correct, the data isn't there *yet*.")
+               "the sections below walk through it. **Re-run §12 (charge-rate) as the fleet ages** — it's the cleanest "
+               "method; the data isn't there *yet*.")
 
 if summ is None:
     st.error("Run `python src/native_explore_prep.py` first to build the summaries.")
@@ -434,7 +442,295 @@ else:
         f2.update_xaxes(**AX); f2.update_yaxes(title="vehicle-months", **AX)
         g2.plotly_chart(f2, use_container_width=True)
     st.caption("The native distance-per-SoC proxy shows **no significant correlation** with the intellicar coulomb "
-               "SoH (ground truth) on the ~23 vehicles that have both. It's also barely testable: the coulomb data "
-               "is **2023–24**, the native feed starts **2024-12** — this cohort migrated intellicar→native, so "
-               "they barely co-occur (median 0 shared months). **Bottom line: native-only Mahindra SoH can't be "
-               "validated or measured from the current feed — it needs current/voltage, or fleet aging.**")
+               "SoH (ground truth) on the ~23 vehicles that have both. It's barely testable: most of the ~220 "
+               "both-feeds vehicles migrated intellicar→native (coulomb 2023–24, native 2025–26) and share **no** "
+               "months; only **23 overlap ≥3 months** (median 4), and within those the coulomb is near-flat "
+               "(**median 2 distinct SoH values**) — too little dynamic range to correlate. **Bottom line: "
+               "native-only Mahindra SoH can't be validated or measured from the current feed — it needs "
+               "current/voltage, or fleet aging.**")
+
+
+# ── 11b. Both-feeds case study — the one vehicle with rich native AND overlapping coulomb ──
+st.subheader("Case study — the one vehicle with rich native data AND overlapping coulomb")
+
+
+@st.cache_data(show_spinner="Extracting charge events…")
+def _charge_window_rate(LO, HI):
+    """Charge-time-per-%SoC over a fixed CC-phase window: crossing UP through LO then UP through HI inside one
+    charge (no discharge between). rate = %SoC per hour. `consistent` flags each vehicle's own usual-charger
+    events (within ±25–33% of its median rate) — the charger-type confound is *controllable*, unlike payload."""
+    d = load_raw()[["vin", "t", "soc"]].dropna().sort_values(["vin", "t"])
+    ev = []
+    for v, g in d.groupby("vin"):
+        soc = g.soc.values; ts = g.t.values.astype("datetime64[s]").astype("int64"); tt = g.t.values
+        if len(soc) < 10:
+            continue
+        sh = np.empty_like(soc); sh[0] = soc[0]; sh[1:] = soc[:-1]
+        ulo = np.where((soc >= LO) & (sh < LO))[0]     # cross UP through LO
+        uhi = np.where((soc >= HI) & (sh < HI))[0]     # cross UP through HI
+        dn = np.where(soc < sh - 3)[0]                 # a discharge resets the charge
+        for lo in ulo:
+            da = dn[dn > lo]; nd = da[0] if len(da) else len(soc) + 1
+            ha = uhi[(uhi > lo) & (uhi < nd)]
+            if len(ha):
+                hrs = (ts[ha[0]] - ts[lo]) / 3600.0
+                if 0.15 < hrs < 10:
+                    ev.append((v, tt[lo], (HI - LO) / hrs))
+    E = pd.DataFrame(ev, columns=["vin", "t", "rate"])
+    if len(E):
+        E["vmed"] = E.groupby("vin")["rate"].transform("median")
+        E["consistent"] = (E.rate / E.vmed).between(0.75, 1.33)
+    return E
+
+
+@st.cache_data(show_spinner="Building both-feeds case study…")
+def load_casestudy():
+    fe, tp = "data/redshift/mahindra_featengg.parquet", "data/manifests/mahindra_native_top100.csv"
+    if not (os.path.exists(fe) and os.path.exists(tp)):
+        return None
+    cc = pd.read_parquet(fe); cc["vin"] = cc["vin"].astype(str); cc["month"] = pd.to_datetime(cc["ymd"].astype(str))
+    top100 = set(pd.read_csv(tp)["vin"].astype(str))
+    vins = sorted(top100 & set(cc.vin.unique()))
+    if not vins:
+        return None
+    raw = load_raw(); chg = _charge_window_rate(30, 70)
+    rows = []
+    for v in vins:
+        cs = cc[cc.vin == v][["month", "soh"]].rename(columns={"soh": "coulomb"})
+        g = raw[raw.vin == v].sort_values("t").copy()
+        g["do"] = g.odometer.diff(); g["ds"] = -g.soc.diff(); g["dm"] = g.t.diff().dt.total_seconds() / 60
+        seg = g[g.do.between(0.1, 80) & g.ds.between(0.5, 40) & g.dm.between(0.1, 180)].copy()
+        seg["month"] = seg.t.dt.to_period("M").dt.to_timestamp()
+        dps = seg.groupby("month").agg(o=("do", "sum"), sc=("ds", "sum"), n=("do", "size"))
+        dps = dps[dps.n >= 3].copy(); dps["native_km_soc"] = 100 * dps.o / dps.sc
+        dps = dps[dps.native_km_soc.between(20, 400)][["native_km_soc"]]
+        cr = chg[(chg.vin == v) & chg.consistent] if len(chg) else chg
+        if len(cr):
+            crm = cr.assign(month=cr.t.dt.to_period("M").dt.to_timestamp()).groupby("month")["rate"].median().rename("native_charge_rate")
+        else:
+            crm = pd.Series(dtype=float, name="native_charge_rate")
+        merged = cs.set_index("month").join(dps, how="outer").join(crm, how="outer").reset_index()
+        merged["vin"] = v
+        rows.append(merged)
+    out = pd.concat(rows, ignore_index=True)
+    for col in ["coulomb", "native_km_soc", "native_charge_rate"]:
+        out[col] = pd.to_numeric(out[col], errors="coerce")   # guard object-dtype from all-NaN outer joins
+    return out
+
+
+CS = load_casestudy()
+if CS is None or not len(CS):
+    st.info("Case study needs `data/redshift/mahindra_featengg.parquet` + the native100 pull.")
+else:
+    def _novlp(v):
+        d = CS[CS.vin == v]
+        return int((d.coulomb.notna() & d.native_km_soc.notna()).sum())
+    vins = [v for v in sorted(CS.vin.unique(), key=_novlp, reverse=True) if CS[CS.vin == v].coulomb.notna().any()]
+    star = vins[0]
+    ds = CS[CS.vin == star]
+    ov = ds[ds.coulomb.notna() & ds.native_km_soc.notna()]
+    rr = float(ov.coulomb.corr(ov.native_km_soc)) if len(ov) >= 3 else float("nan")
+    tag = "n/a" if np.isnan(rr) else ("wrong sign" if rr < 0 else ("too weak" if rr < 0.3 else "tracks"))
+    desc = ("**can't be computed** (too few overlap months)" if np.isnan(rr) else
+            ("the **wrong sign** and spurious" if rr < 0 else
+             ("**too weak to be usable**" if rr < 0.3 else "positive — worth a closer look")))
+    cser = ds.dropna(subset=["coulomb"]).sort_values("month")
+    k1, k2, k3 = st.columns(3)
+    k1.metric(f"…{star[-8:]} coulomb", f"{cser.coulomb.iloc[0]:.0f}→{cser.coulomb.iloc[-1]:.0f}%",
+              help="A real degrader per the intellicar coulomb ground truth")
+    k2.metric("Overlap window", f"{_novlp(star)} months")
+    k3.metric("Proxy vs truth (r)", f"{rr:+.2f}", delta=tag,
+              delta_color="inverse" if (np.isnan(rr) or rr < 0.3) else "normal")
+    st.error(f"Of the **{len(vins)} vehicles** with both rich native data and a coulomb SoH, only "
+             f"**…{star[-8:]}** overlaps in time — and it's a genuine degrader (coulomb "
+             f"{cser.coulomb.iloc[0]:.0f}→{cser.coulomb.iloc[-1]:.0f}%). Yet across the {_novlp(star)}-month overlap "
+             f"the native distance proxy correlates **r = {rr:+.2f}** with the truth — {desc} "
+             "(coulomb steps only ~2.5pp in-window, buried under proxy noise). The other "
+             f"{len(vins)-1} vehicles have **zero** temporal overlap: their coulomb is 2023–24, native 2025–26.")
+    titles = []
+    for v in vins:
+        d0 = CS[CS.vin == v].dropna(subset=["coulomb"])
+        titles.append(f"…{v[-8:]} · coulomb {d0.coulomb.iloc[0]:.0f}→{d0.coulomb.iloc[-1]:.0f}% · overlap {_novlp(v)} mo")
+    cg = make_subplots(rows=len(vins), cols=1, specs=[[{"secondary_y": True}] for _ in vins],
+                       subplot_titles=titles, vertical_spacing=0.08)
+    for i, v in enumerate(vins, start=1):
+        d = CS[CS.vin == v].sort_values("month")
+        cl = d.dropna(subset=["coulomb"]); km = d.dropna(subset=["native_km_soc"]); ch = d.dropna(subset=["native_charge_rate"])
+        cg.add_scatter(x=cl.month, y=cl.coulomb, mode="lines+markers", line=dict(color=BLUE, width=2),
+                       marker=dict(size=5), row=i, col=1, secondary_y=False, showlegend=(i == 1), name="coulomb SoH (truth)")
+        cg.add_scatter(x=km.month, y=km.native_km_soc, mode="lines+markers", line=dict(color=AMBER, dash="dot"),
+                       marker=dict(size=4), row=i, col=1, secondary_y=True, showlegend=(i == 1), name="native km/%SoC")
+        cg.add_scatter(x=ch.month, y=ch.native_charge_rate, mode="lines+markers", line=dict(color=GREEN, dash="dot"),
+                       marker=dict(size=4), row=i, col=1, secondary_y=True, showlegend=(i == 1), name="native %SoC/hr")
+        ovd = d[d.coulomb.notna() & (d.native_km_soc.notna() | d.native_charge_rate.notna())]
+        if len(ovd):
+            cg.add_vrect(x0=ovd.month.min(), x1=ovd.month.max(), fillcolor=AMBER, opacity=0.10, line_width=0, row=i, col=1)
+    cg.update_yaxes(title_text="coulomb %", secondary_y=False, **AX)
+    cg.update_yaxes(title_text="native", secondary_y=True, **AX)
+    cg.update_xaxes(**AX)
+    cg.update_layout(**lay(height=max(360, 200 * len(vins)),
+                     title="Coulomb SoH (truth, blue) vs native proxies — feeds barely co-occur; only the top vehicle overlaps",
+                     legend=dict(orientation="h", y=1.06)))
+    st.plotly_chart(cg, use_container_width=True)
+    st.caption("Blue = intellicar coulomb SoH (ground truth, left axis); amber/green = native proxies (right axis); "
+               "shaded = the both-feeds overlap. The cohort migrated intellicar→native around end-2024, so coulomb "
+               "lives in 2023–24 and native in 2025–26 — **they don't line up**. The single overlap case has the "
+               "native proxies **not tracking** the real decline. This is the visual proof that native SoH can't be "
+               "*validated* against coulomb with today's data — it needs the feeds to overlap, or the fleet to age.")
+
+
+# ── 12. Charge-rate capacity proxy — the cleanest native signal ──
+st.header("12 · Charge-rate capacity proxy — the cleanest native signal (re-run as the fleet ages)")
+st.caption("The discharge proxy (§10) is killed by **unobservable payload**. Charging is different: a charger "
+           "delivers ~constant current, so **%SoC-per-hour rises as capacity fades** (constant current fills a "
+           "smaller pack faster) — and its one big confound, **charger type, is controllable**: filter to each "
+           "vehicle's own usual charger and the noise collapses. This is the most promising native method.")
+
+CE = _charge_window_rate(30, 70)
+if not len(CE):
+    st.info("No charge events extracted — need the native100 pull.")
+else:
+    CEc = CE[CE.consistent]
+    raw_cv = float(CE.groupby("vin")["rate"].agg(lambda s: s.std() / s.mean() if s.mean() else np.nan).median() * 100)
+    con_cv = float(CEc.groupby("vin")["rate"].agg(lambda s: s.std() / s.mean() if s.mean() else np.nan).median() * 100)
+    slc = []
+    for v, g in CEc.groupby("vin"):
+        if len(g) >= 6:
+            g = g.sort_values("t")
+            x = ((g.t.astype("int64") - g.t.astype("int64").min()) / 8.64e13 / 30.4).values
+            slc.append(np.polyfit(x, g.rate.values, 1)[0] / g.rate.mean() * 100)
+    slc = np.array(slc); rng = np.random.default_rng(0)
+    bootc = np.array([np.median(rng.choice(slc, len(slc), replace=True)) for _ in range(3000)]) if len(slc) else np.array([0.0])
+    lo2, hi2 = np.percentile(bootc, [2.5, 97.5]); med2 = float(np.median(slc)) if len(slc) else 0.0
+    q1, q2, q3 = st.columns(3)
+    q1.metric("Charge events (30→70%)", f"{len(CE):,}", help=f"{CE.vin.nunique()} vehicles")
+    q2.metric("Noise: raw → consistent-charger", f"{raw_cv:.0f}% → {con_cv:.0f}%",
+              delta=f"{con_cv-raw_cv:.0f} pp", delta_color="inverse",
+              help="Median within-vehicle coefficient of variation. Controlling for charger type collapses it.")
+    q3.metric("Fleet slope 95% CI (%/mo)", f"[{lo2:+.2f}, {hi2:+.2f}]", help=f"median {med2:+.2f}%/mo · n={len(slc)}")
+    if lo2 > 0:
+        st.success(f"✅ **Significant charge-rate rise = capacity fade detected** ({med2:+.2f}%/mo). The native "
+                   "charge proxy now measures degradation — validate against coulomb and roll out.")
+    elif hi2 < 0:
+        st.warning(f"⚠️ Charge rate *falls* over time ({med2:+.2f}%/mo) — unexpected; investigate before use.")
+    else:
+        st.info(f"🟡 **Cleanest native proxy we have, but no fade signal *yet*.** Controlling for charger type cuts "
+                f"within-vehicle noise to **~{con_cv:.0f}%** (vs discharge's uncontrollable ±10–20%), yet the trend "
+                f"is flat (**{med2:+.2f}%/mo**, CI [{lo2:+.2f}, {hi2:+.2f}] — spans 0). At ~{con_cv:.0f}% noise we're "
+                "right at the detection threshold: this young fleet's ~3–6% fade hasn't cleared it. **This is the "
+                "test most likely to fire as the fleet ages — re-run it in ~6–12 months.**")
+    top5c = CEc["vin"].value_counts().head(5).index.tolist()
+    metac = {}; titlesc = []
+    for v in top5c:
+        ev = CEc[CEc.vin == v].sort_values("t")
+        x = ((ev.t.astype("int64") - ev.t.astype("int64").min()) / 8.64e13 / 30.4).values
+        bb = np.polyfit(x, ev.rate.values, 1)
+        metac[v] = (ev, bb, x); titlesc.append(f"…{v[-6:]} · {len(ev)} charges · trend {bb[0]/ev.rate.mean()*100:+.2f}%/mo")
+    gridc = make_subplots(rows=len(top5c), cols=1, subplot_titles=titlesc, vertical_spacing=0.06)
+    for i, v in enumerate(top5c, start=1):
+        ev, bb, x = metac[v]
+        gridc.add_scattergl(x=ev.t, y=ev.rate, mode="markers", marker=dict(color=GREY, size=4, opacity=0.5), row=i, col=1, showlegend=False)
+        mm = ev.assign(mon=ev.t.dt.to_period("M").dt.to_timestamp()).groupby("mon")["rate"].median().reset_index()
+        gridc.add_scatter(x=mm.mon, y=mm.rate, mode="lines+markers", line=dict(color=GREEN, width=2), row=i, col=1, showlegend=False)
+        gridc.add_scatter(x=[ev.t.min(), ev.t.max()], y=[np.polyval(bb, x.min()), np.polyval(bb, x.max())],
+                          mode="lines", line=dict(color=RED, dash="dash", width=1.5), row=i, col=1, showlegend=False)
+    gridc.update_yaxes(title_text="%SoC / hr", **AX); gridc.update_xaxes(**AX)
+    gridc.update_layout(**lay(height=max(320, 220 * len(top5c)),
+                        title="Consistent-charger %SoC/hr over time · the 5 most-charged vehicles (flat = no fade yet)"))
+    st.plotly_chart(gridc, use_container_width=True)
+    st.caption("**Method:** charge events crossing up through a fixed 30→70% window (CC phase), rate = %SoC/hr, "
+               "keep only each vehicle's consistent-charger sessions (within ±25–33% of its median rate), "
+               "per-vehicle-normalized slope, bootstrap 95% CI — same rigor as §10. Grey = per-charge; green = "
+               "monthly median; red = fitted trend. **Why it beats discharge:** charge current is set by the "
+               "charger (controllable), not by unobservable cargo/terrain — so as the fleet ages, this is the "
+               "cleanest shot at a native SoH.")
+
+
+# ── 13. Probable SoH curves — Bayesian, behaviour-conditioned ──
+st.header("13 · Probable SoH curves — Bayesian, behaviour-conditioned (the constructive answer)")
+st.caption("The proxies don't *measure* SoH — but usage still *drives* degradation. So instead of sensing SoH, we "
+           "model the trajectory: a hierarchical **Bayesian** model learns SoH-vs-age on the feeds that HAVE a real "
+           "SoH (Euler, Bajaj, Piaggio, Mahindra-intellicar), lets a **native-computable behaviour fingerprint** "
+           "(km/month, SoC habits) tilt the degradation *rate*, and posterior-predicts a **probable SoH curve with "
+           "credible bands** for every native vehicle — anchored on the Mahindra baseline. Honest by construction: "
+           "weak behaviour → wide bands.")
+
+
+@st.cache_data
+def load_bayes():
+    pp, rp = "data/mahindra/native_behaviour_soh.parquet", "data/mahindra/behaviour_soh_report.json"
+    P = pd.read_parquet(pp) if os.path.exists(pp) else None
+    R = json.load(open(rp)) if os.path.exists(rp) else None
+    return P, R
+
+
+BP, BR = load_bayes()
+if BP is None or BR is None:
+    st.info("Run `python src/behaviour_soh_experiment.py` to build the Bayesian behaviour-conditioned curves.")
+else:
+    nat = BR["native"]; kms = BR["behaviour_slopes"]["km_month"]; hd = BR["heldout_rate_mae"]; bd = BR["band_decomposition"]
+    mc = st.columns(4)
+    mc[0].metric("Native median SoH @36mo", f"{nat['soh50_at_36mo_median']:.0f}%")
+    mc[1].metric("Credible band @36mo", f"±{nat['band_width_at_36mo_median']/2:.0f} pp", help="half of the p10–p90 width")
+    mc[2].metric("km/month effect (+1 SD)", f"{kms['mean']:+.3f} SoH/mo",
+                 delta="credible" if kms["credible"] else "n.s.", delta_color="normal" if kms["credible"] else "off")
+    mc[3].metric("Behaviour vs OEM-avg (held-out)", f"{hd['behaviour_improvement_pct']:+.1f}%",
+                 help="reduction in held-out degradation-rate MAE from adding behaviour over the OEM baseline")
+
+    g1, g2 = st.columns(2)
+    ag = BP.groupby("age_months")
+    med, p10, p90 = ag.soh_p50.mean(), ag.soh_p10.mean(), ag.soh_p90.mean(); xg = med.index
+    f13 = go.Figure()
+    f13.add_scatter(x=xg, y=p90, line=dict(width=0), showlegend=False, hoverinfo="skip")
+    f13.add_scatter(x=xg, y=p10, fill="tonexty", fillcolor="rgba(90,169,247,0.18)", line=dict(width=0), name="fleet p10–p90 band")
+    f13.add_scatter(x=xg, y=med, line=dict(color=BLUE, width=3), name="fleet median (p50)")
+    for v in list(BP.vin.unique())[:15]:
+        d = BP[BP.vin == v]
+        f13.add_scatter(x=d.age_months, y=d.soh_p50, line=dict(color=GREY, width=0.6), opacity=0.4, showlegend=False, hoverinfo="skip")
+    f13.add_hline(y=80, line=dict(color=RED, dash="dash"))
+    f13.update_xaxes(title="age (months)", **AX); f13.update_yaxes(title="SoH %", range=[70, 101], **AX)
+    f13.update_layout(**lay(height=380, title="Native probable SoH — fleet median + credible band", legend=dict(orientation="h", y=1.13)))
+    g1.plotly_chart(f13, use_container_width=True)
+
+    kmv = BP.groupby("vin").km_month.first()
+    hi = set(kmv[kmv > kmv.quantile(.75)].index); lo = set(kmv[kmv < kmv.quantile(.25)].index)
+    f14 = go.Figure()
+    for grp, col, fill, lab in [(hi, RED, "rgba(212,80,78,0.12)", "heavy usage (top-quartile km/mo)"),
+                                (lo, GREEN, "rgba(46,193,107,0.12)", "light usage (bottom-quartile km/mo)")]:
+        s = BP[BP.vin.isin(grp)].groupby("age_months"); xx = s.soh_p50.mean().index
+        f14.add_scatter(x=xx, y=s.soh_p90.mean(), line=dict(width=0), showlegend=False, hoverinfo="skip")
+        f14.add_scatter(x=xx, y=s.soh_p10.mean(), fill="tonexty", fillcolor=fill, line=dict(width=0), showlegend=False, hoverinfo="skip")
+        f14.add_scatter(x=xx, y=s.soh_p50.mean(), line=dict(color=col, width=3), name=lab)
+    f14.add_hline(y=80, line=dict(color=GREY, dash="dash"))
+    f14.update_xaxes(title="age (months)", **AX); f14.update_yaxes(title="SoH %", range=[70, 101], **AX)
+    f14.update_layout(**lay(height=380, title="Behaviour tilt — heavy vs light usage (km/month)", legend=dict(orientation="h", y=1.13)))
+    g2.plotly_chart(f14, use_container_width=True)
+
+    st.markdown("**What drives the curve — and how much to trust it**")
+    cta, ctb = st.columns(2)
+    sb = BR["source_baseline_rate"]; ssb = BR.get("source_sigma_b", {})
+    cta.caption("Per-OEM baseline rate + between-vehicle spread σ_b (per-source calibrated):")
+    cta.table(pd.DataFrame({"baseline (SoH/mo)": {k: round(v, 3) for k, v in sb.items()},
+                            "σ_b (SoH/mo)": {k: round(ssb.get(k, float('nan')), 3) for k in sb}}))
+    ctb.caption("Behaviour slopes on the degradation rate (per +1 global SD) — only km/month is credible:")
+    ctb.table(pd.DataFrame([{"behaviour": k, "slope/+1SD": round(v["mean"], 3),
+                             "95% CI": f"[{v['lo']:+.3f}, {v['hi']:+.3f}]", "credible": "✅" if v["credible"] else "—"}
+                            for k, v in BR["behaviour_slopes"].items()]).set_index("behaviour"))
+
+    psk = BR.get("per_source_km_rate", {})
+    psk_txt = ", ".join(f"**{s} {v['rho']:+.2f}**" for s, v in psk.items())
+    st.warning(f"**Honesty on the one real driver (km/month) and the bands.** After fixing the odometer definition, the "
+               f"km/month→faster-fade effect is **credible and consistent across 3 of 4 OEMs** (per-source km→rate: "
+               f"{psk_txt}) — including **Mahindra-intellicar's own −0.24**, so the native tilt has *same-OEM* support "
+               f"rather than being borrowed (Euler is the lone null — its raw odometer is glitchy; Bajaj is strongest "
+               f"but its rates are late-window local slopes). **The band is irreducible:** Mahindra between-vehicle "
+               f"heterogeneity **σ_b={bd['heterogeneity_sd']:.2f} SoH/mo dominates parameter uncertainty "
+               f"{bd['parameter_sd']:.3f}** — vehicles that charge & drive alike still fade differently, and the native "
+               f"feed (no temperature/current) can't resolve why.")
+    st.success(f"✅ **Constructive takeaway:** every native vehicle gets a **principled probabilistic SoH curve** — the "
+               f"Mahindra baseline tilted by its (credible) mileage effect, with a per-source-calibrated "
+               f"**±{nat['band_width_at_36mo_median']/2:.0f}pp** band. This native cohort is the *longest-availability "
+               f"(highest-usage)* subset (median **{nat.get('km_month_median', 0):.0f} km/mo**), so its median lands at "
+               f"a steeper **~{nat['soh50_at_36mo_median']:.0f}% at 36 months**. Behaviour beats the OEM-average by "
+               f"**{hd['behaviour_improvement_pct']:+.1f}%** out-of-sample — good for **fleet-level warranty/risk**, not "
+               f"a per-vehicle sensor. Best the native feed supports without current/voltage.")
