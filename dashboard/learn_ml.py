@@ -356,10 +356,10 @@ def smooth(s, win=5):
     return s.rolling(win, center=True, min_periods=1).mean() if SMOOTH else s
 
 
-STEPS = ["📋 Overview", "1 · The problem", "2 · The data", "3 · The target (SoH)", "4 · Features",
-         "5 · Train / Validation / Test", "6 · Training the model", "7 · Which clues matter?",
-         "8 · Errors & overfitting", "9 · A tougher test (LOVO)", "10 · Predicting the future",
-         "11 · Range & km left", "12 · Data quality", "13 · Limits & retraining",
+STEPS = ["📋 Overview", "1 · The problem", "2 · The data", "3 · The target (SoH)", "4 · Data quality",
+         "5 · Features", "6 · Train / Validation / Test", "7 · Training the model",
+         "8 · Which clues matter?", "9 · Errors & overfitting", "10 · A tougher test (LOVO)",
+         "11 · Predicting the future", "12 · Range & km left", "13 · Limits & retraining",
          "14 · Validation & data needs"]
 step = st.sidebar.radio("Steps", STEPS, label_visibility="collapsed")
 st.sidebar.markdown("---")
@@ -1157,7 +1157,7 @@ elif step == STEPS[2]:
                            "charge-energy/`kwh` **8** (≈ +0.32; kwh field in 84, plausible-scale in 22) · "
                            "any **84/95** → native-only tier falls back to an **age prior**, not a proxy.")
     takeaway("ML needs **examples** — one per row. A model can only use clues its feed actually carries, so "
-             "the three models necessarily lean on different features (Step 7 shows how differently).")
+             "the three models necessarily lean on different features (Step 8 shows how differently).")
 
 # ═════════════════════════════════ STEP 3 ═════════════════════════════════
 elif step == STEPS[3]:
@@ -1199,8 +1199,8 @@ elif step == STEPS[3]:
              "the most valuable examples: they show the model what real aging looks like.")
 
 # ═════════════════════════════════ STEP 4 ═════════════════════════════════
-elif step == STEPS[4]:
-    st.title("4 · Features — turning raw data into clues")
+elif step == STEPS[5]:
+    st.title("5 · Features — turning raw data into clues")
     st.markdown("A **feature** is one clue we give the model. We *engineer* features that capture known "
                 "battery-aging factors — but **a fleet can only offer features its feed supports.**")
     groups = {
@@ -1229,11 +1229,11 @@ elif step == STEPS[4]:
             st.caption(f"**{oem}** · vehicle {vin[-6:]} · {nf} features")
             st.plotly_chart(fig, use_container_width=True)
     takeaway("Each model receives the features its feed allows and learns which combinations predict SoH "
-             "loss. Step 7 reveals *which* it actually relied on — and it differs per fleet.")
+             "loss. Step 8 reveals *which* it actually relied on — and it differs per fleet.")
 
 # ═════════════════════════════════ STEP 5 ═════════════════════════════════
-elif step == STEPS[5]:
-    st.title("5 · Splitting the data — train / validation / test")
+elif step == STEPS[6]:
+    st.title("6 · Splitting the data — train / validation / test")
     st.markdown("A rule we hold to: **never judge a model on data it learned from.** For each fleet we "
                 "split the *vehicles* (never rows) into three groups — 🟢 train · 🟡 validation · 🔴 test — "
                 "stratified so each keeps degraders and flat vehicles. **Columns = fleets, rows = the three "
@@ -1291,7 +1291,7 @@ elif step == STEPS[5]:
              "biasing it toward over-predicting risk. **Bajaj has 0 aged at all**, so its long-horizon "
              "forecast is pure *extrapolation* until real aged Bajaj exist. We also can't validate the "
              "'98% survive' assumption from data — no vehicle has aged gracefully to EoL. Honest aged "
-             "accuracy now comes from **Step 9 (LOVO)**, not the held-out test set.")
+             "accuracy now comes from **Step 10 (LOVO)**, not the held-out test set.")
 
     # ── every vehicle per fleet: the healthy mass (grey) vs the completely-aged early-failures (red) ──
     st.markdown("##### 🔎 *Every* vehicle's SoH trajectory — the healthy fleet (grey) vs the early-failures (red)")
@@ -1393,8 +1393,8 @@ elif step == STEPS[5]:
              "fleet. That's how we get an *honest* accuracy estimate.")
 
 # ═════════════════════════════════ STEP 6 ═════════════════════════════════
-elif step == STEPS[6]:
-    st.title("6 · Training the model — how it learns")
+elif step == STEPS[7]:
+    st.title("7 · Training the model — how it learns")
     st.markdown("All three fleets use the same model family — **gradient-boosted decision trees** — but one "
                 "model trained per fleet. A **single decision tree** asks yes/no questions to reach a guess:")
     st.code("if temp_max > 38°C:\n    if age_months > 24:  ->  predict 'loses 0.4% this month'\n"
@@ -1413,8 +1413,8 @@ elif step == STEPS[6]:
              "match reality as closely as possible. Next: did it learn real patterns, or just memorise?")
 
 # ═════════════════════════════════ STEP 7 ═════════════════════════════════
-elif step == STEPS[7]:
-    st.title("7 · Which clues mattered most? — Feature importance")
+elif step == STEPS[8]:
+    st.title("8 · Which clues mattered most? — Feature importance")
     st.markdown("After training, each model reports **how much it leaned on each feature** (bigger bar = "
                 "used more). Compare the three — they're **not the same**, because their feeds differ. The "
                 "line under each chart flags **thinly-populated features** — a clue can rank low simply "
@@ -1443,8 +1443,8 @@ elif step == STEPS[7]:
              "aging'.")
 
 # ═════════════════════════════════ STEP 8 ═════════════════════════════════
-elif step == STEPS[8]:
-    st.title("8 · Is it any good? — Errors & overfitting")
+elif step == STEPS[9]:
+    st.title("9 · Is it any good? — Errors & overfitting")
     st.markdown("We measure error as **RMSE** — roughly the typical size of the model's mistake (in "
                 "percentage-points of monthly SoH loss). **Lower is better.** Checked on all three splits, "
                 "per fleet — the Test ÷ Train gap reveals overfitting:")
@@ -1461,8 +1461,8 @@ elif step == STEPS[8]:
              "**test/validation** number, never the training one.")
 
 # ═════════════════════════════════ STEP 9 ═════════════════════════════════
-elif step == STEPS[9]:
-    st.title("9 · A tougher, fairer test — Leave-One-Vehicle-Out")
+elif step == STEPS[10]:
+    st.title("10 · A tougher, fairer test — Leave-One-Vehicle-Out")
     st.markdown("A single split can be lucky or unlucky. So we use **Leave-One-Vehicle-Out (LOVO)**: hold "
                 "out one whole vehicle, train on the rest, forecast it — repeat for *every* vehicle. We "
                 "compare each fleet's model against two lazy baselines:")
@@ -1483,8 +1483,8 @@ elif step == STEPS[9]:
              "matter for warranty & RUL. That's the evidence it learned something real.")
 
 # ═════════════════════════════════ STEP 10 ═════════════════════════════════
-elif step == STEPS[10]:
-    st.title("10 · Predicting the future — with honest uncertainty")
+elif step == STEPS[11]:
+    st.title("11 · Predicting the future — with honest uncertainty")
     st.markdown("The payoff: feed a battery's history to the trained model and it projects SoH **forward** — "
                 "not as one over-confident number, but as a **range**. One clear example per fleet:")
     cols = st.columns(len(OEM_KEYS))
@@ -1553,8 +1553,8 @@ elif step == STEPS[10]:
                        "sidebar to watch the split move.")
 
 # ═════════════════════════════════ STEP 11 ═════════════════════════════════
-elif step == STEPS[11]:
-    st.title("11 · From SoH to kilometres — range & km left")
+elif step == STEPS[12]:
+    st.title("12 · From SoH to kilometres — range & km left")
     st.markdown("Forecasting gives **SoH over time**. Two conversions turn that into the numbers a warranty needs:")
     st.markdown("- **Range now ≈ rated full-charge range × SoH** — a 90%-SoH pack goes ~90% as far.\n"
                 "- **Remaining km to end-of-life = km/month × months-until-SoH-hits-EoL** (read off the forecast). "
@@ -1593,8 +1593,8 @@ elif step == STEPS[11]:
              "numbers a data-backed warranty is built on. ARAI ranges are optimistic (real-world ~30–40% lower); "
              "what we add is the *fade* and the *remaining distance*.")
 
-elif step == STEPS[12]:
-    st.title("12 · Data quality — which vehicles can we trust?")
+elif step == STEPS[4]:
+    st.title("4 · Data quality — which vehicles can we trust?")
     st.markdown("Not every vehicle has **enough data to prove** how it's aging. A battery with only a few "
                 "valid months, or a short observation window, can look 'flat' just because we haven't "
                 "watched it long enough — training on it would teach the model a trend that isn't really "
