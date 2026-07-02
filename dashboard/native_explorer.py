@@ -12,6 +12,7 @@ Run: streamlit run dashboard/native_explorer.py --server.port 8503
 import os
 import numpy as np, pandas as pd, streamlit as st
 import plotly.graph_objects as go
+from plotly.subplots import make_subplots
 
 st.set_page_config(page_title="Mahindra Native Feed Explorer", layout="wide")
 TEAL, AMBER, RED, GREEN, GREY, BLUE = "#1f9e8f", "#e0922b", "#d4504e", "#2ec16b", "#9fb3c8", "#5aa9f7"
@@ -114,6 +115,22 @@ if proxy is not None:
                 "- **Finer time bins don't help.** Binning the *same* complete data **weekly** is noisier "
                 "(residual 10.2% of level) than **monthly** (7.7%), with no extra trend — higher-frequency data "
                 "would *hurt*, not help.")
+    # the 5 highest-availability vehicles, one panel each — every one wobbles, none trends down
+    top5 = pd.read_csv("data/manifests/mahindra_native_top100.csv")["vin"].astype(str).head(5).tolist()
+    p5 = proxy[proxy.vin.isin(top5)]
+    if len(p5):
+        f5 = make_subplots(rows=1, cols=len(top5), shared_yaxes=True, horizontal_spacing=0.015,
+                           subplot_titles=[f"…{v[-6:]}" for v in top5])
+        for i, v in enumerate(top5, start=1):
+            pv = p5[p5.vin == v].sort_values("month")
+            f5.add_scatter(x=pv.month, y=pv.soh, line=dict(color=RED, width=1.6), row=1, col=i, showlegend=False)
+            f5.add_hline(y=100, line=dict(color=GREY, dash="dot"), row=1, col=i)
+        f5.update_yaxes(range=[60, 115], **AX); f5.update_xaxes(showticklabels=False, **AX)
+        f5.update_layout(**lay(height=260,
+                         title="The 5 highest-availability vehicles — distance-per-SoC proxy (each wobbles ±10%, none trends down)"))
+        st.plotly_chart(f5, use_container_width=True)
+        st.caption("Same story per vehicle as in aggregate: the proxy drifts up and down with driving/season, "
+                   "never settling into a decline — there's no capacity signal underneath it.")
 else:
     st.info("Proxy not built yet — run `python src/mahindra_native_soh.py`.")
 
@@ -144,3 +161,54 @@ if proxy is not None and vin in set(proxy.vin):
     st.plotly_chart(pf, use_container_width=True)
 st.caption("Driving segments = odometer-up & soc-down. The proxy divides km by %SoC used while driving; it "
            "wobbles with driving efficiency and season — not battery health.")
+
+# ── 6. Raw signal explorer — browse the actual telemetry, full resolution ──
+st.header("6 · Raw signal explorer — what the feed actually streams")
+st.caption("Browse a single vehicle-day at full resolution. This is the **raw** native feed — SoC, odometer, "
+           "the BMS range estimate (DTE), speed, status. Note how coarse (often ~2-min cadence) and sometimes "
+           "unreliable it is (`vehicleStatus`/`vehicleSpeed` can be flaky). No current/voltage = no capacity.")
+
+
+@st.cache_data(show_spinner="Loading raw signals…")
+def load_raw():
+    import glob
+    fs = sorted(glob.glob("data/mahindra/native100/*.parquet"))
+    keep = ["vin", "eventAt", "soc", "odometer", "distanceToEmpty", "vehicleSpeed", "vehicleStatus", "vehicleMode"]
+    avail = [c for c in keep if c in pd.read_parquet(fs[0]).columns]
+    d = pd.concat([pd.read_parquet(f, columns=avail) for f in fs], ignore_index=True)
+    d["t"] = pd.to_datetime(pd.to_numeric(d["eventAt"], errors="coerce"), unit="ms")
+    for c in ["soc", "odometer", "distanceToEmpty", "vehicleSpeed"]:
+        if c in d.columns:
+            d[c] = pd.to_numeric(d[c], errors="coerce")
+    d["vin"] = d["vin"].astype(str)
+    d = d.dropna(subset=["t"]); d["day"] = d["t"].dt.date
+    return d
+
+
+raw = load_raw()
+rc = st.columns(2)
+rvin = rc[0].selectbox("Vehicle", sorted(raw.vin.unique()), format_func=lambda v: v[-8:], key="rawvin")
+gv = raw[raw.vin == rvin]
+days = sorted(gv["day"].unique())
+di = rc[1].select_slider("Day", options=list(range(len(days))), value=len(days) // 2,
+                         format_func=lambda i: str(days[i])) if len(days) > 1 else 0
+gd = gv[gv["day"] == days[di]].sort_values("t")
+if len(gd) < 2:
+    st.info("No rows that day.")
+else:
+    cad = gd["t"].diff().dt.total_seconds().median()
+    s = st.columns(4)
+    s[0].metric("Rows", len(gd)); s[1].metric("SoC swing", f"{gd.soc.min():.0f}→{gd.soc.max():.0f}%")
+    s[2].metric("Distance", f"+{gd.odometer.max()-gd.odometer.min():.1f} km"); s[3].metric("Cadence", f"~{cad:.0f}s")
+    fig = go.Figure()
+    fig.add_scatter(x=gd.t, y=gd.soc, name="SoC %", line=dict(color=TEAL), mode="lines+markers", marker=dict(size=3))
+    fig.add_scatter(x=gd.t, y=gd.distanceToEmpty, name="DTE (km)", line=dict(color=BLUE), yaxis="y2")
+    if "vehicleSpeed" in gd:
+        fig.add_scatter(x=gd.t, y=gd.vehicleSpeed, name="speed", line=dict(color=AMBER), yaxis="y2", opacity=0.55)
+    fig.update_layout(**lay(height=380, title=f"…{rvin[-8:]} — raw signals on {days[di]}",
+                            yaxis=dict(title="SoC %", **AX),
+                            yaxis2=dict(title="DTE km / speed", overlaying="y", side="right", **AX),
+                            xaxis=dict(**AX), legend=dict(orientation="h", y=1.12)))
+    st.plotly_chart(fig, use_container_width=True)
+    if "vehicleStatus" in gd:
+        st.caption(f"vehicleStatus mix: {gd.vehicleStatus.value_counts().to_dict()}")
