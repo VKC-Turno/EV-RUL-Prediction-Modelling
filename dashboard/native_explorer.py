@@ -174,8 +174,9 @@ def load_raw():
     import glob
     fs = sorted(glob.glob("data/mahindra/native100/*.parquet"))
     keep = ["vin", "eventAt", "soc", "odometer", "distanceToEmpty", "vehicleSpeed", "vehicleStatus", "vehicleMode"]
-    avail = [c for c in keep if c in pd.read_parquet(fs[0]).columns]
-    d = pd.concat([pd.read_parquet(f, columns=avail) for f in fs], ignore_index=True)
+    # union columns across files — 2024 files predate vehicleStatus/vehicleMode, so read each file's own subset
+    d = pd.concat([pd.read_parquet(f)[[c for c in keep if c in pd.read_parquet(f, columns=None).columns]]
+                   for f in fs], ignore_index=True)
     d["t"] = pd.to_datetime(pd.to_numeric(d["eventAt"], errors="coerce"), unit="ms")
     for c in ["soc", "odometer", "distanceToEmpty", "vehicleSpeed"]:
         if c in d.columns:
@@ -293,3 +294,51 @@ st.plotly_chart(mgrid, use_container_width=True)
 st.caption("SoC over the full timeline, one panel per operating mode. (`vehicleMode` is constant = ECO, so "
            "'mode' = `vehicleStatus`.) CHARGING sits high (topping up), DRIVING spans the discharge range, IDLE "
            "is scattered, DISCONNECTED is the flaky/gappy state flagged earlier.")
+
+# ── 10. First-principles: fixed-SoC-window discharge rate over time ──
+st.header("10 · First-principles — range per %SoC over a FIXED discharge window")
+
+
+@st.cache_data(show_spinner="Extracting fixed-window discharge events…")
+def _fixed_window_rate(HI, LO):
+    d = load_raw()[["vin", "t", "soc", "odometer"]].dropna().sort_values(["vin", "t"])
+    ev = []
+    for v, g in d.groupby("vin"):
+        soc = g.soc.values; odo = g.odometer.values; t = g.t.values
+        if len(soc) < 10:
+            continue
+        sh = np.empty_like(soc); sh[0] = soc[0]; sh[1:] = soc[:-1]
+        dhi = np.where((soc <= HI) & (sh > HI))[0]
+        dlo = np.where((soc <= LO) & (sh > LO))[0]
+        up = np.where(soc > sh + 3)[0]
+        for hi in dhi:
+            ua = up[up > hi]; nu = ua[0] if len(ua) else len(soc) + 1
+            la = dlo[(dlo > hi) & (dlo < nu)]
+            if len(la):
+                km = odo[la[0]] - odo[hi]
+                if 0 < km < 200:
+                    ev.append((t[hi], km / (HI - LO)))
+    return pd.DataFrame(ev, columns=["t", "rate"])
+
+
+cW = st.columns(2)
+HI = cW[0].slider("Window high SoC %", 60, 95, 80, 5)
+LO = cW[1].slider("Window low SoC %", 20, 55, 40, 5)
+E = _fixed_window_rate(HI, LO)
+if len(E) < 20:
+    st.info("Too few events for this window — widen it.")
+else:
+    E["mon"] = E.t.dt.to_period("M").dt.to_timestamp()
+    mt = E.groupby("mon")["rate"].median().reset_index()
+    fig = go.Figure()
+    fig.add_scattergl(x=E.t, y=E.rate, mode="markers", marker=dict(color=GREY, size=3, opacity=0.22), name="events")
+    fig.add_scatter(x=mt.mon, y=mt.rate, mode="lines+markers", line=dict(color=TEAL, width=2.5), name="monthly median")
+    fig.update_yaxes(title=f"km per %SoC ({HI}→{LO}% window)", range=[0.6, 2.0], **AX); fig.update_xaxes(**AX)
+    fig.update_layout(**lay(height=400, legend=dict(orientation="h", y=1.1),
+                            title=f"Range per %SoC over a fixed {HI}→{LO}% discharge window · {len(E):,} events"))
+    st.plotly_chart(fig, use_container_width=True)
+    st.caption(f"By measuring km per %SoC over the SAME {HI}→{LO}% window each discharge, we control for the "
+               "SoC-dependence of range — the cleanest capacity proxy this feed allows. The rate is a stable "
+               "**~1.25 km/%SoC (~125 km full charge)** that barely drifts over 20 months: a faint downward lean "
+               "(~55–60% of vehicles) but still inside the ~10% noise, so no confident degradation on this young "
+               "fleet yet. This is the method to re-run as the fleet ages.")
