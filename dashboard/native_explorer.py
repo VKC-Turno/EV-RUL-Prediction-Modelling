@@ -236,3 +236,36 @@ st.plotly_chart(f7, use_container_width=True)
 st.caption("Charging = consecutive readings where SoC **rises**; discharging = SoC **falls** (more robust than the "
            "flaky `vehicleStatus`). Shows the SoC band each mode operates over — how deep vehicles run down while "
            "driving, and from what level they charge back up.")
+
+# ── 8. Individual SoC vs time — daily charge/discharge cycles ──
+st.header("8 · Individual SoC vs time — daily cycles (charge green / discharge red)")
+
+
+@st.cache_data(show_spinner=False)
+def _rich_days(n=6):
+    r = load_raw()
+    vd = r.groupby(["vin", "day"]).size().sort_values(ascending=False)
+    seen, picks = set(), []
+    for (v, d), _ in vd.items():
+        if v not in seen:
+            seen.add(v); picks.append((str(v), d))
+        if len(picks) >= n:
+            break
+    return picks
+
+
+picks = _rich_days(6)
+grid = make_subplots(rows=2, cols=3, subplot_titles=[f"…{v[-6:]} · {d}" for v, d in picks],
+                     vertical_spacing=0.14, horizontal_spacing=0.05)
+for i, (v, d) in enumerate(picks):
+    r, c = i // 3 + 1, i % 3 + 1
+    g = raw[(raw.vin == v) & (raw.day == d)].sort_values("t").assign(dsoc=lambda x: x.soc.diff())
+    grid.add_scatter(x=g.t, y=g.soc, mode="lines", line=dict(color="#3a4a60", width=1), row=r, col=c, showlegend=False)
+    up = g[g.dsoc > 0]; dn = g[g.dsoc < 0]
+    grid.add_scatter(x=up.t, y=up.soc, mode="markers", marker=dict(color=GREEN, size=3), row=r, col=c, showlegend=False)
+    grid.add_scatter(x=dn.t, y=dn.soc, mode="markers", marker=dict(color=RED, size=3), row=r, col=c, showlegend=False)
+grid.update_yaxes(range=[0, 105], **AX); grid.update_xaxes(showticklabels=False, **AX)
+grid.update_layout(**lay(height=460, title="Each panel = one vehicle's richest day (~24h) · SoC over time"))
+st.plotly_chart(grid, use_container_width=True)
+st.caption("The raw intraday SoC cycle per vehicle: discharge while driving (red), charge back up (green) — the "
+           "behaviour the range proxy is derived from. Note the coarse ~2-min cadence and flat parked stretches.")
