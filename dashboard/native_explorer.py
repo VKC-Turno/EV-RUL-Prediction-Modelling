@@ -367,3 +367,52 @@ st.caption("**Method (no tuning):** fixed *wide* 90→20% window (max ΔSoC), pe
            "~5% of the variance (the dominant confound is unobservable **cargo payload**), so it doesn't help. "
            "**So: no measurable degradation on this young fleet — re-run this exact test as it ages** (fade will "
            "clear the noise), or add current/voltage to the feed.")
+
+# ── 11. Both-feed coulomb cross-validation ──
+st.header("11 · Cross-validation — does the native proxy track REAL (coulomb) SoH?")
+
+
+@st.cache_data
+def load_crossval():
+    P = pd.read_parquet("data/mahindra/crossval_pairs.parquet") if os.path.exists("data/mahindra/crossval_pairs.parquet") else None
+    C = pd.read_csv("data/mahindra/crossval_coverage.csv", index_col=0) if os.path.exists("data/mahindra/crossval_coverage.csv") else None
+    return P, C
+
+
+P, C = load_crossval()
+if P is None:
+    st.info("Run `python src/crossval_prep.py` (needs the both-feeds native pull).")
+else:
+    m = P.nz.notna() & P.cz.notna() & np.isfinite(P.nz) & np.isfinite(P.cz)
+    x = P.nz[m].values; y = P.cz[m].values; r = float(np.corrcoef(x, y)[0, 1])
+    rng = np.random.default_rng(0)
+    boot = [np.corrcoef(x[(i := rng.integers(0, len(x), len(x)))], y[i])[0, 1] for _ in range(2000)]
+    clo, chi = np.percentile(boot, [2.5, 97.5])
+    a, b, cc = st.columns(3)
+    a.metric("Overlap tested", f"{P.vin.nunique()} veh · {len(P)} mo")
+    b.metric("Correlation r", f"{r:+.2f}"); cc.metric("95% CI", f"[{clo:+.2f}, {chi:+.2f}]")
+    if clo > 0:
+        st.success("✅ **Native proxy tracks the coulomb SoH** — the distance proxy is validated for native-only vehicles.")
+    elif chi < 0:
+        st.warning("⚠️ Native proxy *anti*-correlates with coulomb — not usable.")
+    else:
+        st.error("🚫 **No significant tracking** (CI spans 0). The native distance-per-SoC proxy does **not** reflect "
+                 "the real coulomb SoH on the vehicles that have both.")
+    g1, g2 = st.columns(2)
+    fig = go.Figure(go.Scattergl(x=P.nz[m], y=P.cz[m], mode="markers", marker=dict(color=GREY, size=5, opacity=0.5)))
+    fig.update_xaxes(title="native distance proxy (norm.)", **AX); fig.update_yaxes(title="coulomb SoH (norm.)", **AX)
+    fig.update_layout(**lay(height=340, title="If the proxy worked, points would trend ↗"))
+    g1.plotly_chart(fig, use_container_width=True)
+    if C is not None:
+        f2 = go.Figure()
+        f2.add_bar(x=C.index, y=C["coulomb"], name="intellicar coulomb", marker_color=TEAL)
+        f2.add_bar(x=C.index, y=C["native"], name="native", marker_color=AMBER)
+        f2.update_layout(barmode="group", **lay(height=340, title="Why overlap is thin — feeds cover different periods",
+                                                legend=dict(orientation="h", y=1.12)))
+        f2.update_xaxes(**AX); f2.update_yaxes(title="vehicle-months", **AX)
+        g2.plotly_chart(f2, use_container_width=True)
+    st.caption("The native distance-per-SoC proxy shows **no significant correlation** with the intellicar coulomb "
+               "SoH (ground truth) on the ~23 vehicles that have both. It's also barely testable: the coulomb data "
+               "is **2023–24**, the native feed starts **2024-12** — this cohort migrated intellicar→native, so "
+               "they barely co-occur (median 0 shared months). **Bottom line: native-only Mahindra SoH can't be "
+               "validated or measured from the current feed — it needs current/voltage, or fleet aging.**")
