@@ -248,27 +248,29 @@ def _rich_vins(n=6):
 
 all_vins = sorted(raw.vin.unique())
 sel = st.multiselect("Pick vehicles", all_vins, default=_rich_vins(6), format_func=lambda v: v[-8:], max_selections=9)
-def _soc_grid(vins, rising, color, title):
-    ncol = min(2, len(vins)); nrow = (len(vins) + ncol - 1) // ncol
-    fg = make_subplots(rows=nrow, cols=ncol, subplot_titles=[f"…{v[-6:]}" for v in vins],
-                       vertical_spacing=0.12 if nrow > 1 else 0.1, horizontal_spacing=0.06)
-    for i, v in enumerate(vins):
-        r, c = i // ncol + 1, i % ncol + 1
-        g = raw[raw.vin == v].sort_values("t").assign(dsoc=lambda x: x.soc.diff())
-        pts = (g[g.dsoc > 0] if rising else g[g.dsoc < 0]).iloc[::2]
-        fg.add_scattergl(x=pts.t, y=pts.soc, mode="markers", marker=dict(color=color, size=2), row=r, col=c, showlegend=False)
-    fg.update_yaxes(range=[0, 105], **AX); fg.update_xaxes(**AX)
-    fg.update_layout(**lay(height=max(300, 230 * nrow), title=title))
-    return fg
-
-
 if not sel:
     st.info("Select at least one vehicle above.")
 else:
-    st.markdown("##### 🟢 Charging — SoC rising")
-    st.plotly_chart(_soc_grid(sel, True, GREEN, "SoC during charging events (full timeline)"), use_container_width=True)
-    st.markdown("##### 🔴 Discharging — SoC falling")
-    st.plotly_chart(_soc_grid(sel, False, RED, "SoC during discharging events (full timeline)"), use_container_width=True)
-st.caption("Charging (SoC rising) and discharging (SoC falling) plotted **separately**, per vehicle, across the "
-           "full ~20 months (3 sampled days/month → clustered). Same conclusion: neither the charging band nor "
-           "the discharging band drifts over time.")
+    nrow = len(sel)
+    grid = make_subplots(rows=nrow, cols=2,
+                         specs=[[{"secondary_y": True}, {"secondary_y": True}] for _ in range(nrow)],
+                         column_titles=["🟢 Charging (SoC↑) + odometer", "🔴 Discharging (SoC↓) + odometer"],
+                         row_titles=[f"…{v[-6:]}" for v in sel],
+                         vertical_spacing=min(0.06, 1.0 / max(nrow, 2)), horizontal_spacing=0.07)
+    for i, v in enumerate(sel):
+        g = raw[raw.vin == v].sort_values("t").assign(dsoc=lambda x: x.soc.diff())
+        up = g[g.dsoc > 0].iloc[::2]; dn = g[g.dsoc < 0].iloc[::2]; od = g.iloc[::4]
+        for col, pts, clr in ((1, up, GREEN), (2, dn, RED)):
+            grid.add_scattergl(x=pts.t, y=pts.soc, mode="markers", marker=dict(color=clr, size=2),
+                               row=i + 1, col=col, secondary_y=False, showlegend=False)
+            grid.add_scattergl(x=od.t, y=od.odometer, mode="lines", line=dict(color=BLUE, width=1),
+                               row=i + 1, col=col, secondary_y=True, showlegend=False)
+    grid.update_yaxes(range=[0, 105], secondary_y=False, **AX)
+    grid.update_yaxes(secondary_y=True, **AX)
+    grid.update_xaxes(**AX)
+    grid.update_layout(**lay(height=max(320, 210 * nrow),
+                       title="Charging (left) vs Discharging (right) — SoC markers + odometer (blue, right axis)"))
+    st.plotly_chart(grid, use_container_width=True)
+st.caption("One row per vehicle: **charging in column 1, discharging in column 2**. SoC markers (green/red, left "
+           "axis) + **odometer** (blue line, right axis) over the full ~20-month timeline. Odometer climbs "
+           "steadily while the SoC band stays flat — no degradation signal.")
