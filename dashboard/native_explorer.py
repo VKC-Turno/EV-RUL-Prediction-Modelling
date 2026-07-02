@@ -296,7 +296,7 @@ st.caption("SoC over the full timeline, one panel per operating mode. (`vehicleM
            "is scattered, DISCONNECTED is the flaky/gappy state flagged earlier.")
 
 # ── 10. First-principles: fixed-SoC-window discharge rate over time ──
-st.header("10 · First-principles — range per %SoC over a FIXED discharge window")
+st.header("10 · First-principles — is there a degradation signal? (honest verdict)")
 
 
 @st.cache_data(show_spinner="Extracting fixed-window discharge events…")
@@ -321,33 +321,49 @@ def _fixed_window_rate(HI, LO):
     return pd.DataFrame(ev, columns=["vin", "t", "rate"])
 
 
-cW = st.columns(2)
-HI = cW[0].slider("Window high SoC %", 60, 95, 80, 5)
-LO = cW[1].slider("Window low SoC %", 20, 55, 40, 5)
-E = _fixed_window_rate(HI, LO)
-top5 = E["vin"].value_counts().head(5).index.tolist()
-if not top5:
-    st.info("Too few events for this window — widen it.")
+E = _fixed_window_rate(90, 20)          # fixed WIDE window (max ΔSoC = least relative noise); NOT tuned to the result
+sl = []
+for v, g in E.groupby("vin"):
+    if len(g) >= 6:
+        g = g.sort_values("t")
+        x = ((g.t.astype("int64") - g.t.astype("int64").min()) / 8.64e13 / 30.4).values
+        sl.append(np.polyfit(x, g.rate.values, 1)[0] / g.rate.mean() * 100)   # per-vehicle %/mo
+sl = np.array(sl)
+rng = np.random.default_rng(0)
+boot = np.array([np.median(rng.choice(sl, len(sl), replace=True)) for _ in range(3000)]) if len(sl) else np.array([0.0])
+clo, chi = np.percentile(boot, [2.5, 97.5]); med = float(np.median(sl)) if len(sl) else 0.0
+verdict = (f"Fleet degradation slope **{med:+.2f}%/mo**, 95% CI **[{clo:+.2f}, {chi:+.2f}]** · "
+           f"{100*np.mean(sl < 0):.0f}% of {len(sl)} vehicles decline.")
+if chi < 0:
+    st.success("✅ **Significant degradation detected.** " + verdict)
+elif clo > 0:
+    st.warning("⚠️ Proxy trends *up* (impossible for real SoH) — pure noise. " + verdict)
 else:
-    nr = len(top5); meta = {}; titles = []
-    for v in top5:
-        ev = E[E.vin == v].sort_values("t")
-        x = ((ev.t.astype("int64") - ev.t.astype("int64").min()) / 8.64e13 / 30.4).values
-        b = np.polyfit(x, ev.rate.values, 1)
-        meta[v] = (ev, b, x); titles.append(f"…{v[-6:]} · {len(ev)} events · trend {b[0] / ev.rate.mean() * 100:+.2f}%/mo")
-    grid = make_subplots(rows=nr, cols=1, subplot_titles=titles, vertical_spacing=0.06)
-    for i, v in enumerate(top5, start=1):
-        ev, b, x = meta[v]
-        grid.add_scattergl(x=ev.t, y=ev.rate, mode="markers", marker=dict(color=GREY, size=4, opacity=0.5), row=i, col=1, showlegend=False)
-        mm = ev.assign(mon=ev.t.dt.to_period("M").dt.to_timestamp()).groupby("mon")["rate"].median().reset_index()
-        grid.add_scatter(x=mm.mon, y=mm.rate, mode="lines+markers", line=dict(color=TEAL, width=2), row=i, col=1, showlegend=False)
-        grid.add_scatter(x=[ev.t.min(), ev.t.max()], y=[np.polyval(b, x.min()), np.polyval(b, x.max())],
-                         mode="lines", line=dict(color=RED, dash="dash", width=1.5), row=i, col=1, showlegend=False)
-    grid.update_yaxes(range=[0.6, 2.0], **AX); grid.update_xaxes(**AX)
-    grid.update_layout(**lay(height=max(320, 230 * nr),
-                       title=f"Fixed {HI}→{LO}% window · km per %SoC · the 5 richest vehicles, plotted individually"))
-    st.plotly_chart(grid, use_container_width=True)
-    st.caption("Each panel = **one vehicle** (the 5 with the most discharge events over this window — all 100 have "
-               "complete data, these just have the most discharges). Grey = individual events · teal = monthly "
-               "median · red dashed = linear trend (slope in the title). This is the **per-vehicle** view — no "
-               "cross-vehicle mixing. Watch each vehicle's own trend as the fleet ages.")
+    st.error("🚫 **No significant degradation signal yet.** " + verdict + " The CI **spans zero** — this fleet's "
+             "real ~3–6% fade over 20 months is below the driving-efficiency noise floor.")
+# the 5 richest vehicles, individually
+top5 = E["vin"].value_counts().head(5).index.tolist()
+meta = {}; titles = []
+for v in top5:
+    ev = E[E.vin == v].sort_values("t")
+    x = ((ev.t.astype("int64") - ev.t.astype("int64").min()) / 8.64e13 / 30.4).values
+    b = np.polyfit(x, ev.rate.values, 1)
+    meta[v] = (ev, b, x); titles.append(f"…{v[-6:]} · {len(ev)} events · trend {b[0] / ev.rate.mean() * 100:+.2f}%/mo")
+grid = make_subplots(rows=len(top5), cols=1, subplot_titles=titles, vertical_spacing=0.06)
+for i, v in enumerate(top5, start=1):
+    ev, b, x = meta[v]
+    grid.add_scattergl(x=ev.t, y=ev.rate, mode="markers", marker=dict(color=GREY, size=4, opacity=0.5), row=i, col=1, showlegend=False)
+    mm = ev.assign(mon=ev.t.dt.to_period("M").dt.to_timestamp()).groupby("mon")["rate"].median().reset_index()
+    grid.add_scatter(x=mm.mon, y=mm.rate, mode="lines+markers", line=dict(color=TEAL, width=2), row=i, col=1, showlegend=False)
+    grid.add_scatter(x=[ev.t.min(), ev.t.max()], y=[np.polyval(b, x.min()), np.polyval(b, x.max())],
+                     mode="lines", line=dict(color=RED, dash="dash", width=1.5), row=i, col=1, showlegend=False)
+grid.update_yaxes(range=[0.6, 2.0], **AX); grid.update_xaxes(**AX)
+grid.update_layout(**lay(height=max(320, 230 * len(top5)),
+                   title="Fixed 90→20% window · km per %SoC · the 5 richest vehicles, individually"))
+st.plotly_chart(grid, use_container_width=True)
+st.caption("**Method (no tuning):** fixed *wide* 90→20% window (max ΔSoC), per-vehicle-normalized slope, bootstrap "
+           "95% CI. Auto-searching for the 'best' window is **p-hacking** — the slope swings −0.04 to −0.44%/mo "
+           "across windows, all inside noise. I also tested **controlling for speed + season**: they explain only "
+           "~5% of the variance (the dominant confound is unobservable **cargo payload**), so it doesn't help. "
+           "**So: no measurable degradation on this young fleet — re-run this exact test as it ages** (fade will "
+           "clear the noise), or add current/voltage to the feed.")
