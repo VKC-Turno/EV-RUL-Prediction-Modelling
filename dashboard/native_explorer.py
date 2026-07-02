@@ -274,3 +274,22 @@ else:
 st.caption("One row per vehicle: **charging in column 1, discharging in column 2**. SoC markers (green/red, left "
            "axis) + **odometer** (blue line, right axis) over the full ~20-month timeline. Odometer climbs "
            "steadily while the SoC band stays flat — no degradation signal.")
+
+# ── 9. SoC vs time by operating mode (vehicleStatus) ──
+st.header("9 · SoC vs time — one panel per operating mode")
+mv = st.selectbox("Vehicle", sorted(raw.vin.unique()), format_func=lambda v: v[-8:], key="modevin")
+gm = raw[raw.vin == mv].sort_values("t")
+MODES = ["CHARGING", "DRIVING", "IDLE", "DISCONNECTED"]
+MCOL = {"CHARGING": GREEN, "DRIVING": RED, "IDLE": GREY, "DISCONNECTED": AMBER}
+mgrid = make_subplots(rows=2, cols=2, subplot_titles=[f"{m} · {int((gm.vehicleStatus == m).sum()):,} pts" for m in MODES],
+                      vertical_spacing=0.13, horizontal_spacing=0.06)
+for i, m in enumerate(MODES):
+    r, c = i // 2 + 1, i % 2 + 1
+    pts = gm[gm.vehicleStatus == m].iloc[::2]
+    mgrid.add_scattergl(x=pts.t, y=pts.soc, mode="markers", marker=dict(color=MCOL[m], size=2), row=r, col=c, showlegend=False)
+mgrid.update_yaxes(range=[0, 105], **AX); mgrid.update_xaxes(**AX)
+mgrid.update_layout(**lay(height=460, title=f"…{mv[-6:]} — SoC over the full timeline, split by vehicleStatus"))
+st.plotly_chart(mgrid, use_container_width=True)
+st.caption("SoC over the full timeline, one panel per operating mode. (`vehicleMode` is constant = ECO, so "
+           "'mode' = `vehicleStatus`.) CHARGING sits high (topping up), DRIVING spans the discharge range, IDLE "
+           "is scattered, DISCONNECTED is the flaky/gappy state flagged earlier.")
