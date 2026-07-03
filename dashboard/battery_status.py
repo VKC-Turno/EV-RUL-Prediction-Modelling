@@ -255,6 +255,30 @@ def vehicle_spec(oem: str, vin: str):
     return model, (row if row is not None else cand.iloc[0])
 
 
+def real_range(soh: float, spec, rated: float, driveeff):
+    """Physics-based range = usable energy ÷ consumption, instead of the optimistic ARAI-rated × SoH.
+    usable energy = battery_kWh × SoH; consumption = the vehicle's MEASURED Wh/km where we have it (e.g. Bajaj's
+    drive-efficiency), else the model's rated (ARAI) Wh/km. Falls back to rated × SoH when battery kWh is unknown
+    (e.g. Piaggio, no spec sheet). Returns (range_km, basis_text)."""
+    kwh = None
+    if spec is not None:
+        try:
+            v = float(spec.get("battery_capacity_kWh")); kwh = v if 3 < v < 30 else None
+        except Exception:
+            kwh = None
+        try:                                              # prefer the model's own ARAI range (matches the spec card)
+            rv = float(spec.get("rated_range_km")); rated = rv if 20 < rv < 400 else rated
+        except Exception:
+            pass
+    if kwh is None or not rated:
+        return rated * soh / 100.0, "ARAI range × health"
+    if driveeff is not None and 10 < float(driveeff) < 250:
+        whkm, basis = float(driveeff), "your measured Wh/km"
+    else:
+        whkm, basis = kwh * 1000.0 / rated, "rated (ARAI) Wh/km"
+    return (kwh * soh / 100.0) * 1000.0 / whkm, basis
+
+
 # ===========================================================================
 # Personalisation — per-vehicle behaviour vs the fleet (age-matched, LFP-tuned)
 # ===========================================================================
@@ -836,10 +860,44 @@ km_month = mean_val(g, "km_month")
 if (km_month is None or km_month <= 0) and odo and np.isfinite(age_now) and age_now > 0:
     km_month = odo / age_now
 
-range_now = rated * soh_now / 100.0
+_model, _spec = vehicle_spec(oem, vin)
+_driveeff = mean_val(g, "driveeff_mean")
+range_now, range_basis = real_range(soh_now, _spec, rated, _driveeff)       # energy ÷ efficiency, not ARAI × SoH
+range_full, _ = real_range(100.0, _spec, rated, _driveeff)                  # full-health range → range-gauge scale
 status_label, status_color, _ = health_status(soh_now, eol)
 proj = (model_project(oem, g, eol)                             # the pipeline model (matches the internal dashboard)
         or project(g["age_months"].to_numpy(), g["soh"].to_numpy(), eol))   # √t fallback for thin history
+
+
+# ===========================================================================
+# 0) VEHICLE — model + specifications
+# ===========================================================================
+def _spv(colname, suffix=""):
+    if _spec is None:
+        return "—"
+    v = _spec.get(colname)
+    if v is None or (isinstance(v, str) and v.strip().lower() in ("", "unverified", "none (not disclosed)")):
+        return "—"
+    try:
+        return f"{float(v):g}{suffix}"
+    except Exception:
+        return str(v)
+
+
+_body = _spec.get("body_type") if _spec is not None else None
+section("VEHICLE", _model or f"{oem} electric three-wheeler",
+        sub=(str(_body) if (_body is not None and pd.notna(_body) and str(_body).lower() != "unverified") else None))
+_wy, _wk = FLEET_WARRANTY[OEM_KEY[oem]]
+stat_strip([
+    ("Battery pack", _spv("battery_capacity_kWh", " kWh")),
+    ("Chemistry", "LFP" if _spv("chemistry") == "—" else _spv("chemistry")),
+    ("Rated range", _spv("rated_range_km", " km")),
+    ("Motor power", _spv("motor_power_kW", " kW")),
+    ("Battery warranty", _spv("battery_warranty_yr", " yr") if _spv("battery_warranty_yr") != "—"
+     else f"{_wy} yr / {_wk / 1000:.0f}k km"),
+])
+if _spec is None:
+    st.caption("Detailed spec sheet for this model isn't on file yet — showing the fleet defaults.")
 
 
 # ===========================================================================
@@ -857,10 +915,11 @@ with hero_l:
                         f"Battery health</div>", unsafe_allow_html=True)
     with gc2:
         with st.container(border=True):
-            st.plotly_chart(range_gauge(range_now, rated, eol, status_color), use_container_width=True,
+            st.plotly_chart(range_gauge(range_now, range_full, eol, status_color), use_container_width=True,
                             config={"displayModeBar": False}, key="g_range")
             st.markdown(f"<div style='text-align:center;color:{MUTE};font-size:0.85rem;margin-top:-6px;'>"
-                        f"Range now · {rated:.0f} km when new</div>", unsafe_allow_html=True)
+                        f"Range now · {range_full:.0f} km at full health · "
+                        f"<span style='color:{FAINT};'>{range_basis}</span></div>", unsafe_allow_html=True)
 with hero_r:
     with st.container(border=True):
         st.markdown(f"<span class='pill' style='background:{status_color}26;color:{status_color};'>"
@@ -891,36 +950,6 @@ stat_strip([
     ("Distance driven", f"{odo:,.0f} km" if odo and odo > 0 else "—"),
     ("Charge cycles", f"{cycles:,.0f}" if cycles and np.isfinite(cycles) and cycles > 0 else "—"),
 ])
-
-# --- Vehicle model + specifications ---
-_model, _spec = vehicle_spec(oem, vin)
-
-
-def _spv(colname, suffix=""):
-    if _spec is None:
-        return "—"
-    v = _spec.get(colname)
-    if v is None or (isinstance(v, str) and v.strip().lower() in ("", "unverified", "none (not disclosed)")):
-        return "—"
-    try:
-        return f"{float(v):g}{suffix}"
-    except Exception:
-        return str(v)
-
-
-_body = _spec.get("body_type") if _spec is not None else None
-section("VEHICLE", _model or f"{oem} electric three-wheeler",
-        sub=(str(_body) if (_body is not None and pd.notna(_body) and str(_body).lower() != "unverified") else None))
-_wy, _wk = FLEET_WARRANTY[OEM_KEY[oem]]
-stat_strip([
-    ("Battery pack", _spv("battery_capacity_kWh", " kWh")),
-    ("Chemistry", "LFP" if _spv("chemistry") == "—" else _spv("chemistry")),
-    ("Rated range", _spv("rated_range_km", " km")),
-    ("Battery warranty", _spv("battery_warranty_yr", " yr") if _spv("battery_warranty_yr") != "—"
-     else f"{_wy} yr / {_wk / 1000:.0f}k km"),
-])
-if _spec is None:
-    st.caption("Detailed spec sheet for this model isn't on file yet — showing the fleet defaults.")
 
 
 # ===========================================================================
