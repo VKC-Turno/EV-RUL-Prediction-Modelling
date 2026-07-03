@@ -112,13 +112,40 @@ for v, g in c.groupby("vin"):
 SC = pd.DataFrame(sc); SC.to_parquet("data/mahindra/behaviour_validation_scatter.parquet", index=False)
 rho = float(SC.km_month.corr(SC.actual_rate))
 
+# (c) ACCURACY vs coulomb — the headline "Bayesian ≈ coulomb counting": 5-fold, hold out each Mahindra-intellicar
+# vehicle, predict its SoH curve from behaviour, compare the predicted MEDIAN to its actual measured coulomb SoH.
+mah_v = behv[behv.src == "mahindra_ic"].vin.tolist()
+rng2 = np.random.default_rng(1); mfolds = np.array_split(rng2.permutation(mah_v), 5)
+acc = []
+for fold in mfolds:
+    ho = set(fold.tolist()); fv = behv[~behv.vin.isin(ho)]
+    ss = sorted(fv.src.unique()); mi = ss.index("mahindra_ic")
+    ky = fv.set_index(["src", "vin"]); vl = list(ky.index); vm = {vk: i for i, vk in enumerate(vl)}
+    Dd = np.array([[1.0 if vk[0] == s else 0 for s in ss] for vk in vl]); Zz = ky[[f + "_z" for f in BEH]].values
+    Xx = np.hstack([Dd, Zz]); pb = len(ss); gg = np.array([ss.index(vk[0]) for vk in vl])
+    oo = obs[~obs.vin.isin(ho)].copy(); oo["vi"] = list(zip(oo.src, oo.vin)); oo = oo[oo.vi.isin(vm)]
+    dr = fit_gibbs(oo.soh.values, oo.age.values, oo.vi.map(vm).values, Xx, group=gg, n_iter=2500, burn=800, seed=0, beta_prior_sd=2.0)
+    for v in fold:
+        br = behv[behv.vin == v].iloc[0]; av = obs[obs.vin == v].sort_values("age")
+        xj = np.zeros(Xx.shape[1]); xj[mi] = 1.0
+        for j, f in enumerate(BEH):
+            xj[pb + j] = br[f + "_z"]
+        pr = predict_curve(dr, xj, av.age.values, group=mi, anchor_intercept=100.0, intercept_sd=1.0)
+        acc.append(dict(mae=float(np.mean(np.abs(pr["q50"] - av.soh.values))),
+                        cov=float(np.mean((av.soh.values >= pr["q10"]) & (av.soh.values <= pr["q90"])))))
+ACC = pd.DataFrame(acc)
+
 report = dict(demos=[dict(vin=v, label=lab, km_month=round(float(behv[behv.vin == v].km_month.iloc[0])),
                           actual_first=round(float(obs[obs.vin == v].sort_values("age").soh.iloc[0]), 1),
                           actual_last=round(float(obs[obs.vin == v].sort_values("age").soh.iloc[-1]), 1),
                           band_coverage=round(cov[v], 2)) for v, lab in DEMOS],
               systematic=dict(vehicles=int(len(SC)), km_vs_rate_corr=round(rho, 3),
                               light_median_rate=round(float(SC[SC.km_month < SC.km_month.quantile(.3)].actual_rate.median()), 3),
-                              heavy_median_rate=round(float(SC[SC.km_month > SC.km_month.quantile(.7)].actual_rate.median()), 3)))
+                              heavy_median_rate=round(float(SC[SC.km_month > SC.km_month.quantile(.7)].actual_rate.median()), 3)),
+              accuracy_vs_coulomb=dict(vehicles=int(len(ACC)), mae_median=round(float(ACC["mae"].median()), 2),
+                                       mae_mean=round(float(ACC["mae"].mean()), 2),
+                                       within_3pp_pct=round(100 * float((ACC["mae"] < 3).mean()), 0),
+                                       band_coverage_median=round(float(ACC["cov"].median()), 2)))
 json.dump(report, open("data/mahindra/behaviour_validation_report.json", "w"), indent=2)
 print(json.dumps(report, indent=2))
 print("wrote behaviour_validation_{curves,actual,scatter}.parquet + _report.json")

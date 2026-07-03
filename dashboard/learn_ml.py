@@ -1988,7 +1988,11 @@ elif step == STEPS[14]:
             nvf.update_yaxes(range=[55, 103], **AX); nvf.update_xaxes(title_text="age (months)", **AX)
             nvf.update_annotations(font_size=10); nvf.update_layout(**lay(height=380, margin=dict(l=44, r=14, t=54, b=36)))
             st.plotly_chart(nvf, use_container_width=True)
-            sy = NAT_VAL_REP["systematic"]
+            sy = NAT_VAL_REP["systematic"]; _ac = NAT_VAL_REP.get("accuracy_vs_coulomb")
+            if _ac:
+                st.success(f"✅ **Behaviour ≈ coulomb counting:** held out across **{_ac['vehicles']}** sensor-equipped "
+                           f"Mahindras, the behaviour-predicted SoH matches the real coulomb SoH to a **median "
+                           f"{_ac['mae_median']:.2f} pp** ({_ac['within_3pp_pct']:.0f}% within 3 pp).")
             st.caption(f"Behaviour predicts the real curve — the light user stays flat at the top of its band, the "
                        f"heavy users decline into the lower band (76–100% of points covered). And it's systematic: "
                        f"across **{sy['vehicles']} Mahindra vehicles** more km/month means faster fade "
@@ -2133,6 +2137,18 @@ elif step == STEPS[15]:
             st.caption("The native fleet has no ground truth — but the Mahindra vehicles on the **intellicar** feed carry "
                        "both a behaviour fingerprint AND a **real, coulomb-measured** SoH. So we **hold a few out of "
                        "training**, predict their SoH curve from behaviour *alone*, and check it against reality.")
+            _acc = VR.get("accuracy_vs_coulomb")
+            if _acc:
+                am = st.columns(3)
+                am[0].metric("Held-out vehicles tested", _acc["vehicles"])
+                am[1].metric("Predicted vs coulomb SoH", f"{_acc['mae_median']:.2f} pp", "median abs error", delta_color="off")
+                am[2].metric("Within 3pp of coulomb", f"{_acc['within_3pp_pct']:.0f}%", delta_color="off")
+                st.success(f"✅ **The behaviour estimate ≈ coulomb counting.** Holding out **each of {_acc['vehicles']}** "
+                           f"sensor-equipped Mahindra vehicles and predicting its SoH curve from behaviour *alone* lands "
+                           f"within a **median {_acc['mae_median']:.2f} pp** of its real coulomb-measured SoH "
+                           f"(**{_acc['within_3pp_pct']:.0f}% within 3 pp**, band coverage {_acc['band_coverage_median']*100:.0f}%). "
+                           f"So the *same* model, applied to the native fleet that has no sensor, is reproducing "
+                           f"coulomb-grade SoH — not guessing. Three examples:")
             vfig = make_subplots(rows=1, cols=len(VR["demos"]), shared_yaxes=True, horizontal_spacing=0.03,
                                  subplot_titles=[f"{d['label']} · {d['km_month']} km/mo · {d['actual_first']:.0f}→{d['actual_last']:.0f}% · band covers {d['band_coverage']*100:.0f}%"
                                                  for d in VR["demos"]])
