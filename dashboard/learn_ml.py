@@ -466,13 +466,20 @@ SIGNALS = [
     ("Charge-cycle count", ["cyc_max", "cyc_month", "cum_cycles"]),
     ("Drive efficiency", ["driveeff_mean", "wh_per_km", "dte_mean"]),
     ("Coulomb capacity (Ah)", ["capacity_ah"]),
+    ("Cell imbalance", ["imbalance_mean", "cell_imbalance", "imbalance"]),
 ]
 
 
 def availability_df():
-    # The native Mahindra feed (~10,700 vehicles) carries only age, SoC and odometer — no current / voltage /
-    # capacity / cycles / temp (batteryTemp existed pre-2024 but was dropped). Shown beside intellicar Mahindra.
+    # ✅ = MODELLED feature (present in that OEM's feature table). ◦ (EXTRA rows) = present in the raw feed but NOT
+    # modelled (weak/flaky for SoH — speed, GPS, drive-state). Native Mahindra carries only age/SoC/odometer as
+    # usable features. Cell imbalance is a real degradation signal but only Euler's feed reports it.
     NATIVE_SIG = {"Calendar age", "State of charge / dwell", "Mileage / odometer"}
+    EXTRA = [
+        ("Vehicle speed",               {"Euler": "—", "Mahindra · intellicar": "—", "Mahindra · native": "◦", "Bajaj": "—", "Piaggio": "◦"}),
+        ("GPS / location",              {"Euler": "—", "Mahindra · intellicar": "—", "Mahindra · native": "◦", "Bajaj": "—", "Piaggio": "◦"}),
+        ("Operating state (drive/chg)", {"Euler": "◦", "Mahindra · intellicar": "—", "Mahindra · native": "◦", "Bajaj": "—", "Piaggio": "◦"}),
+    ]
     rows = []
     for name, cands in SIGNALS:
         row = {"Signal": name}
@@ -482,8 +489,10 @@ def availability_df():
         row["Mahindra Native"] = "✅" if name in NATIVE_SIG else "—"
         rows.append(row)
     df = pd.DataFrame(rows).rename(columns={"Mahindra": "Mahindra · intellicar", "Mahindra Native": "Mahindra · native"})
+    for name, vals in EXTRA:
+        df = pd.concat([df, pd.DataFrame([{"Signal": name, **vals}])], ignore_index=True)
     order = ["Signal", "Euler", "Mahindra · intellicar", "Mahindra · native", "Bajaj", "Piaggio"]
-    return df[[c for c in order if c in df.columns]]
+    return df[[c for c in order if c in df.columns]].fillna("—")
 
 
 # Per-OEM RAW-field audit (from docs/oem_fields_one_pager.md). ✅ usable · ⚠️ weak/caveats · ❌ not usable.
@@ -1194,21 +1203,15 @@ elif step == STEPS[2]:
 
     st.markdown("#### Which signals each fleet's feed provides")
     st.dataframe(availability_df(), hide_index=True, use_container_width=True)
-    st.caption("✅ = present in that OEM's feed. **Mahindra is split into its two real feeds:** **intellicar** carries "
-               "current/voltage → coulomb SoH, but covers only ~233 vehicles; the **native** feed (~10,700 vehicles) "
-               "carries only **age, SoC and odometer — no current, voltage or capacity**, so *no SoH can be measured "
-               "from it* (it also sends distance-to-empty & vehicle-status, both non-electrical). **Bajaj** has no "
-               "current/voltage either (it reports SoH directly instead) and is the only feed with **charge-cycle "
-               "count & ambient temp**. Euler & Mahindra-intellicar are the electrically-rich pair (Mahindra even has GPS).")
+    st.caption("**✅** = used as a model feature · **◦** = present in the raw feed but *not modelled* (weak / flaky for "
+               "SoH — e.g. speed, GPS, drive-state) · **—** = absent. **Mahindra is split into its two feeds:** "
+               "**intellicar** carries current/voltage → coulomb SoH (~233 vehicles); the **native** feed (~10,700) "
+               "gives only age, SoC & odometer as usable features — it *also* streams speed / GPS / status, but those "
+               "are too weak or flaky to model. **Cell imbalance** is a genuine degradation signal, but **only Euler's "
+               "feed reports it**. **Bajaj** has no current/voltage (it reports SoH directly) and is the only feed with "
+               "charge-cycle count & ambient temp.")
     concept("Two kinds of columns everywhere: **the target** (`soh`, the answer we predict) and "
             "**features** (the clues). What changes per fleet is *which clues exist*.")
-    st.markdown("#### A real slice of each fleet's rows")
-    cols = st.columns(len(OEM_KEYS))
-    for col, oem in zip(cols, OEM_KEYS):
-        F = FEATS_BY[oem]
-        col.markdown(f"**{oem}** — {F.vin.nunique()} veh · {len(F):,} rows · {F.shape[1]} cols")
-        show = [c for c in ["month", "soh", "age_months", "temp_max", "soc_mean", "odo_max"] if c in F]
-        col.dataframe(F[show].head(6).reset_index(drop=True), hide_index=True, use_container_width=True)
     st.markdown("#### When does each fleet's data start — and who was captured *from new*?")
     st.markdown("A vehicle only truly starts at **~100% SoH** if telemetry begins near its registration. If the "
                 "feed turned on *after* the vehicle was already in service, its first reading is already aged.")
@@ -1224,16 +1227,44 @@ elif step == STEPS[2]:
                "**absolute** BMS-reported SoH. Euler (from Oct 2023) and Mahindra (from Mar 2023) capture far more "
                "vehicles near-new, so their SoH is anchored to 100% at registration.")
     st.markdown("#### Every raw field each OEM sends — and whether it's usable")
-    st.caption("The full per-OEM audit (also in `docs/oem_fields_one_pager.md`). "
-               "✅ usable · ⚠️ weak / caveats · ❌ not usable.")
-    for title, rows in OEM_FIELD_AUDIT.items():
-        with st.expander(title):
-            st.dataframe(pd.DataFrame(rows, columns=_FCOLS), hide_index=True, use_container_width=True)
-            if "Native OEM feed" in title:
-                st.caption("**Proxy-SoH coverage of 95 native vehicles** — *computable* but **none trustworthy**: "
-                           "distanceToEmpty **84** (corr ≈ −0.20) · distance-per-SoC **25** (≈ +0.22) · "
-                           "charge-energy/`kwh` **8** (≈ +0.32; kwh field in 84, plausible-scale in 22) · "
-                           "any **84/95** → native-only tier falls back to an **age prior**, not a proxy.")
+
+    def _shortfeed(feed):
+        if feed.startswith("Euler"):
+            return "Euler"
+        if feed.startswith("Mahindra") and "Intellicar" in feed:
+            return "Mahindra·IC"
+        if "Native" in feed:
+            return "Mahindra·native"
+        if feed.startswith("Bajaj"):
+            return "Bajaj"
+        if feed.startswith("Piaggio"):
+            return "Piaggio"
+        return feed[:12]
+    _flat = []
+    for feed, fields in OEM_FIELD_AUDIT.items():
+        fs = _shortfeed(feed)
+        for fld, what, use, dq in fields:
+            u = "✅ usable" if use.startswith("✅") else ("⚠️ weak" if use.startswith("⚠️") else "❌ not usable")
+            _flat.append({"Feed": fs, "Field": fld, "What it is": what, "Use for SoH / RUL": use, "Data quality": dq, "_u": u})
+    _fdf = pd.DataFrame(_flat); _order = list(dict.fromkeys(_fdf.Feed))
+    ufig = go.Figure()
+    for lab, clr in [("✅ usable", GREEN), ("⚠️ weak", AMBER), ("❌ not usable", RED)]:
+        ys = [int(((_fdf.Feed == f) & (_fdf._u == lab)).sum()) for f in _order]
+        ufig.add_bar(name=lab, x=_order, y=ys, marker_color=clr, text=[y or "" for y in ys], textposition="inside")
+    ufig.update_layout(barmode="stack", **lay(height=300, margin=dict(l=10, r=10, t=40, b=64),
+                       legend=dict(orientation="h", y=-0.26, x=0.5, xanchor="center", font=dict(size=10)),
+                       title=dict(text="Raw fields per feed, by usability", font=dict(size=13))))
+    ufig.update_yaxes(title_text="# raw fields", **AX); ufig.update_xaxes(**AX)
+    st.plotly_chart(ufig, use_container_width=True)
+    st.caption("Every raw field each feed sends, counted by whether we can use it (**✅ usable · ⚠️ weak/caveats · "
+               "❌ not usable**) — Euler & the intellicar feeds are field-rich; native Mahindra & Bajaj are leaner. "
+               "Per-field detail below (also `docs/oem_fields_one_pager.md`):")
+    _pick = st.selectbox("Filter by feed", ["All feeds"] + _order, key="fieldaudit")
+    _show = _fdf if _pick == "All feeds" else _fdf[_fdf.Feed == _pick]
+    st.dataframe(_show.drop(columns="_u").reset_index(drop=True), hide_index=True, use_container_width=True)
+    st.caption("**Native Mahindra proxy-SoH coverage (95 vehicles)** — *computable* but **none trustworthy**: "
+               "distanceToEmpty **84** (corr ≈ −0.20) · distance-per-SoC **25** (≈ +0.22) · charge-energy/`kwh` **8** "
+               "(≈ +0.32) → the native tier falls back to an **age prior**, not a proxy.")
     takeaway("ML needs **examples** — one per row. A model can only use clues its feed actually carries, so "
              "the three models necessarily lean on different features (Step 8 shows how differently).")
 
@@ -1253,11 +1284,17 @@ elif step == STEPS[3]:
         col.caption(f"reached {eol}%: {int((o.smin<=eol).sum())} · median history {int(o.months.median())} mo")
     if NATIVE_SOH is not None:
         col = cols[len(OEM_KEYS)]; o = ov(NATIVE_SOH); rise = int((o.s0 - o.s1 <= -2).sum())
+        _clean = 0                                        # how many are a CLEAN monotonic decline (no up-bump)?
+        for _v, _g in NATIVE_SOH.sort_values("month").groupby("vin"):
+            _s = _g["soh"].values
+            if len(_s) >= 6 and (_s[0] - _s[-1]) >= 2 and np.diff(_s).max() <= 1.0:
+                _clean += 1
         col.markdown(f"**Mahindra Native** · _distance-per-SoC (native-only)_ · {int((o.s0-o.s1>=2).sum())} 'degraders'")
         col.plotly_chart(_native_soh_fig(which="deg"), use_container_width=True)
-        col.caption(f"**Separate OEM — native feed only, never mixed with intellicar.** ⚠️ Noise, not aging: "
-                    f"**{rise}** vehicles' proxy went *up* ≥2pp (~coin-flip). No current → no true SoH. "
-                    f"{NATIVE_SOH.vin.nunique()} vins.")
+        col.caption(f"**Separate OEM — native feed only, never mixed with intellicar.** ⚠️ **Noise, not aging:** "
+                    f"**{rise}** vehicles' proxy went *up* ≥2pp (~coin-flip), and **{_clean} of {NATIVE_SOH.vin.nunique()}** "
+                    "is a clean monotonic decline (no up-bumps or cliffs) — every curve wobbles both ways. No current → "
+                    "no true SoH.")
     st.markdown("##### ⚪ Still near-new — flat (lost <2%)")
     cols2 = st.columns(_ncol)
     for col, oem in zip(cols2[:len(OEM_KEYS)], OEM_KEYS):

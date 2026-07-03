@@ -51,16 +51,18 @@ if str(SRC) not in sys.path:
 # ---------------------------------------------------------------------------
 # Per-OEM constants (LFP chemistry across the fleet).
 # ---------------------------------------------------------------------------
-OEMS = ["Euler", "Mahindra", "Bajaj"]
-OEM_KEY = {"Euler": "euler", "Mahindra": "mahindra", "Bajaj": "bajaj"}
-EOL = {"Euler": 80.0, "Mahindra": 80.0, "Bajaj": 70.0}
-RATED_KM = {"Euler": 120.0, "Mahindra": 80.0, "Bajaj": 178.0}
+OEMS = ["Euler", "Mahindra", "Bajaj", "Piaggio", "Mahindra Native"]
+OEM_KEY = {"Euler": "euler", "Mahindra": "mahindra", "Bajaj": "bajaj",
+           "Piaggio": "piaggio", "Mahindra Native": "mahindra_native"}
+EOL = {"Euler": 80.0, "Mahindra": 80.0, "Bajaj": 70.0, "Piaggio": 80.0, "Mahindra Native": 80.0}
+RATED_KM = {"Euler": 120.0, "Mahindra": 80.0, "Bajaj": 178.0, "Piaggio": 110.0, "Mahindra Native": 120.0}
 
-_FALLBACK_WARR = {"euler": (3, 80000), "mahindra": (3, 120000), "bajaj": (5, 120000)}
+_FALLBACK_WARR = {"euler": (3, 80000), "mahindra": (3, 120000), "bajaj": (5, 120000),
+                  "piaggio": (3, 100000), "mahindra_native": (3, 120000)}
 try:
     import config as _cfg  # noqa: E402
 
-    FLEET_WARRANTY = dict(getattr(_cfg, "FLEET_WARRANTY", _FALLBACK_WARR))
+    FLEET_WARRANTY = {**_FALLBACK_WARR, **dict(getattr(_cfg, "FLEET_WARRANTY", {}) or {})}
 except Exception:
     FLEET_WARRANTY = _FALLBACK_WARR
 
@@ -90,8 +92,42 @@ st.set_page_config(page_title="Battery Health", layout="wide", page_icon="🔋")
 # Data loading
 # ===========================================================================
 @st.cache_data(show_spinner=False)
+def _load_native() -> pd.DataFrame:
+    """Mahindra NATIVE fleet — no on-board SoH sensor. Build a per-vehicle ESTIMATED SoH series from the Bayesian
+    behaviour model's median (p50) curve (data/mahindra/native_behaviour_soh.parquet), truncated at each vehicle's
+    current age. No electrical/behaviour columns, so the SoC/temperature/habit sections auto-skip. soh = predicted p50."""
+    p = "data/mahindra/native_behaviour_soh.parquet"
+    if not os.path.exists(p):
+        return pd.DataFrame()
+    d = pd.read_parquet(p); d["vin"] = d["vin"].astype(str)
+    reg = {}
+    try:
+        r = pd.read_csv("Mh_Regd_Date.csv"); rv = next(c for c in r.columns if c.lower() == "vin")
+        r["rd"] = pd.to_datetime(r["vehicle_registration_date"], errors="coerce")
+        reg = dict(zip(r[rv].astype(str), r["rd"]))
+    except Exception:
+        pass
+    rows = []
+    for vin, g in d.groupby("vin"):
+        g = g.sort_values("age_months")
+        la = float(g["last_age"].iloc[0]) if pd.notna(g["last_age"].iloc[0]) else float(g["age_months"].max())
+        gg = g[g["age_months"] <= la + 0.1]
+        if len(gg) < 2:
+            gg = g.head(3)
+        rd = reg.get(vin)
+        for _, rr in gg.iterrows():
+            mo = (rd + pd.DateOffset(months=int(rr["age_months"]))) if (rd is not None and pd.notna(rd)) else pd.NaT
+            rows.append(dict(vin=vin, month=mo, soh=float(rr["soh_p50"]), age_months=float(rr["age_months"]),
+                             km_month=(float(rr["km_month"]) if pd.notna(rr["km_month"]) else np.nan),
+                             soh_p10=float(rr["soh_p10"]), soh_p90=float(rr["soh_p90"])))
+    return pd.DataFrame(rows).sort_values(["vin", "age_months"]).reset_index(drop=True)
+
+
+@st.cache_data(show_spinner=False)
 def load_oem(oem: str) -> pd.DataFrame:
     """Load + tidy one OEM's monthly battery data, gated for data-thin vehicles."""
+    if oem == "Mahindra Native":
+        return _load_native()
     key = OEM_KEY[oem]
     df = pd.read_parquet(f"data/redshift/{key}_featengg.parquet")
     df = df.rename(columns={"ymd": "month"})
@@ -179,6 +215,44 @@ def fleet_stat(oem: str, col: str):
         return None
     return dict(med=float(s.median()), lo=float(s.quantile(0.10)),
                 hi=float(s.quantile(0.90)), values=s.to_numpy())
+
+
+@st.cache_data(show_spinner=False)
+def _vin_model_map():
+    try:
+        r = pd.read_csv("Vin_Model_Details.csv"); r["vin"] = r["vin"].astype(str)
+        col = "model" if "model" in r.columns else ("name" if "name" in r.columns else None)
+        return dict(zip(r["vin"], r[col].fillna(""))) if col else {}
+    except Exception:
+        return {}
+
+
+@st.cache_data(show_spinner=False)
+def _spec_sheet():
+    try:
+        return pd.read_csv("OEM_Model_Specs.csv")
+    except Exception:
+        return pd.DataFrame()
+
+
+def vehicle_spec(oem: str, vin: str):
+    """Best-effort (model_name, spec_row|None) from Vin_Model_Details + OEM_Model_Specs (fuzzy model match)."""
+    model = (_vin_model_map().get(vin, "") or "").strip()
+    sp = _spec_sheet()
+    if sp.empty:
+        return model, None
+    base = "mahindra" if oem.startswith("Mahindra") else OEM_KEY.get(oem, oem.lower())
+    cand = sp[sp["oem"].astype(str).str.lower() == base]
+    if cand.empty:
+        return model, None
+    row = None
+    if model:
+        ml = model.lower()
+        for _, r in cand.iterrows():
+            k = str(r["model"]).lower()
+            if k and (k in ml or (k.split() and ml.startswith(k.split()[0]))):
+                row = r; break
+    return model, (row if row is not None else cand.iloc[0])
 
 
 # ===========================================================================
@@ -353,7 +427,7 @@ def project(age_months, soh, eol: float) -> dict | None:
 # so the customer forecast matches the pipeline. Falls back to the √t fit above
 # for vehicles with too little history for the model.
 # ---------------------------------------------------------------------------
-_MODEL_MODULE = {"Euler": "euler_model", "Mahindra": "model", "Bajaj": "bajaj_model"}
+_MODEL_MODULE = {"Euler": "euler_model", "Mahindra": "model", "Bajaj": "bajaj_model", "Piaggio": "model"}
 
 
 # Training populations compared in the Lifespan chart. safe = never observed at/below EoL.
@@ -385,6 +459,8 @@ def customer_forecaster(oem: str, pop: str = "all"):
 def model_project(oem: str, g, eol: float, horizon: int = 120, pop: str = "all") -> dict | None:
     """Forecast this vehicle with the pipeline model (trained on population `pop`), exposing the same
     interface as project(): fit(age)->SoH, months_to_eol, now_age, now_soh. Anchored at the present SoH."""
+    if oem not in _MODEL_MODULE:                                  # e.g. Mahindra Native -> no supervised model
+        return None
     gg = g.dropna(subset=["soh", "age_months"]).sort_values("month")
     if len(gg) < 4:
         return None
@@ -683,6 +759,9 @@ st.markdown(
 # ===========================================================================
 hcol1, hcol2 = st.columns([0.7, 0.3], gap="large")
 with hcol1:
+    _gif = REPO_ROOT / "turno.gif"
+    if _gif.exists():
+        st.image(str(_gif), width=132)
     st.markdown("<h1 style='margin-bottom:0;font-weight:800;letter-spacing:-0.02em;'>"
                 "🔋 Your Battery Health</h1>", unsafe_allow_html=True)
     st.markdown(f"<p style='color:{MUTE};margin-top:6px;font-size:1.02rem;'>A simple, friendly "
@@ -719,6 +798,13 @@ g = df[df["vin"] == vin].dropna(subset=["soh"]).sort_values("age_months")
 if g.empty:
     st.warning("This vehicle doesn't have any battery readings yet.")
     st.stop()
+
+if oem == "Mahindra Native":
+    st.warning("🔎 **Estimated health — no on-board sensor.** This vehicle streams charge, distance and time but "
+               "**no current or voltage**, so its battery health can't be measured directly. The figures below are a "
+               "**statistical estimate** from its **age and mileage** (our behaviour model, validated against "
+               "sensor-equipped Mahindras to ~1.5% error) — a guide with a wide margin, not a precise reading. "
+               "Sensor-based sections (charge habits, temperature) are unavailable.")
 
 eol, rated = EOL[oem], RATED_KM[oem]
 warr_years, warr_km = FLEET_WARRANTY[OEM_KEY[oem]]
@@ -805,6 +891,36 @@ stat_strip([
     ("Distance driven", f"{odo:,.0f} km" if odo and odo > 0 else "—"),
     ("Charge cycles", f"{cycles:,.0f}" if cycles and np.isfinite(cycles) and cycles > 0 else "—"),
 ])
+
+# --- Vehicle model + specifications ---
+_model, _spec = vehicle_spec(oem, vin)
+
+
+def _spv(colname, suffix=""):
+    if _spec is None:
+        return "—"
+    v = _spec.get(colname)
+    if v is None or (isinstance(v, str) and v.strip().lower() in ("", "unverified", "none (not disclosed)")):
+        return "—"
+    try:
+        return f"{float(v):g}{suffix}"
+    except Exception:
+        return str(v)
+
+
+_body = _spec.get("body_type") if _spec is not None else None
+section("VEHICLE", _model or f"{oem} electric three-wheeler",
+        sub=(str(_body) if (_body is not None and pd.notna(_body) and str(_body).lower() != "unverified") else None))
+_wy, _wk = FLEET_WARRANTY[OEM_KEY[oem]]
+stat_strip([
+    ("Battery pack", _spv("battery_capacity_kWh", " kWh")),
+    ("Chemistry", "LFP" if _spv("chemistry") == "—" else _spv("chemistry")),
+    ("Rated range", _spv("rated_range_km", " km")),
+    ("Battery warranty", _spv("battery_warranty_yr", " yr") if _spv("battery_warranty_yr") != "—"
+     else f"{_wy} yr / {_wk / 1000:.0f}k km"),
+])
+if _spec is None:
+    st.caption("Detailed spec sheet for this model isn't on file yet — showing the fleet defaults.")
 
 
 # ===========================================================================
@@ -984,14 +1100,10 @@ if soc_high is not None:
         ("Time at low charge", f"{fl * 100:.0f}%" if fl is not None else "—"),
     ])
     st.write("")
-    _bw = best_worst_soc(oem); _ov = []
-    if _bw:
-        _b = _bw["best"]; _w = _bw["worst"]
-        _ov = [(f"Healthiest · {_b[1]:.0f}% SoH", _b[2], _b[3], _b[4], BLUE),
-               (f"Most degraded · {_w[1]:.0f}% SoH", _w[2], _w[3], _w[4], RED)]
-    chart(soc_density_fig(sm, fl, soc_high, _ov), height=300, legend=bool(_ov))
-    st.caption("Approximate shape, from how much time you spend at low / typical / high charge. Dashed = the "
-               "fleet's **healthiest** and **most-degraded** vehicles (both real decliners with long history).")
+    chart(soc_density_fig(sm, fl, soc_high), height=300)
+    st.caption("Approximate shape of your charging habit — how much time your battery spends at low / typical / high "
+               "charge. **For LFP this barely affects health** (heat is the real driver — see Temperature); it's just "
+               "a picture of *how* you charge, not a health score.")
     why(
         "Your fleet runs <b>LFP (lithium iron phosphate)</b> batteries. Unlike the "
         "nickel-based cells in many cars, LFP is <b>very tolerant of sitting at a high "
