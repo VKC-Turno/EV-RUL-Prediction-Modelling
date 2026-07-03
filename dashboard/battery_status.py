@@ -781,23 +781,25 @@ st.markdown(
 # ===========================================================================
 # Header + picker
 # ===========================================================================
-hcol1, hcol2 = st.columns([0.7, 0.3], gap="large")
-with hcol1:
-    _gif = REPO_ROOT / "turno.gif"
+_gif = REPO_ROOT / "turno.gif"
+_hc1, _hc2 = st.columns([0.62, 0.38], gap="large")
+with _hc1:
     if _gif.exists():
-        st.image(str(_gif), width=132)
+        st.image(str(_gif), width=120)
     st.markdown("<h1 style='margin-bottom:0;font-weight:800;letter-spacing:-0.02em;'>"
                 "🔋 Your Battery Health</h1>", unsafe_allow_html=True)
-    st.markdown(f"<p style='color:{MUTE};margin-top:6px;font-size:1.02rem;'>A simple, friendly "
+    st.markdown(f"<p style='color:{MUTE};margin-top:4px;font-size:1.0rem;'>A simple, friendly "
                 f"check-up for your electric three-wheeler — by Turno.</p>", unsafe_allow_html=True)
-with hcol2:
+
+# One compact row: brand · VIN · specifications
+cb, cv, cs = st.columns([0.16, 0.34, 0.50], gap="medium")
+with cb:
     oem = st.selectbox("Vehicle brand", OEMS, index=0)
 
 idx = vehicle_index(oem)
 if idx.empty:
     st.error("No vehicle data available for this brand right now.")
     st.stop()
-
 demo_vins = idx.nlargest(8, "demo_score")["vin"].tolist()     # ⭐ = long history + visible decline
 ordered = idx["vin"].tolist()                                 # already sorted oldest-first
 
@@ -808,12 +810,10 @@ def _vin_label(v: str) -> str:
     if row.empty:
         return v + star
     r0 = row.iloc[0]
-    return (f"{v}  ·  {int(r0['n_months'])} mo · started {r0['soh_start']:.0f}% · "
-            f"{r0['status']} · {r0['flat']}{star}")
+    return f"{v} · {int(r0['n_months'])} mo · {r0['status']}{star}"
 
 
-vcol1, _ = st.columns([0.55, 0.45])
-with vcol1:
+with cv:
     vin = st.selectbox("Vehicle (VIN)", ordered, index=0, format_func=_vin_label,
                        help="⭐ = demo vehicles with long history and visible decline.")
 
@@ -822,6 +822,35 @@ g = df[df["vin"] == vin].dropna(subset=["soh"]).sort_values("age_months")
 if g.empty:
     st.warning("This vehicle doesn't have any battery readings yet.")
     st.stop()
+
+_model, _spec = vehicle_spec(oem, vin)
+
+
+def _spv(colname, suffix=""):
+    if _spec is None:
+        return None
+    v = _spec.get(colname)
+    if v is None or (isinstance(v, str) and v.strip().lower() in ("", "unverified", "none (not disclosed)")):
+        return None
+    try:
+        return f"{float(v):g}{suffix}"
+    except Exception:
+        return str(v)
+
+
+with cs:
+    _wy, _wk = FLEET_WARRANTY[OEM_KEY[oem]]
+    _body = (str(_spec.get("body_type")) if (_spec is not None and pd.notna(_spec.get("body_type"))
+             and str(_spec.get("body_type")).lower() != "unverified") else "")
+    _chips = [_model or f"{oem} 3-wheeler", _spv("battery_capacity_kWh", " kWh"),
+              ("LFP" if _spv("chemistry") is None else _spv("chemistry")),
+              _spv("rated_range_km", " km"), _spv("motor_power_kW", " kW"),
+              f"warranty {_wy}yr / {_wk / 1000:.0f}k km"]
+    _chip_html = " &nbsp;·&nbsp; ".join(f"<b style='color:{TEXT};'>{c}</b>" for c in _chips if c)
+    st.markdown(f"<div style='color:{FAINT};font-size:0.72rem;font-weight:600;text-transform:uppercase;"
+                f"letter-spacing:0.05em;'>Specifications{(' · ' + _body) if _body else ''}</div>"
+                f"<div style='color:{MUTE};font-size:0.95rem;line-height:1.75;margin-top:3px;'>{_chip_html}</div>",
+                unsafe_allow_html=True)
 
 if oem == "Mahindra Native":
     st.warning("🔎 **Estimated health — no on-board sensor.** This vehicle streams charge, distance and time but "
@@ -860,44 +889,12 @@ km_month = mean_val(g, "km_month")
 if (km_month is None or km_month <= 0) and odo and np.isfinite(age_now) and age_now > 0:
     km_month = odo / age_now
 
-_model, _spec = vehicle_spec(oem, vin)
-_driveeff = mean_val(g, "driveeff_mean")
+_driveeff = mean_val(g, "driveeff_mean")                                    # _model/_spec computed with the picker row
 range_now, range_basis = real_range(soh_now, _spec, rated, _driveeff)       # energy ÷ efficiency, not ARAI × SoH
 range_full, _ = real_range(100.0, _spec, rated, _driveeff)                  # full-health range → range-gauge scale
 status_label, status_color, _ = health_status(soh_now, eol)
 proj = (model_project(oem, g, eol)                             # the pipeline model (matches the internal dashboard)
         or project(g["age_months"].to_numpy(), g["soh"].to_numpy(), eol))   # √t fallback for thin history
-
-
-# ===========================================================================
-# 0) VEHICLE — model + specifications
-# ===========================================================================
-def _spv(colname, suffix=""):
-    if _spec is None:
-        return "—"
-    v = _spec.get(colname)
-    if v is None or (isinstance(v, str) and v.strip().lower() in ("", "unverified", "none (not disclosed)")):
-        return "—"
-    try:
-        return f"{float(v):g}{suffix}"
-    except Exception:
-        return str(v)
-
-
-_body = _spec.get("body_type") if _spec is not None else None
-section("VEHICLE", _model or f"{oem} electric three-wheeler",
-        sub=(str(_body) if (_body is not None and pd.notna(_body) and str(_body).lower() != "unverified") else None))
-_wy, _wk = FLEET_WARRANTY[OEM_KEY[oem]]
-stat_strip([
-    ("Battery pack", _spv("battery_capacity_kWh", " kWh")),
-    ("Chemistry", "LFP" if _spv("chemistry") == "—" else _spv("chemistry")),
-    ("Rated range", _spv("rated_range_km", " km")),
-    ("Motor power", _spv("motor_power_kW", " kW")),
-    ("Battery warranty", _spv("battery_warranty_yr", " yr") if _spv("battery_warranty_yr") != "—"
-     else f"{_wy} yr / {_wk / 1000:.0f}k km"),
-])
-if _spec is None:
-    st.caption("Detailed spec sheet for this model isn't on file yet — showing the fleet defaults.")
 
 
 # ===========================================================================
