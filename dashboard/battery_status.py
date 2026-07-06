@@ -279,6 +279,53 @@ def real_range(soh: float, spec, rated: float, driveeff):
     return (kwh * soh / 100.0) * 1000.0 / whkm, basis
 
 
+@st.cache_data(show_spinner="Loading raw charge/voltage telemetry…")
+def raw_trace(oem: str, vin: str):
+    """A vehicle's raw SoC / voltage / current over time from the local dense or intellicar feed (where downloaded),
+    resampled to 5-min. Euler/Mahindra/Piaggio carry pack voltage; Bajaj does not. Returns df[t,soc,voltage,current]
+    or None. Only a subset of vehicles have local raw telemetry."""
+    import glob
+    frames, cmap = [], None
+    try:
+        if oem == "Euler":
+            cmap = {"soc": "batterySoc", "voltage": "batteryVoltage", "current": "batteryCurrent"}
+            for f in glob.glob("data/euler/dense/*.parquet"):
+                d = pd.read_parquet(f); d = d[d["vin"].astype(str) == vin]
+                if len(d):
+                    frames.append(d)
+        elif oem == "Bajaj":
+            cmap = {"soc": "essBmsSocEstPercValue", "voltage": None, "current": None}
+            for f in glob.glob("data/bajaj/dense/*.parquet"):
+                d = pd.read_parquet(f); d = d[d["vin"].astype(str) == vin]
+                if len(d):
+                    frames.append(d)
+        elif oem in ("Mahindra", "Piaggio"):
+            import pyarrow.dataset as ds, pyarrow.compute as pc
+            path = "data/mahindra/intellicar" if oem == "Mahindra" else "data/piaggio/intellicar"
+            cmap = {"soc": "soc", "voltage": "batteryVoltage", "current": "current"}
+            if os.path.isdir(path):
+                tbl = ds.dataset(path, format="parquet").to_table(
+                    columns=["vin", "eventAt", "soc", "batteryVoltage", "current"], filter=pc.field("vin") == vin)
+                if tbl.num_rows:
+                    frames.append(tbl.to_pandas())
+    except Exception:
+        return None
+    if not frames:
+        return None
+    d = pd.concat(frames, ignore_index=True)
+    out = pd.DataFrame()
+    out["t"] = pd.to_datetime(pd.to_numeric(d["eventAt"], errors="coerce"), unit="ms")
+    out["soc"] = pd.to_numeric(d[cmap["soc"]], errors="coerce")
+    out["voltage"] = pd.to_numeric(d[cmap["voltage"]], errors="coerce") if cmap["voltage"] in d.columns else np.nan
+    out["current"] = pd.to_numeric(d[cmap["current"]], errors="coerce") if cmap["current"] in d.columns else np.nan
+    out = out[out["soc"].between(0, 100)].dropna(subset=["t"]).sort_values("t")
+    if out.empty:
+        return None
+    out = (out.set_index("t").resample("5min").agg({"soc": "last", "voltage": "mean", "current": "mean"})
+              .dropna(subset=["soc"]).reset_index())
+    return out
+
+
 # ===========================================================================
 # Personalisation — per-vehicle behaviour vs the fleet (age-matched, LFP-tuned)
 # ===========================================================================
@@ -810,7 +857,8 @@ def _vin_label(v: str) -> str:
     if row.empty:
         return v + star
     r0 = row.iloc[0]
-    return f"{v} · {int(r0['n_months'])} mo · {r0['status']}{star}"
+    trend = "➖ flat" if r0["flat"] == "flat" else "📉 degrading"
+    return f"{v} · {int(r0['n_months'])} mo · {r0['status']} · {trend}{star}"
 
 
 with cv:
@@ -901,27 +949,25 @@ proj = (model_project(oem, g, eol)                             # the pipeline mo
 # 1) HERO — Battery health gauge
 # ===========================================================================
 section("BATTERY HEALTH", "How your battery is doing")
-hero_l, hero_r = st.columns([0.52, 0.48], gap="large")
-with hero_l:
-    gc1, gc2 = st.columns(2, gap="small")
-    with gc1:
-        with st.container(border=True):
-            st.plotly_chart(gauge(soh_now, eol, status_color), use_container_width=True,
-                            config={"displayModeBar": False}, key="g_soh")
-            st.markdown(f"<div style='text-align:center;color:{MUTE};font-size:0.85rem;margin-top:-6px;'>"
-                        f"Battery health</div>", unsafe_allow_html=True)
-    with gc2:
-        with st.container(border=True):
-            st.plotly_chart(range_gauge(range_now, range_full, eol, status_color), use_container_width=True,
-                            config={"displayModeBar": False}, key="g_range")
-            st.markdown(f"<div style='text-align:center;color:{MUTE};font-size:0.85rem;margin-top:-6px;'>"
-                        f"Range now · {range_full:.0f} km at full health · "
-                        f"<span style='color:{FAINT};'>{range_basis}</span></div>", unsafe_allow_html=True)
-with hero_r:
+cH, cR, cS = st.columns([0.24, 0.24, 0.52], gap="medium")      # gauges + status card all in ONE row
+with cH:
+    with st.container(border=True):
+        st.plotly_chart(gauge(soh_now, eol, status_color), use_container_width=True,
+                        config={"displayModeBar": False}, key="g_soh")
+        st.markdown(f"<div style='text-align:center;color:{MUTE};font-size:0.85rem;margin-top:-6px;'>"
+                    f"Battery health</div>", unsafe_allow_html=True)
+with cR:
+    with st.container(border=True):
+        st.plotly_chart(range_gauge(range_now, range_full, eol, status_color), use_container_width=True,
+                        config={"displayModeBar": False}, key="g_range")
+        st.markdown(f"<div style='text-align:center;color:{MUTE};font-size:0.85rem;margin-top:-6px;'>"
+                    f"Range · {range_full:.0f} km at full · "
+                    f"<span style='color:{FAINT};'>{range_basis}</span></div>", unsafe_allow_html=True)
+with cS:
     with st.container(border=True):
         st.markdown(f"<span class='pill' style='background:{status_color}26;color:{status_color};'>"
                     f"● {status_label}</span>", unsafe_allow_html=True)
-        st.markdown(f"<div style='margin-top:14px;'>{big_number(f'{soh_now:.0f}', '%', status_color)}"
+        st.markdown(f"<div style='margin-top:12px;'>{big_number(f'{soh_now:.0f}', '%', status_color)}"
                     f"<span style='color:{MUTE};font-size:1.05rem;margin-left:6px;'>battery health</span></div>",
                     unsafe_allow_html=True)
         if proj and proj["months_to_eol"] is not None and soh_now > eol:
@@ -930,23 +976,24 @@ with hero_r:
             life = "this battery has reached its <b>end-of-life</b> health line"
         else:
             life = "holding steady — <b>no meaningful decline</b> detected yet"
-        st.markdown(f"<p style='color:{MUTE};font-size:1.12rem;margin-top:16px;line-height:1.6;'>"
+        st.markdown(f"<p style='color:{MUTE};font-size:1.05rem;margin-top:12px;line-height:1.5;'>"
                     f"Your {oem} battery is at {soh_now:.0f}% of its original capacity — {life}.</p>",
                     unsafe_allow_html=True)
+        # age · distance · cycles folded in as chips (was a separate second row of stat cards)
+        _age_s = fmt_age(age_now)
+        _dist_s = f"{odo:,.0f} km" if odo and odo > 0 else "—"
+        _cyc_s = f"{cycles:,.0f}" if cycles and np.isfinite(cycles) and cycles > 0 else "—"
+        st.markdown(
+            "<div style='margin-top:12px;display:flex;flex-wrap:wrap;gap:8px;'>"
+            + "".join(f"<span class='pill' style='background:{FAINT}1f;color:{TEXT};'>{lbl} <b>{val}</b></span>"
+                      for lbl, val in [("Age", _age_s), ("Driven", _dist_s), ("Charge cycles", _cyc_s)])
+            + "</div>", unsafe_allow_html=True)
         _prank, _pn = peer_soh_rank(behaviour_table(oem), age_now, soh_now)
         if _prank is not None:
             _pc = GREEN if _prank >= 50 else AMBER
-            st.markdown(f"<div style='margin-top:6px;'><span class='pill' style='background:{_pc}26;color:{_pc};'>"
+            st.markdown(f"<div style='margin-top:8px;'><span class='pill' style='background:{_pc}26;color:{_pc};'>"
                         f"🏅 Healthier than ~{_prank:.0f}% of similar-age {oem}s</span></div>",
                         unsafe_allow_html=True)
-
-st.write("")
-stat_strip([
-    ("Battery health", f"{soh_now:.0f}%", None, status_color),
-    ("Battery age", fmt_age(age_now)),
-    ("Distance driven", f"{odo:,.0f} km" if odo and odo > 0 else "—"),
-    ("Charge cycles", f"{cycles:,.0f}" if cycles and np.isfinite(cycles) and cycles > 0 else "—"),
-])
 
 
 # ===========================================================================
@@ -1052,6 +1099,97 @@ st.caption("Each dashed line is the *same* forecast model trained on a different
            "All · Degraders-only (lost ≥2%) · Safe (never reached end-of-life) · Safe-degraders (safe **and** "
            "declining). Where they diverge shows how much the training set shapes the prediction. The "
            "headline health & warranty figures above use the **All-vehicles** model.")
+
+
+# ===========================================================================
+# 6b) USAGE + CHARGE-CURVE EVOLUTION — odometer over time; SoC↔voltage aging
+# ===========================================================================
+section("USAGE", "Capacity, health and distance over the battery's life")
+
+# --- overlay: coulomb-counted capacity + SoH + odometer on a shared age axis ---------------
+age_yr = pd.to_numeric(g["age_months"], errors="coerce") / 12
+_soh_s = pd.to_numeric(g["soh"], errors="coerce")
+_cap_s = pd.to_numeric(g["capacity_ah"], errors="coerce") if "capacity_ah" in g.columns else pd.Series(index=g.index, dtype=float)
+_od_s = pd.to_numeric(g["odo_max"], errors="coerce") if "odo_max" in g.columns else pd.Series(index=g.index, dtype=float)
+_od_s = _od_s.where(_od_s < 3e5)                                  # drop odometer sentinels
+has_cap = _cap_s.notna().sum() >= 3
+has_od = _od_s.notna().sum() >= 2 and bool((_od_s.fillna(0) > 0).any())
+
+ov = go.Figure()
+ov.add_trace(go.Scatter(x=age_yr, y=_soh_s, name="SoH (%)", mode="lines+markers",
+                        line=dict(color=GREEN, width=2.6), marker=dict(size=5), yaxis="y"))
+if has_cap:
+    ov.add_trace(go.Scatter(x=age_yr, y=_cap_s, name="capacity (Ah)", mode="lines+markers",
+                            line=dict(color=AMBER, width=1.6), marker=dict(size=3), yaxis="y2"))
+if has_od:
+    ov.add_trace(go.Scatter(x=age_yr, y=_od_s, name="odometer (km)", mode="lines",
+                            line=dict(color=BLUE, width=1.8, dash="dot"), yaxis="y3"))
+
+n_right = int(has_cap) + int(has_od)
+dom_r = 0.82 if n_right == 2 else (0.90 if n_right == 1 else 1.0)
+lay = dict(height=390, paper_bgcolor=PANEL, plot_bgcolor=PANEL, font=dict(color=MUTE, size=12),
+           margin=dict(l=20, r=(98 if n_right == 2 else 60), t=28, b=44), hovermode="x unified",
+           hoverlabel=dict(bgcolor=PANEL2, font_color=TEXT, bordercolor=LINE),
+           legend=dict(orientation="h", x=0, y=1.07, yanchor="bottom", bgcolor="rgba(0,0,0,0)",
+                       font=dict(color=MUTE, size=11)),
+           xaxis=dict(title="battery age (years)", domain=[0.0, dom_r], gridcolor=LINE, color=MUTE, zeroline=False),
+           yaxis=dict(title="SoH (%)", color=GREEN, range=[max(eol - 12, 40), 102], gridcolor=LINE, zeroline=False))
+if has_cap:
+    lay["yaxis2"] = dict(title="capacity (Ah)", color=AMBER, overlaying="y", side="right",
+                         anchor="x", showgrid=False, zeroline=False)
+if has_od:
+    a3 = dict(title="odometer (km)", color=BLUE, overlaying="y", side="right", showgrid=False, zeroline=False)
+    if has_cap:
+        a3["anchor"] = "free"; a3["position"] = 0.93
+    else:
+        a3["anchor"] = "x"
+    lay["yaxis3"] = a3
+ov.update_layout(**lay)
+with st.container(border=True):
+    st.plotly_chart(ov, use_container_width=True, config={"displayModeBar": False})
+_cap_note = (" The **coulomb-counted capacity** (amber) bounces month-to-month — that scatter is measurement noise, "
+             "not real fade; the robust **SoH** envelope (green) stays smooth despite it." if has_cap else "")
+st.caption(f"**Health, measured capacity and distance on one age axis.**{_cap_note}"
+           + (" Blue (dotted) = odometer." if has_od else ""))
+
+# --- opt-in raw charge curve: SoC↔voltage coloured by charge # -----------------------------
+if st.checkbox("🔬 Also show the raw charge curve (SoC–voltage, coloured by charge #) — loads raw telemetry",
+               value=False, key="cc_toggle"):
+    tr = raw_trace(oem, vin)
+    if tr is None or tr.empty:
+        st.info("Raw SoC/voltage telemetry isn't downloaded for this vehicle (available for a subset of "
+                "Euler, Mahindra and Piaggio).")
+    else:
+        tr = tr.copy(); tr["dsoc"] = tr["soc"].diff().fillna(0.0)
+        _use_i = tr["current"].notna().sum() > 20
+        chg = (tr["current"] > 1.0) if _use_i else (tr["dsoc"] > 0.3)   # charging = current in, or SoC rising
+        start = chg & ~chg.shift(1, fill_value=False)
+        tr["event"] = start.cumsum()
+        ch = tr[chg & (tr["event"] > 0)]
+        n_ev = int(ch["event"].nunique()) if len(ch) else 0
+        if n_ev < 2:
+            st.info("Not enough distinct charging events in the downloaded window.")
+        else:
+            has_v = ch["voltage"].notna().sum() > 20 and ch["voltage"].between(20, 120).mean() > 0.4
+            if has_v:
+                ch = ch[ch["voltage"].between(20, 120)]                 # drop sensor-glitch V (0 / >1000)
+                chp = ch.iloc[:: max(1, len(ch) // 6000)]               # cap plotted points
+                fig = go.Figure(go.Scattergl(x=chp["soc"], y=chp["voltage"], mode="markers",
+                                marker=dict(size=4, color=chp["event"], colorscale="Viridis", opacity=0.55,
+                                            colorbar=dict(title="charge #", thickness=12))))
+                fig.update_layout(xaxis=dict(title="state of charge (%)", range=[0, 100]),
+                                  yaxis=dict(title="pack voltage (V)"))
+                _cc_cap = (f"SoC↔voltage across **{n_ev} charges** (dark = early → yellow = recent). As the pack "
+                           f"ages the curve shifts — a fingerprint of fade + rising internal resistance.")
+            else:
+                chp = ch.iloc[:: max(1, len(ch) // 6000)]               # cap plotted points
+                fig = go.Figure(go.Scattergl(x=chp["t"], y=chp["soc"], mode="markers",
+                                marker=dict(size=4, color=chp["event"], colorscale="Viridis", opacity=0.55,
+                                            colorbar=dict(title="charge #", thickness=12))))
+                fig.update_layout(xaxis=dict(title="time"), yaxis=dict(title="state of charge (%)", range=[0, 100]))
+                _cc_cap = (f"No pack voltage in this feed → **SoC over time** across **{n_ev} charges**.")
+            chart(fig, height=340)
+            st.caption(_cc_cap)
 
 
 # ===========================================================================
