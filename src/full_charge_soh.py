@@ -49,6 +49,9 @@ DCIR_DI_MIN = 30.0               # min current step |ΔI| (A) to read dV/dI
 DCIR_DT_MAX = 2.0                # ...across at most this many seconds
 DCIR_R_LO, DCIR_R_HI = 1.0, 50.0  # plausible pack resistance (mΩ)
 DCIR_BAND = (40.0, 70.0)         # SoC band the age-trend is measured in (control for SoC confound)
+# --- FULL-cycle definition by VOLTAGE endpoints (drift-free, unlike BMS SoC) ----------------
+V_START_MAX = 53.0               # a FULL cycle starts at/below this pack voltage (low SoC)
+V_END_MIN = 55.0                 # ...and ends at/above this (into the CV knee, near full)
 
 
 def _trapz(y, x):
@@ -106,12 +109,15 @@ def charge_events(df):
         secs = (g["t"] - g["t"].iloc[0]).dt.total_seconds().to_numpy()
         ah = abs(_trapz(g["current"].abs().to_numpy(), secs / 3600.0))
         cap = ah / (dsoc / 100.0)
+        gvv = g.loc[g["voltage"].between(V_LO, V_HI), "voltage"]         # valid pack voltage within the charge
+        v0 = float(gvv.iloc[:5].median()) if len(gvv) >= 3 else np.nan   # start voltage (low, plateau)
+        v1 = float(gvv.iloc[-5:].median()) if len(gvv) >= 3 else np.nan  # end voltage (high, CV knee)
         rows.append(dict(t0=g["t"].iloc[0], soc0=float(g["soc"].iloc[0]), soc1=float(g["soc"].iloc[-1]),
-                         dsoc=dsoc, ah=ah, cap=cap, n=int(len(g))))
+                         dsoc=dsoc, ah=ah, cap=cap, v0=v0, v1=v1, n=int(len(g))))
     e = pd.DataFrame(rows)
     if len(e):
         e = e[e["cap"].between(CAP_LO, CAP_HI)].reset_index(drop=True)
-        e["is_full"] = (e["dsoc"] >= FULL_DSOC) & (e["soc1"] >= FULL_END)
+        e["is_full"] = (e["v0"] <= V_START_MAX) & (e["v1"] >= V_END_MIN)   # FULL = deep by VOLTAGE endpoints
     return e
 
 
@@ -156,6 +162,7 @@ def _write_artifacts(ev_all, soh_all, dcir_all, summ, n_cohort, t_start, final=F
         dcir_slope_median_mohm_yr=round(float(dtr["dcir_slope"].median()), 2) if len(dtr) else None,
         dcir_frac_trending=round(float((dtr["dcir_r2"] > 0.3).mean()), 2) if len(dtr) else None,
         dcir_band=list(DCIR_BAND),
+        v_start_max=V_START_MAX, v_end_min=V_END_MIN,
         full_dsoc=FULL_DSOC, full_end=FULL_END, elapsed_s=round(time.time() - t_start, 0))
     json.dump(report, open(OUT_REP, "w"), indent=2)
     return report
@@ -229,7 +236,7 @@ def main(limit=None):
                 full["cap0"] = cap0
                 full["soh_full"] = np.clip(100.0 * full["cap"] / cap0, None, 100.0)
                 soh_all.append(full[["vin", "t0", "age_months", "cap", "cap0", "soh_full", "dsoc", "soc0", "soc1"]])
-            ev_all.append(e[["vin", "t0", "age_months", "soc0", "soc1", "dsoc", "ah", "cap", "is_full"]])
+            ev_all.append(e[["vin", "t0", "age_months", "soc0", "soc1", "dsoc", "ah", "cap", "v0", "v1", "is_full"]])
             fcv = _cv(full["cap"])
             summ.append(dict(vin=vin, n_events=int(len(e)), n_full=int(len(full)),
                              cap0=cap0, cv_full=fcv, cv_session=sess_cv.get(vin, np.nan),
