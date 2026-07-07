@@ -356,6 +356,47 @@ def smooth(s, win=5):
     return s.rolling(win, center=True, min_periods=1).mean() if SMOOTH else s
 
 
+FIT_OVERLAY = st.sidebar.checkbox("Anchored polynomial fit", value=True,
+                                  help="Overlay a smooth monotone-decreasing SoH curve anchored at 100% on each "
+                                       "vehicle's registration (age 0) — the clean degradation trend on top of the "
+                                       "faint measured line. Display only; the model still trains on raw monthly SoH.")
+
+
+def anchored_mono_fit(age_months, soh, anchor=100.0, deg=3):
+    """Smooth monotone-DECREASING polynomial forced through (age 0, `anchor`) — i.e. 100% at registration.
+    f(t) = anchor - Σ_{k>=1} a_k t^k with a_k >= 0 (t in YEARS), fit by non-negative least squares on
+    z = anchor - soh. Returns (gx_years, gy) or None. Same construction as the v2 full-charge experiment."""
+    a = np.asarray(age_months, float) / 12.0
+    s = np.asarray(soh, float)
+    m = np.isfinite(a) & np.isfinite(s); a, s = a[m], s[m]
+    if len(a) < 2 or a.max() <= 0:
+        return None
+    from scipy.optimize import lsq_linear
+    deg = int(min(deg, max(1, len(a))))
+    D = np.column_stack([a ** k for k in range(1, deg + 1)])
+    try:
+        c = lsq_linear(D, anchor - s, bounds=(np.zeros(deg), np.full(deg, np.inf))).x
+    except Exception:
+        return None
+    gx = np.linspace(0.0, float(a.max()), 60)
+    gy = anchor - sum(c[k - 1] * gx ** k for k in range(1, deg + 1))
+    return gx, gy                              # gx in YEARS, gy SoH %
+
+
+def add_soh_fit(fig, age_months, soh, color, width=2.0, opacity=0.95, name=None, **kw):
+    """Overlay the anchored monotone fit for one vehicle's SoH history (no-op if FIT_OVERLAY off or fit fails).
+    `kw` passes through to add_scatter (e.g. row/col for subplots). Returns True if a fit was drawn."""
+    if not FIT_OVERLAY:
+        return False
+    r = anchored_mono_fit(age_months, soh)
+    if r is None:
+        return False
+    gx, gy = r
+    fig.add_scatter(x=gx, y=gy, mode="lines", line=dict(color=color, width=width), opacity=opacity,
+                    name=name, showlegend=kw.pop("showlegend", False), **kw)
+    return True
+
+
 STEPS = ["📋 Overview", "1 · The problem", "2 · The data", "3 · The target (SoH)", "4 · Data quality",
          "5 · Features", "6 · Train / Validation / Test", "7 · Training the model",
          "8 · Which clues matter?", "9 · Errors & overfitting", "10 · A tougher test (LOVO)",
@@ -561,8 +602,10 @@ def _soh_fig(oem, h=300, which="all"):
             continue
         ax = ([0.0] if anch else []) + (g.age_months / 12).tolist()
         sy = ([100.0] if anch else []) + smooth(g.soh).tolist()
+        _dim = 0.15 if FIT_OVERLAY else 0.45                      # fade measured when the fit is overlaid
         fig.add_scatter(x=ax, y=sy, mode="lines", line=dict(color=RED if deg else GREY, width=1),
-                        opacity=0.45, showlegend=False)
+                        opacity=_dim, showlegend=False)
+        add_soh_fit(fig, g.age_months.to_numpy(), g.soh.to_numpy(), RED if deg else GREY, width=1.4, opacity=0.6)
     fig.add_hline(y=eol, line=dict(color=AMBER, dash="dash"))
     fig.update_xaxes(title="age (years)", dtick=1, **AX)
     fig.update_yaxes(range=[min(eol - 5, 55), 101], **AX)
@@ -640,8 +683,10 @@ def _forecast_fig(oem, h=330):
                         line=dict(color=GREY, width=1, dash="dot"), showlegend=False)
         fig.add_annotation(x=0, y=sm.iloc[0], text="reg", showarrow=False, xanchor="left",
                            yanchor="bottom", font=dict(color=GREY, size=9))
-    fig.add_scatter(x=g.age_months / 12, y=sm, mode="markers+lines", line=dict(color=TEAL, width=2),
-                    marker=dict(size=3), showlegend=False)
+    _hw = 1.0 if FIT_OVERLAY else 2.0                            # thin the measured line when the fit is overlaid
+    fig.add_scatter(x=g.age_months / 12, y=sm, mode="markers+lines", line=dict(color=TEAL, width=_hw),
+                    marker=dict(size=3), opacity=0.45 if FIT_OVERLAY else 1.0, showlegend=False)
+    add_soh_fit(fig, g.age_months.to_numpy(), g.soh.to_numpy(), TEAL, width=2.4)   # smooth measured-history trend
     fig.add_scatter(x=xc, y=c90, mode="lines", line=dict(width=0, color=GREY), showlegend=False)
     fig.add_scatter(x=xc, y=c10, mode="lines", fill="tonexty", fillcolor="rgba(46,193,107,.18)",
                     line=dict(width=0, color=GREY), showlegend=False)
@@ -911,7 +956,8 @@ def _testgrid_fig(oem, which="test"):
             sy = ([100.0] + sm.tolist()) if a100 else sm.tolist()
             ymin = min(ymin, min(sy), min(p["p50"]))
             fig.add_scatter(x=ax, y=sy, mode="lines", line=dict(color=color, width=0.8),
-                            opacity=0.4, row=r, col=c, showlegend=False)          # measured
+                            opacity=0.14 if FIT_OVERLAY else 0.4, row=r, col=c, showlegend=False)   # measured (faded)
+            add_soh_fit(fig, p["age"], p["soh"], color, width=1.3, opacity=0.6, row=r, col=c)        # smooth trend
             fig.add_scatter(x=fage, y=p["p50"], mode="lines", line=dict(color=color, width=0.8, dash="dot"),
                             opacity=0.35, row=r, col=c, showlegend=False)          # forecast P50
             wx.append(p["warr_age"] / 12.0); wy.append(_fc_at_warranty(p, "p50"))  # this vehicle's warranty end
@@ -976,9 +1022,12 @@ def _feature_grid_fig(oem):
     for i, name in enumerate(panels):
         r, c = i // ncols + 1, i % ncols + 1
         y = smooth(g["soh"]) if name == "soh" else g[name]
+        _issoh = name == "soh"
         fig.add_scatter(x=ageyr, y=y, mode="lines",
-                        line=dict(color=TEAL if name == "soh" else GREY, width=1.6),
-                        row=r, col=c, showlegend=False)
+                        line=dict(color=TEAL if _issoh else GREY, width=1.6),
+                        opacity=0.4 if (_issoh and FIT_OVERLAY) else 1.0, row=r, col=c, showlegend=False)
+        if _issoh:
+            add_soh_fit(fig, g["age_months"].to_numpy(), g["soh"].to_numpy(), TEAL, width=2.0, row=r, col=c)
     fig.update_xaxes(dtick=1, **AX); fig.update_yaxes(**AX)
     for cc in range(1, ncols + 1):
         fig.update_xaxes(title_text="age (yr)", row=nrows, col=cc)
@@ -1414,7 +1463,9 @@ elif step == STEPS[6]:
                 ax = ([0.0] if a100 else []) + (gg.age_months / 12).tolist()
                 sy = ([100.0] if a100 else []) + smooth(gg.soh).tolist()
                 fig.add_scatter(x=ax, y=sy, mode="lines", line=dict(color=colmap[key], width=1),
-                                opacity=0.5, row=ri, col=ci, showlegend=False)
+                                opacity=0.15 if FIT_OVERLAY else 0.5, row=ri, col=ci, showlegend=False)
+                add_soh_fit(fig, gg.age_months.to_numpy(), gg.soh.to_numpy(), colmap[key],
+                            width=1.2, opacity=0.55, row=ri, col=ci)
             fig.add_hline(y=EOL_PCT[oem], line=dict(color=AMBER, width=1, dash="dot"), row=ri, col=ci)
     fig.update_yaxes(range=[55, 101], **AX); fig.update_xaxes(dtick=1, **AX)
     for ci in range(1, len(OEM_KEYS) + 1):
@@ -1505,7 +1556,9 @@ elif step == STEPS[6]:
                 sy = ([100.0] if a100 else []) + gg.soh.tolist()
                 cmin = min(cmin, min(sy))
                 cfig.add_scatter(x=ax, y=sy, mode="lines", line=dict(color=color, width=1.0),
-                                 opacity=0.5, row=1, col=ci, showlegend=False)
+                                 opacity=0.16 if FIT_OVERLAY else 0.5, row=1, col=ci, showlegend=False)
+                add_soh_fit(cfig, gg.age_months.to_numpy(), gg.soh.to_numpy(), color, width=1.3,
+                            opacity=0.6, row=1, col=ci)
                 proj, smn = bk.loc[v, "proj"], bk.loc[v, "sm_now"]   # √t projection from smoothed-now, FORWARD only
                 if pd.notna(proj) and warr / 12 > ax[-1] + 1e-9:     # skip vehicles already past warranty age
                     cmin = min(cmin, float(proj))
@@ -1987,7 +2040,9 @@ elif step == STEPS[14]:
                         sm = smooth(pd.Series(d["soh"]))
                         ax = ([0.0] + age.tolist()) if a100 else age.tolist()
                         sy = ([100.0] + sm.tolist()) if a100 else sm.tolist()
-                        vfig.add_scatter(x=ax, y=sy, mode="lines", line=dict(color=TEAL, width=1.6), row=r, col=c, showlegend=False)
+                        vfig.add_scatter(x=ax, y=sy, mode="lines", line=dict(color=TEAL, width=1.6),
+                                         opacity=0.4 if FIT_OVERLAY else 1.0, row=r, col=c, showlegend=False)
+                        add_soh_fit(vfig, np.asarray(d["age"]), np.asarray(d["soh"]), TEAL, width=2.0, opacity=0.9, row=r, col=c)
                         vfig.add_scatter(x=fage, y=d["p50"], mode="lines", line=dict(color=clr, width=1.6, dash="dash"), row=r, col=c, showlegend=False)
                         vfig.add_vline(x=d["cut_age"] / 12.0, line=dict(color="#7f8ea3", width=1, dash="dot"), row=r, col=c)
                         vfig.add_hline(y=eol, line=dict(color=AMBER, width=1, dash="dot"), row=r, col=c)
