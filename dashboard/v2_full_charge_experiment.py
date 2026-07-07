@@ -186,25 +186,64 @@ def mono_decreasing_fit(x, y, deg=3):
     return gx, gy, c
 
 
-def fit_with_greying(age, soh, flat_thr=1.5):
-    """Ceiling-clip + MAD-residual outlier greying, then a monotone-decreasing fit — the §② treatment,
-    reusable. Returns dict(a, s, inl, gx, gy, drop) on the sorted finite points, or None."""
+def anchored_mono_fit(age_months, soh, anchor=100.0, deg=3):
+    """Monotone-decreasing polynomial constrained to pass EXACTLY through (age 0, `anchor`) — i.e. 100% at
+    registration. f(t) = anchor - Σ_{k>=1} a_k t^k with a_k >= 0 (t in YEARS from registration), fit to the
+    (BMS full-capacity) points by non-negative least squares on z = anchor - soh. Returns (gx_years, gy) or None."""
+    a = np.asarray(age_months, float) / 12.0
+    s = np.asarray(soh, float)
+    m = np.isfinite(a) & np.isfinite(s); a, s = a[m], s[m]
+    if len(a) < 2 or a.max() <= 0:
+        return None
+    from scipy.optimize import lsq_linear                       # local import (mono_decreasing_fit does the same)
+    deg = int(min(deg, max(1, len(a))))
+    D = np.column_stack([a ** k for k in range(1, deg + 1)])
+    try:
+        c = lsq_linear(D, anchor - s, bounds=(np.zeros(deg), np.full(deg, np.inf))).x   # a_k >= 0
+    except Exception:
+        return None
+    gx = np.linspace(0.0, float(a.max()), 60)
+    gy = anchor - sum(c[k - 1] * gx ** k for k in range(1, deg + 1))
+    return gx, gy
+
+
+def fit_with_greying(age, soh, flat_thr=1.5, max_rate=10.0, ceiling_exclude=True):
+    """Outlier greying + a monotone-decreasing fit. `max_rate` (pp/yr) greys points implying a faster-than-physical
+    fade from a 100% BOL (BMS re-estimation errors). `age` in MONTHS. Returns dict(...) or None.
+
+    `ceiling_exclude=True` (Mahindra): 100% is a clip artifact of noisy coulomb capacity → grey those points (keep
+    the first as anchor), then an asymmetric MAD test on the rest.
+    `ceiling_exclude=False` (Euler): 100% is a GENUINE reading. Use a RECOVERY-AWARE rule from monotonicity — grey a
+    reading only if a *sustained* later-higher level exists (capacity can't recover, so it was a transient BMS
+    under-estimate). This flattens recovering noise episodes yet KEEPS genuine sustained declines (0% greyed)."""
     a = np.asarray(age, float); s = np.asarray(soh, float)
     m = np.isfinite(a) & np.isfinite(s); a, s = a[m], s[m]
     o = np.argsort(a); a, s = a[o], s[o]
     if len(a) < 3:
         return None
-    excl = s >= 99.95
-    if excl.any():
-        excl[int(np.where(excl)[0][0])] = False                 # keep the first ceiling point as the anchor
-    idx = np.where(~excl)[0]
-    if len(idx) >= 4:
-        x, y = a[idx], s[idx]
-        sls = [(y[j] - y[i]) / (x[j] - x[i]) for i in range(len(x)) for j in range(i + 1, len(x)) if x[j] != x[i]]
-        sl = float(np.median(sls)) if sls else 0.0
-        resid = y - (sl * x + np.median(y - sl * x)); rmad = float(np.median(np.abs(resid - np.median(resid))))
-        bad = np.abs(resid - np.median(resid)) > max(3.5 * 1.4826 * rmad, 3.0)
-        excl[idx[bad]] = True
+    if ceiling_exclude:
+        excl = s >= 99.95
+        if excl.any():
+            excl[int(np.where(excl)[0][0])] = False             # keep the first ceiling point as the anchor
+        if max_rate is not None:
+            excl = excl | ((100.0 - s) / np.maximum(a / 12.0, 0.25) > max_rate)
+        idx = np.where(~excl)[0]
+        if len(idx) >= 4:
+            x, y = a[idx], s[idx]
+            sls = [(y[j] - y[i]) / (x[j] - x[i]) for i in range(len(x)) for j in range(i + 1, len(x)) if x[j] != x[i]]
+            sl = float(np.median(sls)) if sls else 0.0
+            resid = y - (sl * x + np.median(y - sl * x)); rmad = float(np.median(np.abs(resid - np.median(resid))))
+            excl[idx[np.abs(resid - np.median(resid)) > max(3.5 * 1.4826 * rmad, 3.0)]] = True
+    else:
+        # RECOVERY-AWARE (uses monotonicity): capacity physically can't recover, so grey s_i only if a SUSTAINED
+        # later-higher level exists (median of readings after i is > s_i + margin) — that proves s_i was a transient
+        # BMS under-estimate. A genuine sustained late decline has no higher future, so it's KEPT (not flattened).
+        n = len(s); excl = np.zeros(n, dtype=bool); MARGIN = 3.5
+        for i in range(n - 2):
+            if np.median(s[i + 1:]) > s[i] + MARGIN:
+                excl[i] = True
+        if max_rate is not None:                               # + early-crash gate (>max_rate pp/yr from 100% BOL)
+            excl = excl | ((100.0 - s) / np.maximum(a / 12.0, 0.25) > max_rate)
     inl = ~excl
     gx = gy = None; drop = np.nan
     if inl.sum() >= 3:
@@ -231,7 +270,7 @@ def render_euler():
     comp, fits = [], {}
     for vin, g in M.groupby("vin"):
         g = g.sort_values("age_months")
-        f = fit_with_greying(g["age_months"].values, g["soh_full"].values)
+        f = fit_with_greying(g["age_months"].values, g["soh_full"].values, ceiling_exclude=False)
         if f is None or f["gx"] is None:
             continue
         fits[vin] = (g, f)
@@ -263,9 +302,14 @@ def render_euler():
     st.subheader("② Vehicle explorer — the fix on one battery")
     order = (C.assign(g=(C["drop_prod"] - C["drop_new"]).abs()).sort_values("g", ascending=False)
              if len(C) else pd.DataFrame({"vin": list(fits)}))
-    vin = st.selectbox("Euler vehicle", order["vin"].tolist(),
-                       format_func=lambda v: (f"{v} · prod {order.loc[order.vin==v,'drop_prod'].iloc[0]:.1f}pp · "
-                                              f"fit {order.loc[order.vin==v,'drop_new'].iloc[0]:.1f}pp") if "drop_prod" in order else v)
+    def _elabel(v):
+        row = order[order["vin"] == v]
+        if "drop_prod" in order.columns and len(row):
+            return f"{v} · prod {row['drop_prod'].iloc[0]:.1f}pp · fit {row['drop_new'].iloc[0]:.1f}pp"
+        return str(v)
+    vin = st.selectbox("Euler vehicle", order["vin"].tolist(), format_func=_elabel)
+    if vin not in fits:
+        st.info("Select a vehicle."); return
     g, f = fits[vin]
     fig = go.Figure()
     fig.add_trace(go.Scatter(x=g["age_months"] / 12, y=pd.to_numeric(g["soh_prod"], errors="coerce"),
@@ -275,17 +319,44 @@ def render_euler():
     fig.add_trace(go.Scatter(x=a[inl] / 12, y=s[inl], mode="markers", name="BMS full-capacity SoH",
                              marker=dict(size=8, color=GREEN)))
     if (~inl).any():
-        fig.add_trace(go.Scatter(x=a[~inl] / 12, y=s[~inl], mode="markers", name="excluded (cliff/outlier)",
+        fig.add_trace(go.Scatter(x=a[~inl] / 12, y=s[~inl], mode="markers", name="excluded (transient dip — recovers later)",
                                  marker=dict(size=8, color="#4a5160", symbol="x", opacity=0.85)))
     if f["gx"] is not None:
         _yrs = (f["gx"][-1] - f["gx"][0]) / 12.0; _rate = (f["gy"][0] - f["gy"][-1]) / _yrs if _yrs > 0 else 0.0
-        fig.add_trace(go.Scatter(x=f["gx"] / 12, y=f["gy"], mode="lines", name=f"monotone fit (−{_rate:.1f} pp/yr)",
-                                 line=dict(color=GREEN, width=2.4, dash="dash")))
-    fig.update_layout(xaxis_title="battery age (years)", yaxis=dict(title="SoH (%)"))
+        fig.add_trace(go.Scatter(x=f["gx"] / 12, y=f["gy"], mode="lines", name=f"free fit · first-seen (−{_rate:.1f} pp/yr)",
+                                 line=dict(color=GREEN, width=1.8, dash="dash")))
+    _af = anchored_mono_fit(a[inl], s[inl], anchor=100.0)      # anchored to 100% at registration (age 0)
+    if _af is not None:
+        _agx, _agy = _af
+        _arate = (100.0 - _agy[-1]) / _agx[-1] if _agx[-1] > 0 else 0.0
+        fig.add_trace(go.Scatter(x=_agx, y=_agy, mode="lines+markers", name=f"⭐ anchored fit · 100% @ reg (−{_arate:.1f} pp/yr)",
+                                 line=dict(color="#ffffff", width=1.8), marker=dict(size=3, color="#ffffff")))
+    if "soh_reported" in g.columns and pd.to_numeric(g["soh_reported"], errors="coerce").notna().any():
+        fig.add_trace(go.Scatter(x=g["age_months"] / 12, y=pd.to_numeric(g["soh_reported"], errors="coerce"),
+                                 mode="lines+markers", name="BMS reported SoH (batterySoh)",
+                                 line=dict(color="#c792ff", width=1.8, dash="dot"), marker=dict(size=3)))
+    # registration (age 0) + warranty reference lines
+    _reg = pd.to_datetime(g["month"].iloc[0]) - pd.DateOffset(months=int(round(float(g["age_months"].iloc[0]))))
+    _warr_yr = 3.0                                            # Euler warranty term (config: 3 yr / 80k km)
+    _amax = float(pd.to_numeric(g["age_months"], errors="coerce").max()) / 12.0
+    fig.add_vline(x=0.0, line=dict(color=BLUE, width=1.4, dash="dot"),
+                  annotation_text=f"Registered {_reg:%b '%y}", annotation_position="bottom right",
+                  annotation_font=dict(color=BLUE, size=11))
+    fig.add_vline(x=_warr_yr, line=dict(color=AMBER, width=1.6, dash="dash"),
+                  annotation_text=f"Warranty ({_warr_yr:.0f} yr)", annotation_position="top left",
+                  annotation_font=dict(color=AMBER, size=11))
+    fig.update_layout(xaxis=dict(title="battery age (years)", range=[-0.05, max(_warr_yr + 0.2, _amax + 0.1)]),
+                      yaxis=dict(title="SoH (%)"))
     card(fig, 380, legend=True)
-    st.caption("Grey = Euler's production envelope (prone to cliffs + stuck floors). Green = the BMS full-capacity "
-               "reading with cliff/outlier points greyed and a monotone-decreasing fit — a cleaner, artifact-free "
-               "SoH from the *same* underlying signal. Same fix, different signal source than Mahindra.")
+    st.caption("Grey = Euler's production envelope (prone to cliffs + stuck floors). Green dots = BMS full-capacity "
+               "readings, with two monotone fits: **solid WHITE ⭐ = anchored to 100% on the registration line (true-BOL "
+               "reference), dashed green = free fit from first-seen data**; **grey ✕ = points greyed as cliffs/outliers OR physically "
+               "implausible** (implying > 10 pp/yr fade from a 100% BOL — LFP can't lose that fast, so they're BMS "
+               "re-estimation errors, not real capacity). **Blue dotted = registration (age 0)** — the gap before the "
+               "first point is unobserved early life (telemetry started late), so ~100% is anchored to *first-seen* "
+               f"capacity, not true beginning-of-life. **Amber dashed = {_warr_yr:.0f}-yr warranty.** **Violet dotted "
+               "= the BMS's own *reported* SoH (`batterySoh`)** — a third, independent signal (Euler's production "
+               "ignores it as noisy; shown here for comparison).")
 
 
 # ============================================================================================
