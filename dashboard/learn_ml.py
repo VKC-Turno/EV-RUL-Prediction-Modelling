@@ -45,7 +45,7 @@ OEMS = {
                     "(in amp-hours). We divide that by its original capacity to get SoH %.",
         model_desc="**gradient-boosted decision trees** (XGBoost for monthly loss, plus a LightGBM "
                    "'trajectory' model that adds uncertainty bands)",
-        lovo=dict(overall=3.50, model=5.03, persist=5.77, trend=5.63, band=0.80),
+        lovo=dict(overall=3.23, model=4.54, persist=5.17, trend=4.85, band=0.80),   # euler_20260707 (soh_hybrid)
         label="Euler electric-3-wheelers"),
     "Mahindra": dict(
         ft="data/mahindra/features/feature_table.parquet", module="model",
@@ -1943,6 +1943,15 @@ elif step == STEPS[13]:
         import json
         st.markdown("#### Euler model registry — every retrain is tracked")
         st.dataframe(pd.DataFrame(json.load(open(reg))), use_container_width=True)
+        st.markdown(
+            "**The newest Euler retrain (`soh_hybrid`) is why a retrain needs a *safety gate*, not just a lower error.** "
+            "We first tried a fully **cleaned** SoH target (noisy dips smoothed away) — it scored ~30% better *on its own "
+            "yardstick*. But measured against an **independent physical signal** — coulomb-counting the current during full "
+            "charges — that cleaned target was quietly **too optimistic on the batteries that are genuinely declining**, "
+            "exactly the ones a warranty call depends on. So the deployed target is a **hybrid**: the cleaned SoH for "
+            "healthy batteries, but the original measured SoH for **confirmed decliners** (flagged by that independent "
+            "coulomb signal). Every target change now must clear an **acceptance gate** (`euler_accept_gate.py`) that blocks "
+            "any retrain which regresses on declining batteries — never trusting a target that merely looks smoother.")
     takeaway("That's the full pipeline across three fleets: problem → data → target → features → split → "
              "train → inspect → validate → forecast → retrain — raw telemetry to a warranty-risk call, "
              "end to end.")
