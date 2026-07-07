@@ -18,5 +18,16 @@
     "degrading_rmse": 5.027,
     "flat_rmse": 1.797,
     "band_coverage": 0.8
+  },
+  {
+    "version": "euler_20260707",
+    "trained_at": "2026-07-07T13:48:13",
+    "target": "soh_hybrid",
+    "n_vehicles": 120,
+    "n_degraders": 74,
+    "overall_rmse": 3.232,
+    "degrading_rmse": 4.544,
+    "flat_rmse": 1.646,
+    "band_coverage": 0.8
   }
 ]

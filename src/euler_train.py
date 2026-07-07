@@ -37,23 +37,25 @@ REGISTRY = MDIR / "registry.json"
 DIAG = MDIR / "diagnostics.json"
 
 
-def apply_label(m, path=BMS_SOH):
-    """Swap the training target `soh` for the recovery-aware clean `soh_label` (monotone, <=100, artifact-free;
-    see src/euler_bms_soh.py). Joins on (vin, month), KEEPS only months that carry a finite label (unanchored /
-    sparse-near-full months have none), and overwrites `soh`. Returns (m_labeled, coverage_dict). The rest of the
-    pipeline is untouched — same features, same model — so this is a pure target swap."""
-    lab = pd.read_parquet(path)[["vin", "month", "soh_label"]].copy()
+def apply_label(m, path=BMS_SOH, col="soh_target"):
+    """Swap the training target `soh` for the deployable HYBRID target `soh_target` (src/euler_bms_soh.py):
+    recovery-aware clean `soh_label` for flat/healthy vehicles, but the incumbent production SoH for CONFIRMED
+    DECLINERS (where the clean label is provably too optimistic against the independent coulomb yardstick — see the
+    coulomb acceptance gate / euler_accept_gate.py). Pass col="soh_label" to train on the pure clean label instead.
+    Joins on (vin, month), KEEPS only months carrying a finite target, overwrites `soh`. Pure target swap — same
+    features, same model. Returns (m_swapped, coverage_dict)."""
+    lab = pd.read_parquet(path)[["vin", "month", col]].copy()
     lab["vin"] = lab["vin"].astype(str); lab["month"] = pd.to_datetime(lab["month"])
     m = m.copy(); m["vin"] = m["vin"].astype(str); m["month"] = pd.to_datetime(m["month"])
     before_rows, before_veh = len(m), m["vin"].nunique()
     m = m.merge(lab, on=["vin", "month"], how="left")
-    m = m[m["soh_label"].notna()].copy()
-    m["soh"] = m["soh_label"].to_numpy()
-    m = m.drop(columns=["soh_label"])
-    # a vehicle needs enough labeled months to build transitions/trajectories
+    m = m[m[col].notna()].copy()
+    m["soh"] = m[col].to_numpy()
+    m = m.drop(columns=[col])
+    # a vehicle needs enough target months to build transitions/trajectories
     keep = m.groupby("vin")["month"].transform("size") >= 3
     m = m[keep].copy()
-    cov = dict(target="soh_label", rows=len(m), rows_before=before_rows,
+    cov = dict(target=col, rows=len(m), rows_before=before_rows,
                vehicles=int(m["vin"].nunique()), vehicles_before=int(before_veh))
     return m, cov
 
@@ -119,10 +121,10 @@ def main(fast=False, label=False):
         print(f"  data-quality gate: dropped {before - m['vin'].nunique()} thin vehicle(s)")
     target = "soh_production"
     if label:
-        m, cov = apply_label(m); target = "soh_label"
+        m, cov = apply_label(m); target = "soh_hybrid"      # clean label on flats, production on confirmed decliners
         m = m.sort_values(["vin", "month"])
-        print(f"  target = soh_label (recovery-aware clean): {cov['vehicles']}/{cov['vehicles_before']} vehicles, "
-              f"{cov['rows']}/{cov['rows_before']} vin-months carry a label")
+        print(f"  target = soh_hybrid (clean label on flats, production on confirmed decliners): "
+              f"{cov['vehicles']}/{cov['vehicles_before']} vehicles, {cov['rows']}/{cov['rows_before']} vin-months")
     g = m.groupby("vin")
     n_veh = int(m["vin"].nunique())
     n_deg = int((g["soh"].first() - g["soh"].last() >= 2).sum())

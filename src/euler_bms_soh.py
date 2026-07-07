@@ -15,11 +15,14 @@ Run: .venv/bin/python src/euler_bms_soh.py
 import os, json, glob
 from pathlib import Path
 import numpy as np, pandas as pd
+from scipy.stats import theilslopes
 
 os.chdir(Path(__file__).resolve().parent.parent)
 DENSE = "data/euler/dense/*.parquet"
 FEAT = "data/euler/features/feature_table.parquet"
+FULL_CHARGE = "data/euler/full_charge_soh.parquet"   # INDEPENDENT coulomb full-charge SoH (src/euler_full_charge_soh.py)
 OUT, OUT_SUM, OUT_REP = "data/euler/bms_soh.parquet", "data/euler/bms_soh_summary.parquet", "data/euler/bms_soh_report.json"
+DECL_PPY = 3.0                        # a vehicle is a "confirmed decliner" at >= this fade rate (pp/year)
 SOC_LO, SOC_HI = 95.0, 100.0
 RC_LO, RC_HI = 1.0, 500.0
 MIN_MON_N = 20                        # a month needs >= this many near-full readings
@@ -64,6 +67,51 @@ def clean_label(age_m, soh):
     is_inlier[idx[inl]] = True
     soh_label[idx] = np.clip(iso.predict(af), None, 100.0)
     return is_inlier, soh_label
+
+
+def _slope_ppy(age, y, minn=4, minspan=4.0):
+    """Robust decline rate (pp/YEAR, positive = losing SoH) via Theil-Sen; NaN if coverage is too thin."""
+    a = np.asarray(age, float); v = np.asarray(y, float)
+    m = np.isfinite(a) & np.isfinite(v); a, v = a[m], v[m]
+    if len(a) < minn or (a.max() - a.min()) < minspan:
+        return np.nan
+    return float(-theilslopes(v, a)[0] * 12.0)
+
+
+def hybrid_target(M, full_charge_path=FULL_CHARGE):
+    """The DEPLOYABLE target: soh_label for flat/healthy vehicles (where it robustly beats production), but the
+    incumbent production SoH (soh_prod) for CONFIRMED DECLINERS, where the clean label is provably too optimistic
+    against the independent coulomb yardstick (see euler_soh_label_retrain-gated finding).
+
+    A vehicle is a confirmed decliner if the PHYSICALLY INDEPENDENT coulomb full-charge SoH fades >= DECL_PPY pp/yr
+    (arbiter of first resort), OR — where coulomb coverage is thin — both dense BMS signals (remaining-capacity SoH
+    and BMS-native batterySoh) AGREE on >= DECL_PPY (agreement rules out either being an isolated artifact).
+
+    Adds per-vehicle columns to M: soh_target (the target), confirmed_decliner; and returns a per-vin flag frame."""
+    coul = {}
+    if Path(full_charge_path).exists():
+        C = pd.read_parquet(full_charge_path)[["vin", "age_months", "soh_full"]].copy()
+        C["vin"] = C["vin"].astype(str)
+        C["c"] = np.clip(pd.to_numeric(C["soh_full"], errors="coerce"), None, 100.0)
+        for v, c in C.dropna(subset=["age_months", "c"]).groupby("vin"):
+            coul[v] = _slope_ppy(c["age_months"], c["c"])
+    flags = []
+    for vin, g in M.groupby("vin"):
+        g = g.sort_values("age_months")
+        r_rem = _slope_ppy(g["age_months"], g["soh_full"])                       # remaining-capacity SoH slope
+        r_nat = _slope_ppy(g["age_months"], pd.to_numeric(g["soh_reported"], errors="coerce"))  # batterySoh slope
+        r_cou = coul.get(vin, np.nan)
+        decliner = bool((np.isfinite(r_cou) and r_cou >= DECL_PPY) or
+                        (np.isfinite(r_rem) and np.isfinite(r_nat) and r_rem >= DECL_PPY and r_nat >= DECL_PPY))
+        flags.append(dict(vin=vin, coul_ppy=r_cou, remcap_ppy=r_rem, native_ppy=r_nat, confirmed_decliner=decliner))
+    F = pd.DataFrame(flags)
+    M = M.merge(F[["vin", "confirmed_decliner"]], on="vin", how="left")
+    # target: production for decliners (fall back to label if production missing), clean label otherwise; <=100
+    prod = pd.to_numeric(M["soh_prod"], errors="coerce")
+    tgt = np.where(M["confirmed_decliner"].fillna(False), prod.where(prod.notna(), M["soh_label"]), M["soh_label"])
+    M["soh_target"] = np.clip(pd.to_numeric(pd.Series(tgt, index=M.index), errors="coerce"), None, 100.0)
+    M.loc[M["soh_label"].isna(), "soh_target"] = np.nan                          # only trainable where label exists
+    return M, F
 
 
 def main():
@@ -114,11 +162,15 @@ def main():
                          label_drop=_drop, label_rate=(_drop / _span if len(_lf) > 1 else np.nan),
                          prod_drop=float(sp.iloc[0] - sp.iloc[-1]) if len(sp) > 1 else np.nan))
     M = pd.concat(parts, ignore_index=True); S = pd.DataFrame(summ)
+    M, F = hybrid_target(M)                               # soh_target (deployable) + confirmed_decliner flag
+    S = S.merge(F, on="vin", how="left")
     M.to_parquet(OUT, index=False); S.to_parquet(OUT_SUM, index=False)
+    n_decl = int(S["confirmed_decliner"].sum())
     rep = dict(oem="euler", vehicles=int(S["vin"].nunique()), vehicles_ge4_months=int((S["n_months"] >= 4).sum()),
                median_months=float(S["n_months"].median()),
                cv_monthly_median=round(float(S["cv_full"].median()), 1),
-               cv_raw_reading_median=round(float(S["raw_cv_median"].median()), 1))
+               cv_raw_reading_median=round(float(S["raw_cv_median"].median()), 1),
+               confirmed_decliners=n_decl, hybrid_target="soh_target = production for decliners, soh_label otherwise")
     json.dump(rep, open(OUT_REP, "w"), indent=2)
     print(json.dumps(rep, indent=2))
     print(f"wrote {OUT}, {OUT_SUM}, {OUT_REP}")
