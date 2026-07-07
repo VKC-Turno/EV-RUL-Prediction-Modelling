@@ -196,9 +196,10 @@ def forecast_demo(oem_key, m, deg_only=False):
 
     def run(vin):
         gg = m[m["vin"] == vin].sort_values("month").reset_index(drop=True)
+        gf = fitted_soh(gg)                                   # forecast from the smooth anchored-polyfit SoH
         if oem_key == "Euler":
-            fc = mod.forecast(gg, fmodel, H); return gg, fc[0.1], fc[0.5], fc[0.9]
-        sim = mod.simulate(gg, fmodel, H)
+            fc = mod.forecast(gf, fmodel, H); return gg, fc[0.1], fc[0.5], fc[0.9]
+        sim = mod.simulate(gf, fmodel, H)
         return gg, sim["q10"].to_numpy(), sim["q50"].to_numpy(), sim["q90"].to_numpy()
 
     for vin in order:
@@ -284,17 +285,24 @@ def all_split_predictions(oem_key, deg_only=False):
     tr_vins = _train_vins(TR, drop, deg_only)                                # fit on the TRAIN split only
     train = m[m["vin"].isin(tr_vins)]
     euler = oem_key == "Euler"
-    fmodel = (mod.train_traj(mod.build_traj_samples(train)) if euler
-              else mod.train_quantiles(mod.build_transitions(train)))
+    if euler and deg_only in (False, "all"):                # use the PERSISTED (deployed) hybrid model
+        import euler_train
+        _b = euler_train.load_latest()
+        fmodel = _b["traj_model"] if (_b and _b.get("traj_model")) else mod.train_traj(mod.build_traj_samples(train))
+    elif euler:
+        fmodel = mod.train_traj(mod.build_traj_samples(train))
+    else:
+        fmodel = mod.train_quantiles(mod.build_transitions(train))
     reg = reg_dates(oem_key); wdef, wmap = warranty_map(oem_key)
 
     def forecast_vin(vin):
         gg = m[m["vin"] == vin].sort_values("month").reset_index(drop=True); n = len(gg)
         if n < 6:
             return None
-        # Forecast from the LATEST (present) data point using the vehicle's FULL observed history, so the
-        # forecast begins exactly where the measured line ends.
-        hist = gg; cut_age = float(gg["age_months"].iloc[-1])
+        # Forecast from the LATEST point using the vehicle's history — but conditioned on the smooth ANCHORED
+        # POLYFIT SoH (fitted_soh), so the prediction anchors on / continues the clean trend, not the noisy last
+        # reading. Falls back to raw SoH when the fit toggle is off. Measured line (raw) is still shown faded.
+        hist = fitted_soh(gg); cut_age = float(hist["age_months"].iloc[-1])
         warr_age = eff_warr_months(oem_key, gg, wmap.get(vin, wdef))   # km-bound: min(time term, time-to-120k-km)
         H_MAX = 120                                             # cap (months) to avoid absurd extrapolation
         # Only roll forward as far as the display needs — to the warranty deadline + a buffer to catch EoL
@@ -310,7 +318,7 @@ def all_split_predictions(oem_key, deg_only=False):
         hit = np.where(np.asarray(p50) <= EOL_PCT[oem_key])[0]
         end = (int(hit[0]) + 4) if len(hit) else int(round(warr_age - cut_age)) + 6
         end = int(np.clip(max(end, round(warr_age - cut_age) + 2), 3, H))
-        last = float(gg["soh"].iloc[-1])                        # anchor the forecast to the present SoH
+        last = float(hist["soh"].iloc[-1])                      # anchor forecast to the fitted (smooth) endpoint
         fage = np.concatenate([[cut_age], cut_age + np.arange(1, end + 1)])
         p10 = np.concatenate([[last], p10[:end]]); p50 = np.concatenate([[last], p50[:end]])
         p90 = np.concatenate([[last], p90[:end]])
@@ -362,10 +370,9 @@ FIT_OVERLAY = st.sidebar.checkbox("Anchored polynomial fit", value=True,
                                        "faint measured line. Display only; the model still trains on raw monthly SoH.")
 
 
-def anchored_mono_fit(age_months, soh, anchor=100.0, deg=3):
-    """Smooth monotone-DECREASING polynomial forced through (age 0, `anchor`) — i.e. 100% at registration.
-    f(t) = anchor - Σ_{k>=1} a_k t^k with a_k >= 0 (t in YEARS), fit by non-negative least squares on
-    z = anchor - soh. Returns (gx_years, gy) or None. Same construction as the v2 full-charge experiment."""
+def _anchored_coef(age_months, soh, anchor=100.0, deg=3):
+    """Fit f(t) = anchor - Σ_{k>=1} a_k t^k with a_k >= 0 (t in YEARS) by non-negative least squares on
+    z = anchor - soh. Returns (coef, anchor) or None. The a_k >= 0 constraint makes f monotone-decreasing."""
     a = np.asarray(age_months, float) / 12.0
     s = np.asarray(soh, float)
     m = np.isfinite(a) & np.isfinite(s); a, s = a[m], s[m]
@@ -378,9 +385,39 @@ def anchored_mono_fit(age_months, soh, anchor=100.0, deg=3):
         c = lsq_linear(D, anchor - s, bounds=(np.zeros(deg), np.full(deg, np.inf))).x
     except Exception:
         return None
+    return c, anchor
+
+
+def _anchored_eval(coef_anchor, age_months):
+    """Evaluate the fitted monotone polynomial at `age_months` (SoH %)."""
+    c, anchor = coef_anchor
+    t = np.asarray(age_months, float) / 12.0
+    return anchor - sum(c[k - 1] * t ** k for k in range(1, len(c) + 1))
+
+
+def anchored_mono_fit(age_months, soh, anchor=100.0, deg=3):
+    """Smooth monotone-DECREASING polynomial forced through (age 0, `anchor`) — i.e. 100% at registration.
+    Returns (gx_years, gy) or None. Same construction as the v2 full-charge experiment."""
+    ca = _anchored_coef(age_months, soh, anchor, deg)
+    if ca is None:
+        return None
+    a = np.asarray(age_months, float) / 12.0; a = a[np.isfinite(a)]
     gx = np.linspace(0.0, float(a.max()), 60)
-    gy = anchor - sum(c[k - 1] * gx ** k for k in range(1, deg + 1))
-    return gx, gy                              # gx in YEARS, gy SoH %
+    return gx, np.clip(_anchored_eval(ca, gx * 12.0), None, anchor)   # gx in YEARS, gy SoH %
+
+
+def fitted_soh(gg, anchor=100.0):
+    """Return a copy of `gg` whose `soh` is the anchored monotone-polynomial fit evaluated at each row's age
+    (<=100). Falls back to `gg` unchanged when the fit toggle is off or the fit fails. Feeding THIS to the
+    forecaster makes the prediction anchor on and continue the smooth trend, not the noisy last reading."""
+    if not FIT_OVERLAY:
+        return gg
+    ca = _anchored_coef(gg["age_months"].to_numpy(), gg["soh"].to_numpy(), anchor)
+    if ca is None:
+        return gg
+    out = gg.copy()
+    out["soh"] = np.clip(_anchored_eval(ca, gg["age_months"].to_numpy()), 0.0, 100.0)
+    return out
 
 
 def add_soh_fit(fig, age_months, soh, color, width=2.0, opacity=0.95, name=None, **kw):
@@ -670,8 +707,11 @@ def _forecast_fig(oem, h=330):
     p10, p50, p90 = p10[:keep], p50[:keep], p90[:keep]
     sm = smooth(g.soh); fa = np.arange(a0 + 1, a0 + len(p50) + 1)
     xc = np.concatenate([[a0], fa]) / 12.0                      # months -> years for the age axis
-    c10 = np.concatenate([[sm.iloc[-1]], p10]); c50 = np.concatenate([[sm.iloc[-1]], p50])
-    c90 = np.concatenate([[sm.iloc[-1]], p90])
+    _ca = _anchored_coef(g.age_months.to_numpy(), g.soh.to_numpy())   # anchor forecast to the fitted endpoint
+    _anc = (float(np.clip(_anchored_eval(_ca, [g.age_months.iloc[-1]])[0], 0, 100))
+            if (FIT_OVERLAY and _ca is not None) else float(sm.iloc[-1]))
+    c10 = np.concatenate([[_anc], p10]); c50 = np.concatenate([[_anc], p50])
+    c90 = np.concatenate([[_anc], p90])
     fig = go.Figure()
     if RENORM100[oem]:
         fig.add_scatter(x=[0, g.age_months.iloc[0] / 12], y=[100, sm.iloc[0]], mode="lines",
@@ -790,8 +830,9 @@ def _rul_demo(oem, deg_only, vin):
     # asymptotic flattening (its predicted monthly loss decays to ~0 over a long horizon).
     mod, fmodel = forecaster(oem, deg_only)
     try:
-        p50 = (np.asarray(mod.forecast(g, fmodel, 18)[0.5], dtype="float64") if oem == "Euler"
-               else mod.simulate(g, fmodel, 18)["q50"].to_numpy())
+        _gf = fitted_soh(g)                                  # forecast from the smooth anchored-polyfit SoH
+        p50 = (np.asarray(mod.forecast(_gf, fmodel, 18)[0.5], dtype="float64") if oem == "Euler"
+               else mod.simulate(_gf, fmodel, 18)["q50"].to_numpy())
     except Exception:
         p50 = np.array([cur])
     k = min(12, len(p50))
@@ -1069,10 +1110,11 @@ def _backtest_eval(oem_key, deg_only=False):
         H = int(round(g["age_months"].iloc[-1] - aa))
         if H < 1:
             continue
+        hf = fitted_soh(hist)                                # forecast from the smooth anchored-polyfit SoH
         if euler:
-            fc = mod.forecast(hist, model, H); p50 = np.asarray(fc[0.5])
+            fc = mod.forecast(hf, model, H); p50 = np.asarray(fc[0.5])
         else:
-            p50 = mod.simulate(hist, model, H)["q50"].to_numpy()
+            p50 = mod.simulate(hf, model, H)["q50"].to_numpy()
         errs = [abs(p50[d - 1] - float(r["soh"])) for _, r in g.iloc[cut + 1:].iterrows()
                 for d in [int(round(r["age_months"] - aa))] if 1 <= d <= len(p50)]
         if not errs:
@@ -1115,7 +1157,8 @@ def _learning_curve(oem_key, deg_only=False):
             H = int(round(g["age_months"].iloc[-1] - aa))
             if H < 1:
                 continue
-            p = (np.asarray(mod.forecast(anc, model, H)[0.5]) if euler else mod.simulate(anc, model, H)["q50"].to_numpy())
+            _af = fitted_soh(anc)                            # forecast from the smooth anchored-polyfit SoH
+            p = (np.asarray(mod.forecast(_af, model, H)[0.5]) if euler else mod.simulate(_af, model, H)["q50"].to_numpy())
             for j in range(N, len(g)):
                 d = int(round(g["age_months"].iloc[j] - aa))
                 if 1 <= d <= len(p):
@@ -1150,7 +1193,8 @@ def _validation_demos(oem_key, deg_only=False):
         H = int(round(g["age_months"].iloc[-1] - aa))
         if H < 1:
             continue
-        p50 = np.asarray(mod.forecast(hist, model, H)[0.5]) if euler else mod.simulate(hist, model, H)["q50"].to_numpy()
+        hf = fitted_soh(hist)                                # forecast from the smooth anchored-polyfit SoH
+        p50 = np.asarray(mod.forecast(hf, model, H)[0.5]) if euler else mod.simulate(hf, model, H)["q50"].to_numpy()
         errs = [abs(p50[d - 1] - float(r["soh"])) for _, r in g.iloc[cut + 1:].iterrows()
                 for d in [int(round(r["age_months"] - aa))] if 1 <= d <= len(p50)]
         last = float(hist["soh"].iloc[-1])
