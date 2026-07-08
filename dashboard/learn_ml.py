@@ -1395,6 +1395,36 @@ elif step == STEPS[3]:
     st.markdown("Each line is one vehicle's SoH as it ages. We split the two populations the model must "
                 "handle into separate rows: **degraders** (lost ≥2% — real aging) and **still-near-new** "
                 "(flat) vehicles.")
+
+    st.markdown("#### 🔬 How each fleet's *target* SoH is built")
+    st.caption("The **target** is the SoH value the model learns to predict. It's derived differently per fleet "
+               "(the feeds differ) and every fleet gets a monotone **cleaning** step, because raw SoH is noisy.")
+    _pipe = pd.DataFrame([
+        {"Fleet": "Euler",
+         "Measured from": "BMS remaining-capacity: remCap ÷ (SoC/100) at 95–100% SoC, monthly median",
+         "Cleaning → target": "keep 0.6–1.4× median & ≥15 readings/mo → normalize to first-6-month nominal → "
+                              "isotonic-decreasing envelope → clip ≤100.  DEPLOYED HYBRID: recovery-aware greying of "
+                              "transient dips → isotonic clean label for flat vehicles; production SoH for coulomb-"
+                              "confirmed decliners."},
+        {"Fleet": "Mahindra",
+         "Measured from": "Coulomb counting ∫ I·dt (intellicar subset with current); ~98% native has no current/"
+                          "voltage → NO measured SoH → Bayesian behaviour-model p50 from age + mileage",
+         "Cleaning → target": "greedy cumulative-min → robust isotonic envelope (monotone non-increasing)"},
+        {"Fleet": "Bajaj",
+         "Measured from": "BMS-reported SoH (feed has no current/voltage, so capacity can't be computed)",
+         "Cleaning → target": "monthly median → kept non-increasing (monotone clean of the reported value)"},
+        {"Fleet": "Piaggio",
+         "Measured from": "Coulomb counting ∫ I·dt from the intellicar feed",
+         "Cleaning → target": "greedy cumulative-min → robust isotonic envelope (shares Mahindra's pipeline)"},
+    ]).set_index("Fleet")
+    st.table(_pipe)
+    concept("Two transforms are **display-only** and do NOT change what the model trains on: the **5-point rolling "
+            "mean** (‘Smooth SoH curves’), and the **anchored monotone polynomial** forced through 100% at registration "
+            "(‘Anchored polynomial fit’) — the smooth trend overlaid on the curves below, which also anchors the "
+            "forecasts. Note: the **isotonic** step (Euler production, Mahindra, Piaggio) is what produces the cliff / "
+            "stuck-floor artifacts — which is exactly why **Euler's deployed target moved to the recovery-aware clean "
+            "label**.")
+
     st.markdown("##### 🔴 Degraders — what real aging looks like")
     _ncol = len(OEM_KEYS) + (1 if NATIVE_SOH is not None else 0)
     cols = st.columns(_ncol)
