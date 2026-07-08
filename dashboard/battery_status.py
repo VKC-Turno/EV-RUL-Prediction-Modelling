@@ -160,6 +160,29 @@ def load_oem(oem: str) -> pd.DataFrame:
 
 
 @st.cache_data(show_spinner=False)
+def _mahindra_intellicar_store():
+    """The Mahindra INTELLICAR (coulomb-measured) feed, ungated — so we can cross-check a native vehicle's
+    ESTIMATE against its real sensor SoH where the same VIN appears in both feeds (~5 vehicles)."""
+    p = "data/redshift/mahindra_featengg.parquet"
+    if not os.path.exists(p):
+        return None
+    d = pd.read_parquet(p).rename(columns={"ymd": "month"})
+    d["vin"] = d["vin"].astype(str)
+    d["soh"] = pd.to_numeric(d["soh"], errors="coerce")
+    d["age_months"] = pd.to_numeric(d["age_months"], errors="coerce")
+    return d
+
+
+def intellicar_measured(vin: str):
+    """Measured coulomb SoH (age_months, soh) from the intellicar feed for `vin`, or None if it's not in that feed."""
+    d = _mahindra_intellicar_store()
+    if d is None:
+        return None
+    dd = d[d["vin"] == str(vin)].dropna(subset=["soh", "age_months"]).sort_values("age_months")
+    return dd[["age_months", "soh"]].copy() if len(dd) >= 2 else None
+
+
+@st.cache_data(show_spinner=False)
 def vehicle_index(oem: str) -> pd.DataFrame:
     """One row per vehicle with stats + a quick safe / at-risk estimate (a fast √t fit vs the warranty
     deadline — the detailed view uses the full model). Sorted oldest-first."""
@@ -984,12 +1007,19 @@ with cs:
                 f"<div style='color:{MUTE};font-size:0.95rem;line-height:1.75;margin-top:3px;'>{_chip_html}</div>",
                 unsafe_allow_html=True)
 
+_ic_measured = intellicar_measured(vin) if oem == "Mahindra Native" else None
 if oem == "Mahindra Native":
-    st.warning("🔎 **Estimated health — no on-board sensor.** This vehicle streams charge, distance and time but "
-               "**no current or voltage**, so its battery health can't be measured directly. The figures below are a "
-               "**statistical estimate** from its **age and mileage** (our behaviour model, validated against "
-               "sensor-equipped Mahindras to ~1.5% error) — a guide with a wide margin, not a precise reading. "
-               "Sensor-based sections (charge habits, temperature) are unavailable.")
+    if _ic_measured is not None:
+        st.warning("🔎 **Estimated health — with a real-sensor cross-check.** This native vehicle has no current/voltage, "
+                   "so the headline figures are a **statistical estimate** from age and mileage. But it *also* appears in "
+                   "the **intellicar** feed, so we overlay its **measured** coulomb SoH (blue) on the chart below — a rare "
+                   "chance to see the estimate against the real sensor for the same battery.")
+    else:
+        st.warning("🔎 **Estimated health — no on-board sensor.** This vehicle streams charge, distance and time but "
+                   "**no current or voltage**, so its battery health can't be measured directly. The figures below are a "
+                   "**statistical estimate** from its **age and mileage** (our behaviour model, validated against "
+                   "sensor-equipped Mahindras to ~1.5% error) — a guide with a wide margin, not a precise reading. "
+                   "Sensor-based sections (charge habits, temperature) are unavailable.")
 
 eol, rated = EOL[oem], RATED_KM[oem]
 warr_years, warr_km = FLEET_WARRANTY[OEM_KEY[oem]]
@@ -1131,17 +1161,23 @@ try:
 except Exception:
     pass
 
+# For a native vehicle the main line is an ESTIMATE; name it so when we also show the measured sensor line.
+_main_name = "Estimated (behaviour model)" if _ic_measured is not None else "Your battery"
 _hfit = anchored_mono_fit(g["age_months"].to_numpy(), g["soh"].to_numpy())
 if _hfit is not None:                                          # smooth health trend + faded raw measured
     fig.add_trace(go.Scatter(x=g["age_months"] / 12, y=g["soh"], mode="lines+markers",
                              line=dict(color=status_color, width=1.4), marker=dict(size=4),
                              opacity=0.4, name="measured", showlegend=False))
     fig.add_trace(go.Scatter(x=_hfit[0], y=_hfit[1], mode="lines",
-                             line=dict(color=status_color, width=3), name="Your battery"))
+                             line=dict(color=status_color, width=3), name=_main_name))
 else:
     fig.add_trace(go.Scatter(x=g["age_months"] / 12, y=g["soh"], mode="lines+markers",
                              line=dict(color=status_color, width=3), marker=dict(size=6),
-                             name="Your battery"))
+                             name=_main_name))
+if _ic_measured is not None:                                  # native vehicle that also has intellicar sensor data
+    fig.add_trace(go.Scatter(x=_ic_measured["age_months"] / 12, y=_ic_measured["soh"], mode="lines+markers",
+                             line=dict(color=BLUE, width=2.6), marker=dict(size=5),
+                             name="Measured · intellicar sensor"))
 for pop, label, color in POPULATIONS:                          # one predicted line per training population
     pj = pop_projs.get(pop)
     if pj is None:
