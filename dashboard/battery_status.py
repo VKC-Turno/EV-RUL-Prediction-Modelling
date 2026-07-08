@@ -493,6 +493,60 @@ def project(age_months, soh, eol: float) -> dict | None:
 
 
 # ---------------------------------------------------------------------------
+# Anchored monotone-polyfit SoH — a smooth degradation trend forced through 100% at registration
+# (age 0). We show it on the health charts and forecast FROM it, so the projection continues the
+# clean trend rather than a noisy last reading. Mirrors dashboard/learn_ml.py.
+# ---------------------------------------------------------------------------
+def _anchored_coef(age_months, soh, anchor=100.0, deg=3):
+    from scipy.optimize import lsq_linear
+    a = np.asarray(age_months, float) / 12.0; s = np.asarray(soh, float)
+    m = np.isfinite(a) & np.isfinite(s); a, s = a[m], s[m]
+    if len(a) < 2 or a.max() <= 0:
+        return None
+    deg = int(min(deg, max(1, len(a))))
+    D = np.column_stack([a ** k for k in range(1, deg + 1)])
+    try:
+        c = lsq_linear(D, anchor - s, bounds=(np.zeros(deg), np.full(deg, np.inf))).x
+    except Exception:
+        return None
+    return c, anchor
+
+
+def _anchored_eval(coef_anchor, age_months):
+    c, anchor = coef_anchor
+    t = np.asarray(age_months, float) / 12.0
+    return anchor - sum(c[k - 1] * t ** k for k in range(1, len(c) + 1))
+
+
+def anchored_mono_fit(age_months, soh, anchor=100.0, deg=3):
+    """Smooth monotone-decreasing SoH curve through (age 0, `anchor`). Returns (gx_years, gy) or None."""
+    ca = _anchored_coef(age_months, soh, anchor, deg)
+    if ca is None:
+        return None
+    a = np.asarray(age_months, float) / 12.0; a = a[np.isfinite(a)]
+    gx = np.linspace(0.0, float(a.max()), 60)
+    return gx, np.clip(_anchored_eval(ca, gx * 12.0), None, anchor)
+
+
+def fitted_soh(gg, anchor=100.0):
+    """Copy of `gg` with `soh` replaced by the anchored monotone-polyfit fit (<=100); raw on failure."""
+    ca = _anchored_coef(gg["age_months"].to_numpy(), gg["soh"].to_numpy(), anchor)
+    if ca is None:
+        return gg
+    out = gg.copy()
+    out["soh"] = np.clip(_anchored_eval(ca, gg["age_months"].to_numpy()), 0.0, 100.0)
+    return out
+
+
+def _euler_model_ver():
+    """mtime of the deployed Euler model — used to bust the customer_forecaster cache on redeploy."""
+    try:
+        return os.path.getmtime("models/euler/latest.pkl")
+    except Exception:
+        return 0.0
+
+
+# ---------------------------------------------------------------------------
 # Model-based projection — the SAME conditioned models the internal pipeline uses
 # (euler_model trajectory · Mahindra expected-loss quantiles · Bajaj quantiles),
 # so the customer forecast matches the pipeline. Falls back to the √t fit above
@@ -507,9 +561,12 @@ POPULATIONS = [("all", "All vehicles", GREEN), ("deg", "Degraders only", AMBER),
 
 
 @st.cache_resource(show_spinner=False)
-def customer_forecaster(oem: str, pop: str = "all"):
+def customer_forecaster(oem: str, pop: str = "all", model_ver: float = 0.0):
     """Train (cached) the pipeline model for an OEM on a chosen training population:
-    all · deg (drop≥2) · safe (never reached EoL) · safe_deg (safe AND drop≥2)."""
+    all · deg (drop≥2) · safe (never reached EoL) · safe_deg (safe AND drop≥2).
+    For Euler + the full population, load the DEPLOYED (persisted) model instead of training fresh, so the
+    customer app matches the internal pipeline. `model_ver` (the deployed model's mtime) busts this cache on
+    redeploy — do not remove it (no leading underscore, so Streamlit hashes it)."""
     df = load_oem(oem); eol = EOL[oem]
     gg = df.groupby("vin"); drop = gg["soh"].first() - gg["soh"].last(); smin = gg["soh"].min()
     if pop == "deg":
@@ -523,6 +580,14 @@ def customer_forecaster(oem: str, pop: str = "all"):
     df = df[df["vin"].isin(keep)]
     mod = importlib.import_module(_MODEL_MODULE[oem])
     if oem == "Euler":
+        if pop in (False, "all"):                          # use the deployed hybrid model when available
+            try:
+                import euler_train
+                b = euler_train.load_latest()
+                if b and b.get("traj_model"):
+                    return mod, b["traj_model"]
+            except Exception:
+                pass
         return mod, mod.train_traj(mod.build_traj_samples(df))
     return mod, mod.train_quantiles(mod.build_transitions(df))
 
@@ -536,18 +601,19 @@ def model_project(oem: str, g, eol: float, horizon: int = 120, pop: str = "all")
     if len(gg) < 4:
         return None
     now_age = float(gg["age_months"].iloc[-1]); now_soh = float(gg["soh"].iloc[-1])
+    gf = fitted_soh(gg); fit_soh = float(gf["soh"].iloc[-1])       # forecast FROM / anchor ON the smooth trend
     try:
-        mod, fmodel = customer_forecaster(oem, pop)
+        mod, fmodel = customer_forecaster(oem, pop, model_ver=_euler_model_ver() if oem == "Euler" else 0.0)
         if oem == "Euler":
-            p50 = np.asarray(mod.forecast(gg, fmodel, horizon)[0.5], dtype=float)
+            p50 = np.asarray(mod.forecast(gf, fmodel, horizon)[0.5], dtype=float)
         else:
-            p50 = mod.simulate(gg, fmodel, horizon)["q50"].to_numpy()
+            p50 = mod.simulate(gf, fmodel, horizon)["q50"].to_numpy()
     except Exception:
         return None
     if p50.size == 0:
         return None
     ages = now_age + np.arange(0, len(p50) + 1)                    # now, now+1, … now+H
-    central = np.concatenate([[now_soh], p50])                     # anchor at the present measured SoH
+    central = np.concatenate([[fit_soh], p50])                     # anchor at the smooth (fitted) present SoH
     below = np.where(central <= eol)[0]
     months_to_eol = float(ages[below[0]] - now_age) if len(below) else None
     tail_slope = min(float(central[-1] - central[-2]), 0.0) if len(central) >= 2 else 0.0
@@ -1037,9 +1103,17 @@ try:
 except Exception:
     pass
 
-fig.add_trace(go.Scatter(x=g["age_months"] / 12, y=g["soh"], mode="lines+markers",
-                         line=dict(color=status_color, width=3), marker=dict(size=6),
-                         name="Your battery"))
+_hfit = anchored_mono_fit(g["age_months"].to_numpy(), g["soh"].to_numpy())
+if _hfit is not None:                                          # smooth health trend + faded raw measured
+    fig.add_trace(go.Scatter(x=g["age_months"] / 12, y=g["soh"], mode="lines+markers",
+                             line=dict(color=status_color, width=1.4), marker=dict(size=4),
+                             opacity=0.4, name="measured", showlegend=False))
+    fig.add_trace(go.Scatter(x=_hfit[0], y=_hfit[1], mode="lines",
+                             line=dict(color=status_color, width=3), name="Your battery"))
+else:
+    fig.add_trace(go.Scatter(x=g["age_months"] / 12, y=g["soh"], mode="lines+markers",
+                             line=dict(color=status_color, width=3), marker=dict(size=6),
+                             name="Your battery"))
 for pop, label, color in POPULATIONS:                          # one predicted line per training population
     pj = pop_projs.get(pop)
     if pj is None:
@@ -1116,8 +1190,15 @@ has_cap = _cap_s.notna().sum() >= 3
 has_od = _od_s.notna().sum() >= 2 and bool((_od_s.fillna(0) > 0).any())
 
 ov = go.Figure()
-ov.add_trace(go.Scatter(x=age_yr, y=_soh_s, name="SoH (%)", mode="lines+markers",
-                        line=dict(color=GREEN, width=2.6), marker=dict(size=5), yaxis="y"))
+_ufit = anchored_mono_fit(g["age_months"].to_numpy(), _soh_s.to_numpy())
+if _ufit is not None:                                         # smooth SoH trend + faded raw measured
+    ov.add_trace(go.Scatter(x=age_yr, y=_soh_s, mode="lines+markers", showlegend=False,
+                            line=dict(color=GREEN, width=1.2), marker=dict(size=4), opacity=0.4, yaxis="y"))
+    ov.add_trace(go.Scatter(x=_ufit[0], y=_ufit[1], name="SoH (%)", mode="lines",
+                            line=dict(color=GREEN, width=2.6), yaxis="y"))
+else:
+    ov.add_trace(go.Scatter(x=age_yr, y=_soh_s, name="SoH (%)", mode="lines+markers",
+                            line=dict(color=GREEN, width=2.6), marker=dict(size=5), yaxis="y"))
 if has_cap:
     ov.add_trace(go.Scatter(x=age_yr, y=_cap_s, name="capacity (Ah)", mode="lines+markers",
                             line=dict(color=AMBER, width=1.6), marker=dict(size=3), yaxis="y2"))
