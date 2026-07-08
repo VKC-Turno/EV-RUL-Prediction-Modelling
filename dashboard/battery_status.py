@@ -613,7 +613,9 @@ def model_project(oem: str, g, eol: float, horizon: int = 120, pop: str = "all")
     if p50.size == 0:
         return None
     ages = now_age + np.arange(0, len(p50) + 1)                    # now, now+1, … now+H
-    central = np.concatenate([[fit_soh], p50])                     # anchor at the smooth (fitted) present SoH
+    # Re-anchor the (fitted-shape) forecast at the RAW current SoH so 'healthy life left' agrees with the
+    # 'Health today' number the customer sees — the fitted trend still sets the SLOPE, only the start shifts.
+    central = np.concatenate([[now_soh], np.clip(p50 + (now_soh - fit_soh), 0.0, 100.0)])
     below = np.where(central <= eol)[0]
     months_to_eol = float(ages[below[0]] - now_age) if len(below) else None
     tail_slope = min(float(central[-1] - central[-2]), 0.0) if len(central) >= 2 else 0.0
@@ -625,6 +627,22 @@ def model_project(oem: str, g, eol: float, horizon: int = 120, pop: str = "all")
 
     return dict(fit=fit, slope=tail_slope, now_age=now_age, now_soh=now_soh,
                 months_to_eol=months_to_eol)
+
+
+# Warranty-risk severity by HOW EARLY the projection crosses end-of-life before the warranty deadline (months).
+RISK_TIER_META = {"safe": ("Safe", "🟢", GREEN), "low": ("Low risk", "🟡", "#e7d14e"),
+                  "moderate": ("Moderate risk", "🟠", AMBER), "high": ("High risk", "🔴", RED)}
+
+
+def warranty_risk_tier(proj, warr_months):
+    """'safe' if the projection never crosses EoL by the warranty deadline; else Low / Moderate / High by how many
+    months BEFORE the deadline it crosses (barely-before = Low, long-before = High). Mirrors the internal dashboard."""
+    if not proj or proj.get("months_to_eol") is None:
+        return "safe"
+    early = float(warr_months) - (float(proj["now_age"]) + float(proj["months_to_eol"]))   # months early it crosses EoL
+    if early <= 0:
+        return "safe"
+    return "low" if early <= 6 else ("moderate" if early <= 18 else "high")
 
 
 # ===========================================================================
@@ -1069,6 +1087,16 @@ section("LIFESPAN", "How your battery is aging")
 life_left = (fmt_months_human(proj["months_to_eol"])
              if proj and proj["months_to_eol"] is not None
              else ("reached end-of-life" if soh_now <= eol else "no decline yet"))
+_tier = warranty_risk_tier(proj, warr_months)
+_tlabel, _ticon, _tcolor = RISK_TIER_META[_tier]
+_tsub = {"safe": "projected to stay above end-of-life through warranty",
+         "low": "only dips below the line in the final months of warranty — barely a claim risk",
+         "moderate": "projected to reach end-of-life 6–18 months before warranty ends",
+         "high": "projected to reach end-of-life well inside warranty — needs attention"}[_tier]
+st.markdown(f"<div style='margin:-6px 0 14px 0;'><span class='pill' style='background:{_tcolor}26;color:{_tcolor};'>"
+            f"{_ticon} Warranty risk: {_tlabel}</span>"
+            f"<span style='color:{MUTE};font-size:0.95rem;margin-left:12px;'>{_tsub}</span></div>",
+            unsafe_allow_html=True)
 stat_strip([
     ("Health today", f"{soh_now:.0f}%", None, status_color),
     ("Healthy life left", life_left),
