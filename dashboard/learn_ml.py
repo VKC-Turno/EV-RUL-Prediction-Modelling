@@ -821,25 +821,20 @@ def _rul_demo(oem, deg_only, vin):
     m = data_quality.apply_quality(FEATS_BY[oem], oem)
     eol, wyr, wkm = EOL_PCT[oem], WARRANTY_YR[oem], WARRANTY_KM[oem]
     g = m[m.vin == vin].sort_values("month").reset_index(drop=True)
-    cur = float(g.soh.iloc[-1]); a0m = float(g["age_months"].iloc[-1])
+    gf = fitted_soh(g)                                       # smooth anchored-polyfit SoH (raw if the fit toggle is off)
+    cur = float(gf["soh"].iloc[-1]); a0m = float(g["age_months"].iloc[-1])    # anchor the projection on the FITTED SoH
     has_odo = "odo_max" in g.columns and bool((g["odo_max"] < 3e5).any())
     odo_now = float(g["odo_max"][g["odo_max"] < 3e5].max()) if has_odo else None
     reached_flag = (a0m / 12.0 >= wyr) or (odo_now is not None and odo_now >= wkm)   # did THIS vehicle reach warranty?
     reach_by = "km" if (odo_now is not None and odo_now >= wkm) else "age"
-    # near-term degradation rate from the model, then a LINEAR projection to EoL — avoids the rate model's
-    # asymptotic flattening (its predicted monthly loss decays to ~0 over a long horizon).
-    mod, fmodel = forecaster(oem, deg_only)
-    try:
-        _gf = fitted_soh(g)                                  # forecast from the smooth anchored-polyfit SoH
-        p50 = (np.asarray(mod.forecast(_gf, fmodel, 18)[0.5], dtype="float64") if oem == "Euler"
-               else mod.simulate(_gf, fmodel, 18)["q50"].to_numpy())
-    except Exception:
-        p50 = np.array([cur])
-    k = min(12, len(p50))
-    model_rate = max((cur - float(p50[k - 1])) / k, 0.0) if k >= 1 else 0.0   # model near-term pp/month
-    span_m = max(a0m - float(g["age_months"].iloc[0]), 1.0)                   # this vehicle's observed life (months)
-    hist_rate = max((float(g["soh"].iloc[0]) - cur) / span_m, 0.0)           # ...and its observed degradation pace
-    rate = max(model_rate, hist_rate)                                        # faster of the two -> healthy ones still project
+    # Decline RATE = the fitted polyfit trend's recent (last ~12 mo) slope, then a LINEAR projection to EoL
+    # anchored at the FITTED current SoH (a full model rollout flattens asymptotically and never reaches EoL).
+    ages = g["age_months"].to_numpy(); fs = gf["soh"].to_numpy()
+    _rec = ages >= (ages[-1] - 12.0)
+    if int(_rec.sum()) >= 2 and (ages[-1] - float(ages[_rec][0])) > 0:
+        rate = max((float(fs[_rec][0]) - cur) / (ages[-1] - float(ages[_rec][0])), 0.0)   # pp/month, fitted slope
+    else:
+        rate = max((float(fs[0]) - cur) / max(a0m - float(ages[0]), 1.0), 0.0)
     if rate > 0.01 and cur > eol:
         mte = (cur - eol) / rate
         npts = int(min(np.ceil((cur - (eol - 3)) / rate), 24))              # to ~3pp past EoL, capped at 2 yr
@@ -854,10 +849,12 @@ def _rul_demo(oem, deg_only, vin):
     ntr = len(f_soh)
     f_odo = ((np.full(ntr, kmpm).cumsum() + odo_now).tolist() if (kmpm and odo_now and ntr) else None)
     gc = g[g["odo_max"] < 3e5] if "odo_max" in g.columns else g.iloc[0:0]   # clean-odo trajectory (km-based plot)
+    gcf = gf[g["odo_max"] < 3e5] if "odo_max" in g.columns else gf.iloc[0:0]   # fitted SoH at the same clean-odo rows
     return dict(vin=vin, cur=cur, eol=eol, mte=mte, kmpm=(int(round(kmpm)) if kmpm else None),
                 rem_km=rem_km, rated=rated, range_now=rated * cur / 100, range_eol=rated * eol / 100,
                 reached=reached_flag, reach_by=reach_by, age_yr=a0m / 12.0, odo=odo_now, wyr=wyr, wkm=wkm,
                 a_hist=(g["age_months"].to_numpy() / 12.0).tolist(), soh_hist=smooth(g["soh"]).to_numpy().tolist(),
+                soh_fit=gf["soh"].to_numpy().tolist(), odo_soh_fit=gcf["soh"].to_numpy().tolist(),
                 f_age=((a0m + np.arange(1, ntr + 1)) / 12.0).tolist(), f_p50=f_soh.tolist(),
                 odo_hist=gc["odo_max"].to_numpy().tolist(), odo_soh=smooth(gc["soh"]).to_numpy().tolist(), f_odo=f_odo)
 
@@ -898,14 +895,20 @@ def _rul_soh_fig(oem, infos, h=230, on_km=None):
         c = _PAIRCOL[j % 2]
         if use_km:
             x, y, fx, fy = info["odo_hist"], info["odo_soh"], info.get("f_odo"), info.get("f_p50")
+            yf = info.get("odo_soh_fit")
         else:
             x, y, fx, fy = info["a_hist"], info["soh_hist"], info.get("f_age"), info.get("f_p50")
+            yf = info.get("soh_fit")
         if not x:
             continue
-        fig.add_scatter(x=x, y=y, mode="lines+markers", line=dict(color=c, width=2), marker=dict(size=3),
-                        name=f"…{info['vin'][-6:]}")
-        if fx and fy and len(fx) == len(fy):                          # bridge from the last measured point
-            fig.add_scatter(x=[x[-1]] + list(fx), y=[y[-1]] + list(fy), mode="lines",
+        _has_fit = bool(FIT_OVERLAY and yf and len(yf) == len(x))     # overlay the smooth anchored fit, fade measured
+        fig.add_scatter(x=x, y=y, mode="lines+markers", line=dict(color=c, width=(1 if _has_fit else 2)),
+                        marker=dict(size=3), opacity=(0.4 if _has_fit else 1.0), name=f"…{info['vin'][-6:]}")
+        if _has_fit:
+            fig.add_scatter(x=x, y=yf, mode="lines", line=dict(color=c, width=2.4), showlegend=False)
+        _anchor_y = (yf[-1] if _has_fit else y[-1])                   # forecast bridges from the FITTED endpoint
+        if fx and fy and len(fx) == len(fy):
+            fig.add_scatter(x=[x[-1]] + list(fx), y=[_anchor_y] + list(fy), mode="lines",
                             line=dict(color=c, width=2, dash="dash"), showlegend=False)
         hi = max(hi, x[-1], (fx[-1] if fx else 0))
     wline = info0["wkm"] if use_km else info0["wyr"]
