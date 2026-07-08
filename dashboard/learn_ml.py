@@ -955,16 +955,38 @@ def _bucketise(preds, eol):
     return cats
 
 
+# At-risk severity by HOW EARLY the forecast crosses end-of-life before the warranty deadline (months).
+RISK_EARLY = (6.0, 18.0)     # <= 6 mo early -> Low · <= 18 -> Moderate · > 18 -> High
+RISK_META = {"high": ("🔴 High", "#ff5b5b"), "moderate": ("🟠 Moderate", "#f2a93b"),
+             "low": ("🟡 Low", "#e7d14e"), "safe": ("🟢 Safe", GREEN)}
+
+
+def _risk_tier(p, eol):
+    """'safe' if the forecast stays above EoL through warranty; else a severity tier keyed off how many months
+    BEFORE the warranty deadline the forecast first crosses EoL (barely-before = Low, long-before = High)."""
+    if _fc_at_warranty(p, "p50") >= eol:
+        return "safe"
+    fage = np.asarray(p["fage"], float); p50 = np.asarray(p["p50"], float)
+    below = np.where(p50 <= eol)[0]
+    cross = float(fage[below[0]]) if len(below) else float(p["warr_age"])
+    early = float(p["warr_age"]) - cross                              # months it crosses EoL before warranty ends
+    lo, hi = RISK_EARLY
+    return "low" if early <= lo else ("moderate" if early <= hi else "high")
+
+
 @st.cache_data(show_spinner="Assessing warranty risk…")
 def warranty_risk_summary(oem_key, deg_only=False):
-    """Across ALL modeled vehicles: how many are projected to STAY ABOVE end-of-life through their warranty deadline
-    (out of risk) vs cross it before it (at-risk). Same forecast + _bucketise classification as Step 11."""
+    """Across ALL modeled vehicles: out-of-risk (projected to stay above EoL through warranty) vs at-risk, with the
+    at-risk split into High / Moderate / Low by how early the forecast crosses end-of-life (see _risk_tier)."""
     P = all_split_predictions(oem_key, deg_only)
     allp = P.get("train", []) + P.get("validation", []) + P.get("test", [])
-    cats = _bucketise(allp, EOL_PCT[oem_key])
-    at_risk = len(cats["At-risk"]); total = sum(len(v) for v in cats.values())
-    return dict(total=total, at_risk=at_risk, out_of_risk=total - at_risk,
-                safe=len(cats["Safe"]) + len(cats["Genuinely flat"]), unproven=len(cats["Flat (unproven)"]))
+    eol = EOL_PCT[oem_key]
+    t = {"safe": 0, "low": 0, "moderate": 0, "high": 0}
+    for p in allp:
+        t[_risk_tier(p, eol)] += 1
+    total = sum(t.values()); at_risk = t["low"] + t["moderate"] + t["high"]
+    return dict(total=total, at_risk=at_risk, out_of_risk=t["safe"],
+                high=t["high"], moderate=t["moderate"], low=t["low"])
 
 
 def _risk_pie(name, out_of_risk, at_risk, height=250):
@@ -973,6 +995,22 @@ def _risk_pie(name, out_of_risk, at_risk, height=250):
                            hole=0.58, marker=dict(colors=[GREEN, RED], line=dict(color="#0e1726", width=2)),
                            textinfo="value", textfont_size=13, hovertemplate="%{label}: %{value} (%{percent})<extra></extra>"))
     pct = 100 * out_of_risk / total if total else 0
+    fig.update_layout(**lay(height=height, showlegend=False, margin=dict(l=6, r=6, t=34, b=6),
+                      title=dict(text=name, font=dict(size=13)),
+                      annotations=[dict(text=f"<b>{pct:.0f}%</b><br><span style='font-size:11px'>out of risk</span>",
+                                        x=0.5, y=0.5, showarrow=False, font=dict(size=18, color=GREEN))]))
+    return fig
+
+
+def _risk_pie_tiered(name, r, height=250):
+    """Donut split into 🟢 Safe · 🟡 Low · 🟠 Moderate · 🔴 High (r = a warranty_risk_summary dict). Centre = % out of risk."""
+    order = [("safe", r.get("out_of_risk", 0)), ("low", r.get("low", 0)),
+             ("moderate", r.get("moderate", 0)), ("high", r.get("high", 0))]
+    labels = [RISK_META[k][0] for k, _ in order]; vals = [v for _, v in order]; cols = [RISK_META[k][1] for k, _ in order]
+    total = sum(vals); pct = 100 * r.get("out_of_risk", 0) / total if total else 0
+    fig = go.Figure(go.Pie(labels=labels, values=vals, sort=False, direction="clockwise", hole=0.58,
+                           marker=dict(colors=cols, line=dict(color="#0e1726", width=2)),
+                           textinfo="value", textfont_size=12, hovertemplate="%{label}: %{value} (%{percent})<extra></extra>"))
     fig.update_layout(**lay(height=height, showlegend=False, margin=dict(l=6, r=6, t=34, b=6),
                       title=dict(text=name, font=dict(size=13)),
                       annotations=[dict(text=f"<b>{pct:.0f}%</b><br><span style='font-size:11px'>out of risk</span>",
@@ -2365,8 +2403,11 @@ elif step == STEPS[16]:
     st.title("16 · Fleet warranty risk — who's projected to survive?")
     st.markdown("For **every modeled vehicle** we forecast its SoH out to its **warranty deadline** (whichever of the "
                 "time term or the km limit comes first) and ask the warranty question: does it stay **above the "
-                "end-of-life line**? **Out of warranty risk** = projected to survive; **at-risk** = the forecast crosses "
-                "end-of-life *before* warranty ends. Green = safe, red = at-risk.")
+                "end-of-life line**? At-risk vehicles are graded by **how early the forecast crosses end-of-life** — "
+                "a battery that dips below the line in the final month of warranty is far less risky than one that "
+                "fails years early:")
+    st.markdown("- 🟢 **Safe** — never crosses end-of-life within warranty · 🟡 **Low** — crosses in the **last 6 "
+                "months** · 🟠 **Moderate** — crosses **6–18 months** early · 🔴 **High** — crosses **>18 months** early")
     rows = {}
     for oem in OEM_KEYS:
         try:
@@ -2377,22 +2418,24 @@ elif step == STEPS[16]:
         cols = st.columns(len(rows))
         for col, (oem, r) in zip(cols, rows.items()):
             with col:
-                st.plotly_chart(_risk_pie(oem, r["out_of_risk"], r["at_risk"]), use_container_width=True)
+                st.plotly_chart(_risk_pie_tiered(oem, r), use_container_width=True)
                 st.caption(f"**{r['out_of_risk']} of {r['total']} out of risk** "
-                           f"({100*r['out_of_risk']/max(r['total'],1):.0f}%) · **{r['at_risk']} at-risk** · "
-                           f"EoL {EOL_PCT[oem]}% · warranty {WARRANTY_YR[oem]} yr")
-        tot_out = sum(r["out_of_risk"] for r in rows.values()); tot_risk = sum(r["at_risk"] for r in rows.values())
-        tot = tot_out + tot_risk
+                           f"({100*r['out_of_risk']/max(r['total'],1):.0f}%) · at-risk **{r['at_risk']}** "
+                           f"(🔴 {r['high']} · 🟠 {r['moderate']} · 🟡 {r['low']}) · EoL {EOL_PCT[oem]}% · "
+                           f"warranty {WARRANTY_YR[oem]} yr")
+        agg = {k: sum(r.get(k, 0) for r in rows.values()) for k in ("total", "out_of_risk", "at_risk", "high", "moderate", "low")}
+        tot_out, tot_risk, tot = agg["out_of_risk"], agg["at_risk"], agg["total"]
         st.markdown("#### Whole modeled fleet (Euler + Mahindra + Bajaj + Piaggio)")
         fca, fcb = st.columns([0.42, 0.58], gap="large")
         with fca:
-            st.plotly_chart(_risk_pie("All fleets", tot_out, tot_risk, height=320), use_container_width=True)
+            st.plotly_chart(_risk_pie_tiered("All fleets", agg, height=320), use_container_width=True)
         with fcb:
-            mm = st.columns(2)
-            mm[0].metric("Out of warranty risk", f"{tot_out:,} / {tot:,}", f"{100*tot_out/max(tot,1):.0f}% of modeled fleet", delta_color="off")
-            mm[1].metric("At-risk in warranty", f"{tot_risk:,}", f"{100*tot_risk/max(tot,1):.0f}%", delta_color="off")
+            mm = st.columns(3)
+            mm[0].metric("Out of warranty risk", f"{tot_out:,} / {tot:,}", f"{100*tot_out/max(tot,1):.0f}% of fleet", delta_color="off")
+            mm[1].metric("At-risk (total)", f"{tot_risk:,}", f"{100*tot_risk/max(tot,1):.0f}%", delta_color="off")
+            mm[2].metric("🔴 High-risk", f"{agg['high']:,}", f"{100*agg['high']/max(tot,1):.0f}% — act first", delta_color="off")
             st.dataframe(pd.DataFrame([{"Fleet": o, "Vehicles": r["total"], "Out of risk": r["out_of_risk"],
-                                        "% out of risk": f"{100*r['out_of_risk']/max(r['total'],1):.0f}%",
+                                        "🔴 High": r["high"], "🟠 Moderate": r["moderate"], "🟡 Low": r["low"],
                                         "At-risk": r["at_risk"]} for o, r in rows.items()]).set_index("Fleet"),
                          use_container_width=True)
     if NAT_BAYES is not None:
@@ -2410,6 +2453,7 @@ elif step == STEPS[16]:
                         f"estimate (sample of {n_tot} modeled native vehicles), not a per-vehicle call.")
     concept("This is the number that matters commercially: **the share of the fleet that will *not* trigger a warranty "
             "claim.** Switch **Train on** in the sidebar to see how the training population moves it.")
-    takeaway("Warranty risk here is **time-driven, not mileage-driven** — on these low-utilisation fleets the time "
-             "term almost always binds before the km limit. Caveat: the aged-vehicle SoH artifacts (Step 4) inflate "
-             "the at-risk count, so read these as an **upper bound** until the SoH endpoints are recomputed.")
+    takeaway("The **🔴 High** tier is the one to act on — batteries projected to fail well inside warranty; **🟡 Low** "
+             "ones only dip below the line in the final months and are barely a claim risk. Warranty risk here is "
+             "**time-driven, not mileage-driven** (the time term binds before the km limit on these low-utilisation "
+             "fleets). Caveat: aged-vehicle SoH artifacts (Step 4) inflate the count, so treat it as an **upper bound**.")
