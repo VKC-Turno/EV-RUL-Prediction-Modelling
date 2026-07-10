@@ -114,7 +114,7 @@ DEFAULT_WARRANTY = (5, 120000)
 # the one-warranty-line-per-OEM dashboard views (so config and the dashboard never drift apart again).
 # Euler = HiLoad (3yr, provisional); Mahindra = Treo (3yr); Bajaj = RE E-TEC battery (5yr; km usually binds first).
 FLEET_WARRANTY = {"euler": (3, 80000), "mahindra": (3, 120000), "bajaj": (5, 120000),
-                  "piaggio": (3, 100000)}   # Ape E-Xtra FX; from WARRANTY["piaggio"]
+                  "piaggio": (3, 100000), "montra": (3, 100000)}   # from WARRANTY[oem]
 
 
 def warranty_for(oem, model):
