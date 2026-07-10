@@ -1,0 +1,12 @@
+[
+  {
+    "version": "bajaj_20260710",
+    "trained_at": "2026-07-10T11:38:29",
+    "target": "soh",
+    "n_vehicles": 976,
+    "n_degraders": 932,
+    "overall_rmse": 1.078,
+    "degrading_rmse": 1.395,
+    "persistence_rmse": 1.849
+  }
+]

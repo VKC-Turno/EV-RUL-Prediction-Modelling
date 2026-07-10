@@ -1,0 +1,14 @@
+{
+  "version": "bajaj_20260710",
+  "trained_at": "2026-07-10T11:38:29",
+  "split_sizes": {
+    "train": 585,
+    "validation": 194,
+    "test": 197
+  },
+  "overall_rmse": 1.078,
+  "degrading_rmse": 1.395,
+  "persistence_rmse": 1.849,
+  "n_test_vehicles": 197,
+  "n_forecasts": 704
+}

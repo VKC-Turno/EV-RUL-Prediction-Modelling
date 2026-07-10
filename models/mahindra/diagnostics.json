@@ -1,0 +1,14 @@
+{
+  "version": "mahindra_20260710",
+  "trained_at": "2026-07-10T11:38:21",
+  "split_sizes": {
+    "train": 79,
+    "validation": 26,
+    "test": 29
+  },
+  "overall_rmse": 2.385,
+  "degrading_rmse": 3.34,
+  "persistence_rmse": 2.513,
+  "n_test_vehicles": 29,
+  "n_forecasts": 160
+}

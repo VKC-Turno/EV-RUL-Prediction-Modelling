@@ -1,0 +1,12 @@
+[
+  {
+    "version": "piaggio_20260710",
+    "trained_at": "2026-07-10T11:38:36",
+    "target": "soh",
+    "n_vehicles": 207,
+    "n_degraders": 126,
+    "overall_rmse": 3.317,
+    "degrading_rmse": 3.69,
+    "persistence_rmse": 2.929
+  }
+]

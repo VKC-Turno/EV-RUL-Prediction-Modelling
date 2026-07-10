@@ -179,6 +179,11 @@ def forecaster(oem_key, deg_only=False):
             if b and b.get("traj_model"):
                 return mod, b["traj_model"]
         return mod, mod.train_traj(mod.build_traj_samples(m))
+    if deg_only in (False, "all"):                        # Mahindra/Bajaj/Piaggio: the persisted deployed model
+        import oem_train
+        b = oem_train.load_latest(oem_key.lower())
+        if b and b.get("model"):
+            return mod, b["model"]
     return mod, mod.train_quantiles(mod.build_transitions(m))
 
 
@@ -291,6 +296,10 @@ def all_split_predictions(oem_key, deg_only=False):
         fmodel = _b["traj_model"] if (_b and _b.get("traj_model")) else mod.train_traj(mod.build_traj_samples(train))
     elif euler:
         fmodel = mod.train_traj(mod.build_traj_samples(train))
+    elif deg_only in (False, "all"):                       # Mahindra/Bajaj/Piaggio: persisted deployed model
+        import oem_train
+        _b = oem_train.load_latest(oem_key.lower())
+        fmodel = _b["model"] if (_b and _b.get("model")) else mod.train_quantiles(mod.build_transitions(train))
     else:
         fmodel = mod.train_quantiles(mod.build_transitions(train))
     reg = reg_dates(oem_key); wdef, wmap = warranty_map(oem_key)

@@ -561,10 +561,11 @@ def fitted_soh(gg, anchor=100.0):
     return out
 
 
-def _euler_model_ver():
-    """mtime of the deployed Euler model — used to bust the customer_forecaster cache on redeploy."""
+def _model_ver(oem):
+    """mtime of the deployed model for `oem` — used to bust the customer_forecaster cache on redeploy."""
+    p = "models/euler/latest.pkl" if oem == "Euler" else f"models/{oem.lower()}/latest.pkl"
     try:
-        return os.path.getmtime("models/euler/latest.pkl")
+        return os.path.getmtime(p)
     except Exception:
         return 0.0
 
@@ -612,6 +613,14 @@ def customer_forecaster(oem: str, pop: str = "all", model_ver: float = 0.0):
             except Exception:
                 pass
         return mod, mod.train_traj(mod.build_traj_samples(df))
+    if pop in (False, "all"):                              # Mahindra/Bajaj/Piaggio: deployed persisted model
+        try:
+            import oem_train
+            b = oem_train.load_latest(oem.lower())
+            if b and b.get("model"):
+                return mod, b["model"]
+        except Exception:
+            pass
     return mod, mod.train_quantiles(mod.build_transitions(df))
 
 
@@ -626,7 +635,7 @@ def model_project(oem: str, g, eol: float, horizon: int = 120, pop: str = "all")
     now_age = float(gg["age_months"].iloc[-1]); now_soh = float(gg["soh"].iloc[-1])
     gf = fitted_soh(gg); fit_soh = float(gf["soh"].iloc[-1])       # forecast FROM / anchor ON the smooth trend
     try:
-        mod, fmodel = customer_forecaster(oem, pop, model_ver=_euler_model_ver() if oem == "Euler" else 0.0)
+        mod, fmodel = customer_forecaster(oem, pop, model_ver=_model_ver(oem))
         if oem == "Euler":
             p50 = np.asarray(mod.forecast(gf, fmodel, horizon)[0.5], dtype=float)
         else:
