@@ -61,10 +61,15 @@ def free_run(g, mdl, months):
 
 def build_mahindra():
     m = pd.read_parquet("data/mahindra/features/feature_table.parquet").sort_values(["vin", "month"])
-    tr = model.build_transitions(m)
-    xgbm = xgb.XGBRegressor(n_estimators=300, learning_rate=0.03, max_depth=4, subsample=0.8,
-                            colsample_bytree=0.8, n_jobs=8, verbosity=0).fit(
-        tr[FEATS].to_numpy(), tr["loss"].to_numpy(), sample_weight=tr["w"].to_numpy())
+    import oem_train
+    _b = oem_train.load_latest("mahindra")                 # deployed model (src/oem_train.py): expected-loss regressor
+    if _b and _b.get("model") and _b["model"].get("mean") is not None:
+        xgbm = _b["model"]["mean"]                          # same model.FEATS -> drop-in for free_run
+    else:                                                  # fallback: train fresh on the local feature table
+        tr = model.build_transitions(m)
+        xgbm = xgb.XGBRegressor(n_estimators=300, learning_rate=0.03, max_depth=4, subsample=0.8,
+                                colsample_bytree=0.8, n_jobs=8, verbosity=0).fit(
+            tr[FEATS].to_numpy(), tr["loss"].to_numpy(), sample_weight=tr["w"].to_numpy())
     vmod = dict(pd.read_csv("data/manifests/mahindra_vin_model.csv").values)
     rdf = pd.read_csv("Mh_Regd_Date.csv"); rdf["reg"] = pd.to_datetime(rdf["vehicle_registration_date"], errors="coerce")
     REG = dict(zip(rdf["vin"], rdf["reg"]))
