@@ -1,0 +1,12 @@
+[
+  {
+    "version": "montra_20260710",
+    "trained_at": "2026-07-10T12:53:46",
+    "target": "soh",
+    "n_vehicles": 10,
+    "n_degraders": 0,
+    "overall_rmse": null,
+    "degrading_rmse": null,
+    "persistence_rmse": null
+  }
+]

@@ -106,7 +106,7 @@ WARRANTY = {
     # The 120k-km limit usually binds BEFORE 5yr for high-use vehicles -> use the km-bound effective deadline.
     "bajaj":    [("", (5, 120000))],
     "piaggio":  [("", (3, 100000))],
-    "montra":   [("", (5, 175000))],
+    "montra":   [("", (3, 100000))],   # verified: Super Auto ePV/EPL 2.0 = 3yr/100k (+2yr/50k ext); prior 5yr/175k uncorroborated
 }
 DEFAULT_WARRANTY = (5, 120000)
 

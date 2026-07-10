@@ -29,6 +29,7 @@ CFG = {
     "mahindra": dict(module="model", eol=80.0, warr_yr=3),
     "bajaj": dict(module="bajaj_model", eol=70.0, warr_yr=5),
     "piaggio": dict(module="model", eol=80.0, warr_yr=3),
+    "montra": dict(module="model", eol=80.0, warr_yr=3),   # new OEM, 10-veh POC (~4mo, new fleet -> flat SoH)
 }
 STORE = "data/redshift/{oem}_featengg.parquet"
 DEGRADE_PP = 2.0

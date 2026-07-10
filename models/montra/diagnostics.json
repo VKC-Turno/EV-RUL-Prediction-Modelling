@@ -1,0 +1,9 @@
+{
+  "version": "montra_20260710",
+  "trained_at": "2026-07-10T12:53:46",
+  "split_sizes": {
+    "train": 6,
+    "validation": 2,
+    "test": 2
+  }
+}

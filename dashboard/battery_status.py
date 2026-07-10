@@ -51,14 +51,14 @@ if str(SRC) not in sys.path:
 # ---------------------------------------------------------------------------
 # Per-OEM constants (LFP chemistry across the fleet).
 # ---------------------------------------------------------------------------
-OEMS = ["Euler", "Mahindra", "Bajaj", "Piaggio", "Mahindra Native"]
+OEMS = ["Euler", "Mahindra", "Bajaj", "Piaggio", "Montra", "Mahindra Native"]
 OEM_KEY = {"Euler": "euler", "Mahindra": "mahindra", "Bajaj": "bajaj",
-           "Piaggio": "piaggio", "Mahindra Native": "mahindra_native"}
-EOL = {"Euler": 80.0, "Mahindra": 80.0, "Bajaj": 70.0, "Piaggio": 80.0, "Mahindra Native": 80.0}
-RATED_KM = {"Euler": 120.0, "Mahindra": 80.0, "Bajaj": 178.0, "Piaggio": 110.0, "Mahindra Native": 120.0}
+           "Piaggio": "piaggio", "Montra": "montra", "Mahindra Native": "mahindra_native"}
+EOL = {"Euler": 80.0, "Mahindra": 80.0, "Bajaj": 70.0, "Piaggio": 80.0, "Montra": 80.0, "Mahindra Native": 80.0}
+RATED_KM = {"Euler": 120.0, "Mahindra": 80.0, "Bajaj": 178.0, "Piaggio": 110.0, "Montra": 110.0, "Mahindra Native": 120.0}
 
 _FALLBACK_WARR = {"euler": (3, 80000), "mahindra": (3, 120000), "bajaj": (5, 120000),
-                  "piaggio": (3, 100000), "mahindra_native": (3, 120000)}
+                  "piaggio": (3, 100000), "montra": (3, 100000), "mahindra_native": (3, 120000)}
 try:
     import config as _cfg  # noqa: E402
 
@@ -576,7 +576,7 @@ def _model_ver(oem):
 # so the customer forecast matches the pipeline. Falls back to the √t fit above
 # for vehicles with too little history for the model.
 # ---------------------------------------------------------------------------
-_MODEL_MODULE = {"Euler": "euler_model", "Mahindra": "model", "Bajaj": "bajaj_model", "Piaggio": "model"}
+_MODEL_MODULE = {"Euler": "euler_model", "Mahindra": "model", "Bajaj": "bajaj_model", "Piaggio": "model", "Montra": "model"}
 
 
 # Training populations compared in the Lifespan chart. safe = never observed at/below EoL.
