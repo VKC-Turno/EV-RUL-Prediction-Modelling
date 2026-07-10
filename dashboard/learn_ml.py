@@ -2211,7 +2211,7 @@ elif step == STEPS[14]:
                        "real measured curve. This is the ground truth behind the predicted native fleet curve.")
             demos = NAT_VAL_REP["demos"]
             nvf = make_subplots(rows=1, cols=len(demos), shared_yaxes=True, horizontal_spacing=0.03,
-                                subplot_titles=[f"{d['label']} · {d['km_month']} km/mo · {d['actual_first']:.0f}→{d['actual_last']:.0f}% · band covers {d['band_coverage']*100:.0f}%"
+                                subplot_titles=[f"{d['vin']}<br>{d['label']} · {d['km_month']} km/mo · {d['actual_first']:.0f}→{d['actual_last']:.0f}% · band {d['band_coverage']*100:.0f}%"
                                                 for d in demos])
             for i, d in enumerate(demos, start=1):
                 cv = NAT_VAL_CUR[NAT_VAL_CUR.vin == d["vin"]].sort_values("age")
@@ -2388,7 +2388,7 @@ elif step == STEPS[15]:
                            f"So the *same* model, applied to the native fleet that has no sensor, is reproducing "
                            f"coulomb-grade SoH — not guessing. Three examples:")
             vfig = make_subplots(rows=1, cols=len(VR["demos"]), shared_yaxes=True, horizontal_spacing=0.03,
-                                 subplot_titles=[f"{d['label']} · {d['km_month']} km/mo · {d['actual_first']:.0f}→{d['actual_last']:.0f}% · band covers {d['band_coverage']*100:.0f}%"
+                                 subplot_titles=[f"{d['vin']}<br>{d['label']} · {d['km_month']} km/mo · {d['actual_first']:.0f}→{d['actual_last']:.0f}% · band {d['band_coverage']*100:.0f}%"
                                                  for d in VR["demos"]])
             for i, d in enumerate(VR["demos"], start=1):
                 cv = VC[VC.vin == d["vin"]].sort_values("age"); ac = VA[VA.vin == d["vin"]].sort_values("age")
