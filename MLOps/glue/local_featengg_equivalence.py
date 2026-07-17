@@ -25,13 +25,16 @@ FEAT_COLS = ["ah_throughput", "cur_abs_mean", "soc_mean", "volt_mean", "volt_min
 
 
 def vin_featengg(events: pd.DataFrame, vin: str, reg_date=None):
-    """One vehicle's featengg — the exact body of ef.main(), callable on a DataFrame (the Glue UDF)."""
+    """One vehicle's featengg — features for ALL vehicles; soh null where no usable high-SoC signal.
+
+    Mirrors the Glue job's UDF: monthly_features is the base (always emitted), bms_soh_monthly left-joined."""
     df = ef.load_clean(events)
-    soh = ef.bms_soh_monthly(df)
-    if soh is None:
-        return None
     feat = ef.monthly_features(df)
-    m = soh.merge(feat, on="month", how="inner").sort_values("month")
+    if feat is None or not len(feat):
+        return None
+    soh = ef.bms_soh_monthly(df)
+    m = (feat.merge(soh, on="month", how="left") if soh is not None
+         else feat.assign(soh=np.nan)).sort_values("month")
     if not len(m):
         return None
     base = reg_date if (reg_date is not None and pd.notna(reg_date) and reg_date <= m["month"].iloc[0]) \
@@ -85,7 +88,10 @@ def incremental(events_by_vin, reg):
     return pd.DataFrame(list(table.values())).reset_index(drop=True) if table else pd.DataFrame()
 
 
-def compare(a, b, tol=1e-6, label=""):
+CUM_COLS = ["cum_ah", "cum_km", "km_month"]   # cumulate over ALL months now (fixes labeled-only under-count)
+
+
+def compare(a, b, tol=1e-6, label="", loose=()):
     key = ["vin", "ymd"]
     a = a.sort_values(key).reset_index(drop=True)
     b = b.sort_values(key).reset_index(drop=True)
@@ -100,9 +106,13 @@ def compare(a, b, tol=1e-6, label=""):
         bv = pd.to_numeric(common[f"{c}_b"], errors="coerce").to_numpy()
         d = np.abs(av - bv); d[np.isnan(av) & np.isnan(bv)] = 0.0
         worst[c] = float(np.nanmax(d)) if len(d) else 0.0
-    md = max(worst.values()) if worst else 0.0
-    top = sorted(worst.items(), key=lambda kv: -kv[1])[:4]
-    print(f"  [{label}] rows compared={len(common)}  max abs diff={md:.3e}  worst={[(c, round(v,6)) for c,v in top]}")
+    strict = {c: v for c, v in worst.items() if c not in loose}
+    md = max(strict.values()) if strict else 0.0
+    top = sorted(strict.items(), key=lambda kv: -kv[1])[:4]
+    print(f"  [{label}] rows compared={len(common)}  strict max diff={md:.3e}  worst={[(c, round(v,6)) for c,v in top]}")
+    if loose:
+        loose_d = {c: round(worst.get(c, 0.0), 3) for c in loose}
+        print(f"  [{label}] cumulative cols (expected to differ — all-months vs labeled-only): {loose_d}")
     return md <= tol
 
 
@@ -150,7 +160,8 @@ def main():
         else:
             dep = dep[dep["vin"].isin(events_by_vin)].copy()
             dep["ymd"] = pd.to_datetime(dep["month"]).dt.strftime("%Y-%m-%d")
-            ok_b = compare(b, dep, tol=1e-3, label="port vs euler_features")
+            # per-month features + soh must match exactly; cumulative cols intentionally differ (all-months fix)
+            ok_b = compare(b, dep, tol=1e-3, label="port vs euler_features", loose=CUM_COLS)
     else:
         print("  (feature_table.parquet not found — skipped)")
 

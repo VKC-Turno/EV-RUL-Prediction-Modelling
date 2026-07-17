@@ -1,20 +1,29 @@
 """Euler feature-engineering — OUR methodology on the incremental Glue/Iceberg architecture.
 
 Ports the preprocessing job to Turno's own SoH/feature logic while keeping the third party's MLOps
-architecture (incremental read, Iceberg MERGE, cost-bounded, SageMaker-ready outputs). "All logic is ours":
-the per-vehicle work calls src/euler_features.py directly (load_clean / bms_soh_monthly / monthly_features)
-via applyInPandas — the SAME functions our models + dashboards already consume, so there is no second
-implementation to drift. Output = our deployed 25-column monthly featengg (base SoH = bms_capacity ->
-isotonic; the recovery-aware clean label / hybrid target / coulomb gate stay in the SageMaker layer).
+architecture (incremental read, Iceberg MERGE, cost-bounded). "All logic is ours": the per-vehicle work
+calls src/euler_features.py directly (load_clean / bms_soh_monthly / monthly_features) via applyInPandas —
+the same functions our models + dashboards consume, so there is no second implementation to drift.
+
+SEPARATION OF CONCERNS (deliberate):
+  * Feature engineering runs for ALL vehicles. Features are always emitted; `soh` (our BMS-capacity label)
+    is null where a vehicle lacks a usable high-SoC signal — a missing LABEL never drops a vehicle's FEATURES.
+  * The job's ONLY output is the `euler_featengg` feature store (one row per vin-month). It does NOT emit a
+    "training set" or an "inference set" — which vehicles/rows are used for training vs inference is a
+    point-in-time SELECTION made downstream (SageMaker training / serving), so a retrain a year later picks
+    the then-current, in-service cohort without any change here. The train/val/test split + cohort gate live
+    in the training step (src/oem_train.py::_split + data_quality.apply_quality), not in feature generation.
+
+Output = our deployed 25-col monthly featengg (base SoH = bms_capacity -> isotonic; the recovery-aware clean
+label / hybrid target / coulomb gate stay in the SageMaker layer).
 
 Validated offline (no Glue/S3) by MLOps/glue/local_featengg_equivalence.py:
-  incremental == batch  AND  == data/euler/features/feature_table.parquet  (both 0.0 diff on local data).
+  incremental == batch, and == data/euler/features/feature_table.parquet on labelled rows (both 0.0 diff).
 
 Cost model: incremental at ingest (only the new day's raw is parsed + appended). featengg is recomputed for
-TOUCHED vehicles only, over their full clean-event history read back from a durable Iceberg store (cheap
-columnar, not tiny S3 files). Our SoH uses a per-vehicle adaptive capacity window + isotonic fit + first-6-
-months baseline, which are not additively-incremental, so the touched-vehicle recompute is the exact-correct
-floor (see README for the optional monthly-capacity optimisation).
+TOUCHED vehicles only, over their full clean-event history read from a durable Iceberg store (cheap columnar,
+not tiny S3 files). Our SoH uses a per-vehicle adaptive window + isotonic + first-6-months baseline, which are
+not additively-incremental, so the touched-vehicle recompute is the exact-correct floor (see README).
 
 REQUIRED JOB PARAMETERS (besides --JOB_NAME):
     --datalake-formats            iceberg
@@ -26,7 +35,7 @@ REQUIRED JOB PARAMETERS (besides --JOB_NAME):
             --conf spark.sql.catalog.glue_catalog.catalog-impl=org.apache.iceberg.aws.glue.GlueCatalog
             --conf spark.sql.catalog.glue_catalog.warehouse=s3://rcs-mlops-data/iceberg/
             --conf spark.sql.catalog.glue_catalog.io-impl=org.apache.iceberg.aws.s3.S3FileIO
-OPTIONAL: --raw_bucket --warehouse --training_output --inference_output --reg_table --emit_training_snapshot
+OPTIONAL: --raw_bucket --warehouse --reg_table
 """
 import sys
 from datetime import datetime
@@ -39,12 +48,8 @@ from pyspark.sql.utils import AnalysisException
 from pyspark.sql import functions as F
 from pyspark.sql.types import StructType, StructField, StringType, DoubleType, LongType
 
-ARG_KEYS = ["JOB_NAME", "process_date", "raw_bucket", "warehouse", "training_output",
-            "inference_output", "reg_table", "emit_training_snapshot"]
-_defaults = dict(raw_bucket="oem-iot-data", warehouse="s3://rcs-mlops-data/iceberg/",
-                 training_output="s3://rcs-mlops-data/training/euler/",
-                 inference_output="s3://rcs-mlops-data/inference_input/euler/latest/",
-                 reg_table="", emit_training_snapshot="false")
+ARG_KEYS = ["JOB_NAME", "process_date", "raw_bucket", "warehouse", "reg_table"]
+_defaults = dict(raw_bucket="oem-iot-data", warehouse="s3://rcs-mlops-data/iceberg/", reg_table="")
 _present = [k for k in ARG_KEYS if f"--{k}" in sys.argv]
 args = getResolvedOptions(sys.argv, _present)
 for k, v in _defaults.items():
@@ -61,18 +66,15 @@ job.init(args["JOB_NAME"], args)
 
 OEM, CATALOG, DB = "euler", "glue_catalog", "turno_ml"
 EVENTS_TABLE = f"{CATALOG}.{DB}.{OEM}_clean_events"
-FEATENGG_TABLE = f"{CATALOG}.{DB}.{OEM}_featengg"
-LATEST_TABLE = f"{CATALOG}.{DB}.{OEM}_latest"
+FEATENGG_TABLE = f"{CATALOG}.{DB}.{OEM}_featengg"           # the ONLY output: the feature store
 PROCESS_DATE = datetime.strptime(args["process_date"], "%Y-%m-%d").date()
-EMIT_SNAPSHOT = args["emit_training_snapshot"].lower() == "true"
 
 for k, v in {f"spark.sql.catalog.{CATALOG}": "org.apache.iceberg.spark.SparkCatalog",
              f"spark.sql.catalog.{CATALOG}.catalog-impl": "org.apache.iceberg.aws.glue.GlueCatalog",
              f"spark.sql.catalog.{CATALOG}.warehouse": args["warehouse"],
              f"spark.sql.catalog.{CATALOG}.io-impl": "org.apache.iceberg.aws.s3.S3FileIO",
              "spark.sql.shuffle.partitions": "64", "spark.sql.adaptive.enabled": "true",
-             "spark.sql.adaptive.coalescePartitions.enabled": "true",
-             "spark.sql.sources.partitionOverwriteMode": "dynamic"}.items():
+             "spark.sql.adaptive.coalescePartitions.enabled": "true"}.items():
     spark.conf.set(k, v)
 
 # our raw feed uses lowercase names; euler_features.py expects camelCase
@@ -83,7 +85,6 @@ RENAME = {"batterysoc": "batterySoc", "batterysoh": "batterySoh",
 NEEDED = ["vin", "eventAt", "batterySoc", "batterySoh", "batteryRemainingCapacity", "batteryCurrent",
           "batteryVoltage", "batteryTemperature", "cellImbalance", "odometer"]
 
-# featengg output schema (our deployed 25 columns) for applyInPandas
 FEATENGG_SCHEMA = StructType([
     StructField("vin", StringType()), StructField("ymd", StringType()), StructField("soh", DoubleType()),
     StructField("ah_throughput", DoubleType()), StructField("cur_abs_mean", DoubleType()),
@@ -99,28 +100,30 @@ FEATENGG_SCHEMA = StructType([
     StructField("cum_ah", DoubleType()), StructField("cum_km", DoubleType()),
 ])
 OUT_COLS = [f.name for f in FEATENGG_SCHEMA.fields]
+REQ = ("batterySoc", "batterySoh", "batteryRemainingCapacity", "batteryCurrent",
+       "batteryVoltage", "batteryTemperature", "cellImbalance", "odometer")
 
 
 def vin_featengg(pdf):
-    """applyInPandas UDF — one vehicle's full clean-event history -> its monthly featengg rows.
-
-    Calls OUR functions verbatim (euler_features.load_clean / bms_soh_monthly / monthly_features); this is
-    exactly ef.main()'s per-vehicle body. Empty frame if the vehicle lacks enough high-SoC capacity data.
-    """
+    """applyInPandas UDF — one vehicle's full clean-event history -> its monthly featengg rows, for ALL
+    vehicles. Calls OUR functions (euler_features). FEATURES are always emitted; `soh` is null when the
+    BMS-capacity method has no usable high-SoC signal for this vehicle (a missing label never drops it)."""
     import numpy as np
     import pandas as pd
     import euler_features as ef            # our module (shipped via --extra-py-files)
 
     vin = str(pdf["vin"].iloc[0])
     reg = pd.to_datetime(pdf["reg_date"].iloc[0]) if "reg_date" in pdf and pdf["reg_date"].notna().any() else None
+    for c in REQ:                          # some vehicles/feeds lack a channel -> keep the column, values null
+        if c not in pdf.columns:
+            pdf[c] = np.nan
     df = ef.load_clean(pdf)
-    soh = ef.bms_soh_monthly(df)
-    if soh is None:
+    feat = ef.monthly_features(df)         # the base: features for every vehicle-month
+    if feat is None or not len(feat):
         return pd.DataFrame(columns=OUT_COLS)
-    feat = ef.monthly_features(df)
-    m = soh.merge(feat, on="month", how="inner").sort_values("month")
-    if not len(m):
-        return pd.DataFrame(columns=OUT_COLS)
+    soh = ef.bms_soh_monthly(df)           # our base SoH label; None when no usable high-SoC capacity signal
+    m = feat.merge(soh, on="month", how="left") if soh is not None else feat.assign(soh=np.nan)
+    m = m.sort_values("month")
     base = reg if (reg is not None and pd.notna(reg) and reg <= m["month"].iloc[0]) else m["month"].iloc[0]
     m["age_months"] = ((m["month"] - base).dt.days / 30.4).round(1)
     m["cur_chg_mean"] = m["cur_chg_mean"].fillna(0.0)
@@ -133,11 +136,11 @@ def vin_featengg(pdf):
     for c in OUT_COLS:
         if c not in m.columns:
             m[c] = np.nan
-    m["n_rows"] = m["n_rows"].astype("int64")
+    m["n_rows"] = pd.to_numeric(m["n_rows"], errors="coerce").fillna(0).astype("int64")
     return m[OUT_COLS]
 
 
-def ensure_table(df, table, partition=None, keys=None):
+def ensure_table(df, table, partition=None):
     if not spark.catalog.tableExists(table):
         spark.sql(f"CREATE NAMESPACE IF NOT EXISTS {CATALOG}.{DB}")
         w = (df.limit(0).writeTo(table).using("iceberg")
@@ -180,6 +183,8 @@ merge_upsert(events, EVENTS_TABLE, keys=["vin", "eventAt"])
 logger.info(f"MERGED new-day events into {EVENTS_TABLE}")
 
 # ── 2) recompute featengg for TOUCHED vehicles over their full clean-event history ────────
+# (touched-only = which vehicles get RECOMPUTED this run; every reporting vehicle is covered over time.
+#  No vehicle is dropped for lacking SoH — features are emitted for all; soh is null where unavailable.)
 touched = events.select("vin").distinct()
 hist = spark.table(EVENTS_TABLE).join(F.broadcast(touched), "vin")
 if args["reg_table"]:
@@ -190,25 +195,10 @@ else:
 
 featengg = hist.groupBy("vin").applyInPandas(vin_featengg, schema=FEATENGG_SCHEMA)
 featengg = featengg.filter(F.col("ymd").isNotNull())
-ensure_table(featengg, FEATENGG_TABLE, partition=None)   # ymd is a string; partition left flat (small table)
+ensure_table(featengg, FEATENGG_TABLE)
 merge_upsert(featengg, FEATENGG_TABLE, keys=["vin", "ymd"])
-logger.info(f"MERGED featengg into {FEATENGG_TABLE}")
+logger.info(f"MERGED featengg into {FEATENGG_TABLE} (feature store — all vehicles, soh nullable)")
 
-# ── 3) inference: latest month per touched vehicle -> euler_latest ────────────────────────
-from pyspark.sql.window import Window
-w = Window.partitionBy("vin").orderBy(F.col("ymd").desc())
-latest = (spark.table(FEATENGG_TABLE).join(F.broadcast(touched), "vin")
-          .withColumn("_rn", F.row_number().over(w)).filter(F.col("_rn") == 1).drop("_rn"))
-ensure_table(latest, LATEST_TABLE)
-merge_upsert(latest, LATEST_TABLE, keys=["vin"])
-(latest.repartition("vin").write.mode("overwrite").partitionBy("vin")
-       .option("compression", "gzip").json(args["inference_output"]))
-logger.info(f"inference latest upserted + written to {args['inference_output']}")
-
-# ── 4) training snapshot (on demand only) ─────────────────────────────────────────────────
-if EMIT_SNAPSHOT:
-    (spark.table(FEATENGG_TABLE).write.mode("overwrite")
-        .option("maxRecordsPerFile", 500000).parquet(args["training_output"]))
-    logger.info(f"training snapshot exported to {args['training_output']}")
-
+# Downstream (NOT here): the SageMaker training step selects the cohort from euler_featengg at run time
+# (in-service + labelled + data-quality gate) and does the train/val/test split; serving reads latest-per-vin.
 job.commit()

@@ -21,16 +21,28 @@ and dashboards already consume, so there is no second implementation to drift. O
 **25-column monthly featengg** (`vin, ymd, soh, ah_throughput, cur_abs_mean, …, cum_ah, cum_km`), with
 `soh` = BMS remaining-capacity → isotonic.
 
+### Separation of concerns (why there's no train/inference output)
+Feature engineering runs for **all vehicles** — features are always emitted; `soh` (our label) is simply
+**null where a vehicle has no usable high-SoC signal**. A missing label never drops a vehicle's features.
+The job's **only output is the `euler_featengg` feature store** (one row per vin-month). It does **not**
+materialise a "training set" or an "inference set": *which* vehicles/rows are used for training vs serving is
+a **point-in-time selection made downstream** (SageMaker training / serving), so a retrain a year later picks
+the then-current, in-service, sufficiently-labelled cohort **without any change here**. The train/val/test
+split + cohort gate live in the training step (`src/oem_train.py::_split` + `data_quality.apply_quality`).
+
 ### What each run does
 1. Read **only** the new day's raw partition (`--process_date`); skip if absent. Rename the raw lowercase
    columns to the camelCase our module expects.
 2. `MERGE` the day's events into Iceberg **`euler_clean_events`** (idempotent on `(vin, eventAt)`).
-3. For **touched** vehicles: read their full clean-event history back from `euler_clean_events`, run our
-   `vin_featengg` per vehicle (`groupBy("vin").applyInPandas`), and `MERGE` into **`euler_featengg`** on
-   `(vin, ymd)`.
-4. `euler_latest`: latest month per touched vehicle → `MERGE` (+ JSON, dynamic partition overwrite) for
-   inference.
-5. Training snapshot only with `--emit_training_snapshot=true`; otherwise consumers read `euler_featengg`.
+3. For **touched** vehicles (those reporting that day), read their full clean-event history back from
+   `euler_clean_events`, run our `vin_featengg` per vehicle (`groupBy("vin").applyInPandas`), and `MERGE`
+   into **`euler_featengg`** on `(vin, ymd)`. Touched-only = which vehicles get *recomputed* this run; every
+   reporting vehicle is covered over time, and none is dropped for lacking a label.
+
+> **Cumulative features fixed:** because FE now runs over all months, `cum_ah` / `cum_km` / `km_month`
+> cumulate across *every* month. The old labeled-only assembly (inner-join in `euler_features.main()`) skipped
+> months without a SoH reading and thus **under-counted** throughput/distance — the feature store corrects
+> this. (Per-month features + `soh` are byte-identical to `euler_features`; see the offline check.)
 
 ### Cost model (honest)
 Incremental at ingest — only the new day's raw is parsed and appended. featengg is recomputed for **touched
@@ -47,7 +59,7 @@ events; adds a second table and a small approximation window. Ship the exact ver
 - `--additional-python-modules scikit-learn` (`bms_soh_monthly` uses `IsotonicRegression`)
 - `--extra-py-files s3://…/euler_features.py` — our module, importable on the executors
 - `--process_date`, the Iceberg catalog `--conf`s, optional `--reg_table` (for exact `age_months`),
-  `--emit_training_snapshot`, `--raw_bucket`, `--warehouse`, `--training_output`, `--inference_output`
+  `--raw_bucket`, `--warehouse`
 - Enable **Glue Flex** (spare-capacity pricing) — non-SLA daily batch.
 
 > `src/euler_features.py` does an `os.chdir` at import (harmless here — we call only the pure functions,
@@ -61,8 +73,9 @@ events; adds a second table and a small approximation window. Ship the exact ver
 Both are validated against **local `data/euler/`** only — never a Glue run or an S3 scan.
 
 - **`local_featengg_equivalence.py`** (our-methodology port) — proves, using our *actual* `euler_features`
-  functions, that **incremental == batch** *and* the output **== `data/euler/features/feature_table.parquet`**.
-  Latest run: 3 vehicles, 84 rows, **both 0.0 diff, PASS**.
+  functions, that **incremental == batch** (0.0), and that per-month features + `soh` **== `feature_table.parquet`**
+  (0.0 on labelled rows). Cumulative cols (`cum_ah`/`cum_km`/`km_month`) differ *by design* — the all-months
+  fix above. Latest run: 3 vehicles, 122 rows, **PASS**.
 - **`local_equivalence_check.py`** (as-received job) — proves incremental == batch for the third party's logic.
 
 ```bash
