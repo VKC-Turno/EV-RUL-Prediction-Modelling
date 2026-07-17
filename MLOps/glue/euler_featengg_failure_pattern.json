@@ -1,0 +1,8 @@
+{
+  "source": ["aws.glue"],
+  "detail-type": ["Glue Job State Change"],
+  "detail": {
+    "jobName": ["euler-featengg-incremental"],
+    "state": ["FAILED", "TIMEOUT"]
+  }
+}

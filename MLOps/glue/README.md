@@ -179,8 +179,12 @@ unit-tested offline:
 .venv/bin/python MLOps/glue/local_catchup_check.py
 ```
 
-Remaining gaps (not yet done): **per-vehicle error isolation** (one bad vehicle's UDF still fails the run) and
-a **failure alarm** (EventBridge on Glue `FAILED` → SNS) so a run that exhausts retries isn't silent.
+**Per-vehicle isolation:** both `applyInPandas` UDFs wrap their body in try/except — a data error in one
+`(vin, month)` / vehicle is logged to the executor stderr (`[SKIP monthly] …` / `[SKIP featengg] …`) and
+skipped, so **one bad vehicle can't fail the whole run**. Systemic errors (e.g. a failed `import
+euler_features`) are left to propagate — they *should* fail the run, not silently skip every vehicle. A
+driver-side safety net **fails the run loudly if 0 of N touched vehicles produced any rows** (so a systemic
+failure can't masquerade as a silent empty run), and logs a warning for a partial shortfall.
 
 ## Logs & run history
 
@@ -195,6 +199,30 @@ The job hasn't been executed yet (validated offline only). When it runs, logs/me
   History Server.
 - **Observability metrics** — `--enable-observability-metrics` publishes to CloudWatch
   (`Glue/Observability`) for skew/OOM/throughput dashboards.
+
+### Alerting on failure
+
+So a run that exhausts retries (or the driver-side safety net) isn't silent, wire an **EventBridge rule** on
+Glue job failure → **SNS**. The event pattern is in `euler_featengg_failure_pattern.json`:
+
+```bash
+# SNS topic + subscription (email / Slack / PagerDuty via a Lambda)
+TOPIC=$(aws sns create-topic --name euler-featengg-alerts --query TopicArn --output text)
+aws sns subscribe --topic-arn "$TOPIC" --protocol email --notification-endpoint battery.product@turno.club
+
+# rule: FAILED/TIMEOUT for this job -> SNS
+aws events put-rule --name euler-featengg-failed \
+  --event-pattern file://MLOps/glue/euler_featengg_failure_pattern.json
+aws events put-targets --rule euler-featengg-failed --targets "Id=1,Arn=$TOPIC"
+
+# let EventBridge publish to the topic
+aws sns set-topic-attributes --topic-arn "$TOPIC" --attribute-name Policy --attribute-value '{
+  "Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"Service":"events.amazonaws.com"},
+  "Action":"sns:Publish","Resource":"'"$TOPIC"'"}]}'
+```
+
+The job also `raise`s (→ run `FAILED`) if a systemic failure produced zero rows, so that case triggers this
+alarm too rather than committing an empty feature store.
 
 Generalises to the other OEMs by swapping the per-vehicle module (each OEM's `*_features` / SoH method) —
 same registry idea as `../model-build/pipelines/common/config.py`.

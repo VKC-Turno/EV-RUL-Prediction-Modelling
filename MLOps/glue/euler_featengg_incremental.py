@@ -111,61 +111,82 @@ FEATENGG_COLS = [f.name for f in FEATENGG_SCHEMA.fields]
 
 def monthly_udf(pdf):
     """STAGE B — one (vin, month)'s events -> a euler_monthly row: month-local features + this month's
-    high-SoC full_cap samples. Calls our euler_features.monthly_features / hi_full_cap verbatim."""
+    high-SoC full_cap samples. Calls our euler_features.monthly_features / hi_full_cap verbatim.
+
+    Per-vehicle isolation: a data error in ONE (vin, month) is logged to the executor stderr and skipped
+    (empty row) so it can't fail the whole run. Systemic errors (the `import euler_features` below) are left
+    to propagate — those SHOULD fail the run loudly, not silently skip every vehicle."""
+    import sys
+    import traceback
     import numpy as np
     import pandas as pd
-    import euler_features as ef
-    vin = str(pdf["vin"].iloc[0])
-    for c in REQ:
-        if c not in pdf.columns:
-            pdf[c] = np.nan
-    df = ef.load_clean(pdf)
-    feat = ef.monthly_features(df)
-    if feat is None or not len(feat):
+    import euler_features as ef                       # systemic: propagates -> run fails (intended)
+    try:
+        vin = str(pdf["vin"].iloc[0])
+        for c in REQ:
+            if c not in pdf.columns:
+                pdf[c] = np.nan
+        df = ef.load_clean(pdf)
+        feat = ef.monthly_features(df)
+        if feat is None or not len(feat):
+            return pd.DataFrame(columns=MONTHLY_COLS)
+        row = feat.iloc[[0]].copy()
+        row["vin"] = vin
+        row["fullcap_hi"] = [ef.hi_full_cap(df)["full_cap"].astype(float).tolist()]
+        for c in MONTHLY_COLS:
+            if c not in row.columns:
+                row[c] = np.nan
+        row["n_rows"] = pd.to_numeric(row["n_rows"], errors="coerce").fillna(0).astype("int64")
+        return row[MONTHLY_COLS]
+    except Exception as exc:                          # per-(vin,month) isolation
+        v = str(pdf["vin"].iloc[0]) if len(pdf) else "?"
+        mo = str(pdf["month"].iloc[0]) if "month" in pdf.columns and len(pdf) else "?"
+        print(f"[SKIP monthly] vin={v} month={mo}: {exc}\n{traceback.format_exc()}", file=sys.stderr)
         return pd.DataFrame(columns=MONTHLY_COLS)
-    row = feat.iloc[[0]].copy()
-    row["vin"] = vin
-    row["fullcap_hi"] = [ef.hi_full_cap(df)["full_cap"].astype(float).tolist()]
-    for c in MONTHLY_COLS:
-        if c not in row.columns:
-            row[c] = np.nan
-    row["n_rows"] = pd.to_numeric(row["n_rows"], errors="coerce").fillna(0).astype("int64")
-    return row[MONTHLY_COLS]
 
 
 def featengg_udf(pdf):
     """STAGE C — one vehicle's euler_monthly rows -> its featengg. Recomputes the CROSS-month SoH from the
     persisted per-month samples (euler_features.soh_from_hi_full_cap) + the cumulative/age assembly. Features
-    are emitted for all vehicles; soh is null where there is no usable high-SoC signal."""
+    are emitted for all vehicles; soh is null where there is no usable high-SoC signal.
+
+    Per-vehicle isolation: a data error in ONE vehicle is logged + skipped; systemic import errors propagate."""
+    import sys
+    import traceback
     import numpy as np
     import pandas as pd
-    import euler_features as ef
-    vin = str(pdf["vin"].iloc[0])
-    reg = pd.to_datetime(pdf["reg_date"].iloc[0]) if "reg_date" in pdf and pdf["reg_date"].notna().any() else None
-    mon = pdf.sort_values("month").reset_index(drop=True)
-    parts = [pd.DataFrame({"month": r["month"], "full_cap": r["fullcap_hi"]})
-             for _, r in mon.iterrows() if r["fullcap_hi"] is not None and len(r["fullcap_hi"])]
-    hi_all = pd.concat(parts, ignore_index=True) if parts else pd.DataFrame(columns=["month", "full_cap"])
-    soh = ef.soh_from_hi_full_cap(hi_all)
-    m = mon.drop(columns=["fullcap_hi"])
-    m = m.merge(soh, on="month", how="left") if soh is not None else m.assign(soh=np.nan)
-    m = m.sort_values("month")
-    if not len(m):
+    import euler_features as ef                       # systemic: propagates -> run fails (intended)
+    try:
+        vin = str(pdf["vin"].iloc[0])
+        reg = pd.to_datetime(pdf["reg_date"].iloc[0]) if "reg_date" in pdf and pdf["reg_date"].notna().any() else None
+        mon = pdf.sort_values("month").reset_index(drop=True)
+        parts = [pd.DataFrame({"month": r["month"], "full_cap": r["fullcap_hi"]})
+                 for _, r in mon.iterrows() if r["fullcap_hi"] is not None and len(r["fullcap_hi"])]
+        hi_all = pd.concat(parts, ignore_index=True) if parts else pd.DataFrame(columns=["month", "full_cap"])
+        soh = ef.soh_from_hi_full_cap(hi_all)
+        m = mon.drop(columns=["fullcap_hi"])
+        m = m.merge(soh, on="month", how="left") if soh is not None else m.assign(soh=np.nan)
+        m = m.sort_values("month")
+        if not len(m):
+            return pd.DataFrame(columns=FEATENGG_COLS)
+        base = reg if (reg is not None and pd.notna(reg) and reg <= m["month"].iloc[0]) else m["month"].iloc[0]
+        m["age_months"] = ((m["month"] - base).dt.days / 30.4).round(1)
+        m["cur_chg_mean"] = m["cur_chg_mean"].fillna(0.0)
+        m["cur_dis_mean"] = m["cur_dis_mean"].fillna(0.0)
+        m["km_month"] = m["odo_max"].diff().clip(lower=0).fillna(0.0)
+        m["cum_ah"] = m["ah_throughput"].cumsum()
+        m["cum_km"] = m["km_month"].cumsum()
+        m["vin"] = vin
+        m["ymd"] = pd.to_datetime(m["month"]).dt.strftime("%Y-%m-%d")
+        for c in FEATENGG_COLS:
+            if c not in m.columns:
+                m[c] = np.nan
+        m["n_rows"] = pd.to_numeric(m["n_rows"], errors="coerce").fillna(0).astype("int64")
+        return m[FEATENGG_COLS]
+    except Exception as exc:                          # per-vehicle isolation
+        v = str(pdf["vin"].iloc[0]) if len(pdf) else "?"
+        print(f"[SKIP featengg] vin={v}: {exc}\n{traceback.format_exc()}", file=sys.stderr)
         return pd.DataFrame(columns=FEATENGG_COLS)
-    base = reg if (reg is not None and pd.notna(reg) and reg <= m["month"].iloc[0]) else m["month"].iloc[0]
-    m["age_months"] = ((m["month"] - base).dt.days / 30.4).round(1)
-    m["cur_chg_mean"] = m["cur_chg_mean"].fillna(0.0)
-    m["cur_dis_mean"] = m["cur_dis_mean"].fillna(0.0)
-    m["km_month"] = m["odo_max"].diff().clip(lower=0).fillna(0.0)
-    m["cum_ah"] = m["ah_throughput"].cumsum()
-    m["cum_km"] = m["km_month"].cumsum()
-    m["vin"] = vin
-    m["ymd"] = pd.to_datetime(m["month"]).dt.strftime("%Y-%m-%d")
-    for c in FEATENGG_COLS:
-        if c not in m.columns:
-            m[c] = np.nan
-    m["n_rows"] = pd.to_numeric(m["n_rows"], errors="coerce").fillna(0).astype("int64")
-    return m[FEATENGG_COLS]
 
 
 def ensure_table(df, table, partition=None):
@@ -237,7 +258,8 @@ ensure_table(events, EVENTS_TABLE, partition="month")
 merge_upsert(events, EVENTS_TABLE, keys=["vin", "eventAt", "month"])   # +month -> prune the MERGE target
 logger.info(f"MERGED events for {len(present)} day(s) into {EVENTS_TABLE}")
 
-touched = events.select("vin").distinct()
+touched = events.select("vin").distinct().persist()
+n_touched = touched.count()
 affected_months = [r["month"] for r in events.select("month").distinct().collect()]
 
 # ── STAGE B: recompute euler_monthly for AFFECTED (vin, month) — read month-PRUNED (no full raw scan) ──
@@ -255,16 +277,28 @@ if args["reg_table"]:
     hist = hist.join(F.broadcast(reg), "vin", "left")
 else:
     hist = hist.withColumn("reg_date", F.lit(None).cast("timestamp"))
-featengg = hist.groupBy("vin").applyInPandas(featengg_udf, schema=FEATENGG_SCHEMA)
-featengg = featengg.filter(F.col("ymd").isNotNull())
+featengg = (hist.groupBy("vin").applyInPandas(featengg_udf, schema=FEATENGG_SCHEMA)
+            .filter(F.col("ymd").isNotNull()).persist())
+n_out = featengg.select("vin").distinct().count()
+# safety net: per-vehicle isolation must not mask a SYSTEMIC failure as a silent empty run. If every touched
+# vehicle produced nothing, fail loudly (-> run FAILED -> the failure alarm fires) instead of committing empty.
+if n_touched > 0 and n_out == 0:
+    featengg.unpersist(); touched.unpersist()
+    raise RuntimeError(f"featengg produced 0 rows from {n_touched} touched vehicles — likely systemic "
+                       f"(check executor logs for [SKIP] lines). Failing loudly so the alarm fires.")
+if n_out < n_touched:
+    logger.warn(f"{n_touched - n_out} of {n_touched} touched vehicles produced no featengg rows "
+                f"(per-vehicle [SKIP] in executor logs, or genuinely no valid events)")
 ensure_table(featengg, FEATENGG_TABLE, partition="month")
 merge_upsert(featengg, FEATENGG_TABLE, keys=["vin", "ymd", "month"])
-logger.info(f"MERGED featengg into {FEATENGG_TABLE} (feature store — all vehicles, soh nullable)")
+logger.info(f"MERGED featengg for {n_out}/{n_touched} vehicles into {FEATENGG_TABLE} (all vehicles, soh nullable)")
+featengg.unpersist()
 
 # ── advance the watermark only after a successful featengg MERGE and only if the target day was present
 if plan["advance_to"] is not None and PROCESS_DATE in present:
     write_watermark(PROCESS_DATE)
     logger.info(f"watermark advanced to {PROCESS_DATE}")
+touched.unpersist()
 
 # Downstream (NOT here): SageMaker training selects the cohort from euler_featengg at run time and does the
 # train/val/test split; serving reads latest-per-vin. The 25 deployed columns are FEATENGG_COLS minus `month`.
