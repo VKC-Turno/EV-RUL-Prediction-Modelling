@@ -43,8 +43,8 @@ from pyspark.sql.utils import AnalysisException
 from pyspark.sql.window import Window
 from pyspark.sql.functions import (
     col, lit, when, trim, from_unixtime, to_timestamp, to_date, year, month, dayofmonth,
-    hex, lag, lead, avg, min, max, stddev, sum, count, abs, datediff, unix_timestamp,
-    broadcast, months, struct,
+    hex, lag, lead, avg, min, max, sum, count, abs, datediff, unix_timestamp,
+    broadcast, months, struct, row_number,
 )
 
 ############################################################
@@ -82,8 +82,7 @@ FEATURES_TABLE = f"{CATALOG}.{DB}.{OEM}_features_daily"
 LATEST_TABLE = f"{CATALOG}.{DB}.{OEM}_latest"
 
 PROCESS_DATE = datetime.strptime(args["process_date"], "%Y-%m-%d").date()
-ROLL_DAYS = int(args["rolling_window_days"])
-ROLL_START = str(PROCESS_DATE - timedelta(days=ROLL_DAYS - 1))
+ROLL_DAYS = int(args["rolling_window_days"])   # trailing N daily ROWS (rows-based, matches prototype .rolling(N))
 EMIT_SNAPSHOT = args["emit_training_snapshot"].lower() == "true"
 
 spark.conf.set(f"spark.sql.catalog.{CATALOG}", "org.apache.iceberg.spark.SparkCatalog")
@@ -255,12 +254,14 @@ logger.info(f"MERGED vin stats into {STATS_TABLE}")
 
 ############################################################
 # FEATURES : today's per-date derived row (touched vins) -> euler_features_daily
-# Expanding features come from `stats` (as-of-today); rolling features from a bounded N-day window.
+# Expanding features come from `stats` (as-of-today); rolling features from the last N daily ROWS per vin
+# (rows-based, matching the prototype's .rolling(N) — correct for gappy vehicles that don't report daily).
 # Historical rows are immutable and untouched -> the MERGE only writes the current-month partition.
 ############################################################
 
+_recent_w = Window.partitionBy("vin").orderBy(col("event_date").desc())
 rolling = (spark.table(DAILY_TABLE).join(broadcast(touched), "vin")
-           .filter(col("event_date").between(lit(ROLL_START), lit(str(PROCESS_DATE))))
+           .withColumn("_rn", row_number().over(_recent_w)).filter(col("_rn") <= ROLL_DAYS)
            .groupBy("vin").agg(
                sum("high_temp_exposure_minutes").alias("rolling_temperature_exposure"),
                avg("estimated_cycle_count").alias("rolling_cycle_count")))

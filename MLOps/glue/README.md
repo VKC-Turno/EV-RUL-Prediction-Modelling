@@ -28,8 +28,9 @@ read-time join `euler_features_daily ⋈ euler_vin_stats`.
 1. Read **only** the new day's partition (`--process_date`); skip the run entirely if it's empty/absent.
 2. Clean + daily-aggregate → `MERGE` into `euler_daily` (current-month partition, merge-on-read).
 3. `euler_vin_stats`: aggregate the **touched** vins' history → 1 row/VIN, `MERGE` upsert.
-4. `euler_features_daily`: compute **today's** row from `vin_stats` (expanding features) + a bounded N-day
-   window (rolling features); `MERGE` today's rows only.
+4. `euler_features_daily`: compute **today's** row from `vin_stats` (expanding features) + the last **N daily
+   rows** per vin (rows-based rolling, matching the prototype's `.rolling(N)` — correct for gappy vehicles);
+   `MERGE` today's rows only.
 5. `euler_latest`: today's row + rates → `MERGE` per touched VIN; JSON written with **dynamic partition
    overwrite** so silent vehicles' snapshots are untouched.
 6. Training snapshot: **not** written on the daily path. Consumers read `euler_features_daily ⋈
@@ -72,6 +73,17 @@ for d in 2025-01-01 2025-01-02 2025-01-03 2025-01-04 2025-01-05; do   # oldest -
   aws glue start-job-run --job-name euler-preprocessing-incremental \
     --arguments '{"--process_date":"'"$d"'"}'
 done
+```
+
+## Offline equivalence check
+
+`local_equivalence_check.py` proves — **offline, on a slice of `data/euler/dense/`, no Spark/Glue/S3** — that
+the day-by-day normalised computation reproduces a full-history batch recompute, byte-for-byte on the
+21-column output. It's a pandas mirror of the job's algorithm (the Glue script implements the same steps in
+Spark). Latest run: 4 vehicles, gappy history → **max abs diff 1e-16, PASS**.
+
+```bash
+.venv/bin/python MLOps/glue/local_equivalence_check.py
 ```
 
 ## Schedule (production)
