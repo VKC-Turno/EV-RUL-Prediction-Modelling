@@ -21,24 +21,31 @@ model-build/
 │   │   ├── train.py                 #   SageMaker Training entry point (script mode)
 │   │   ├── backtest_lib.py          #   held-out backtest -> evaluation.json
 │   │   └── pipeline_factory.py      #   builds the DAG from an OEM's registry entry
-│   ├── euler/                       # ← one folder per OEM
-│   │   ├── pipeline.py              #   thin: get_pipeline() -> factory
-│   │   ├── preprocess.py            #   Processing entry -> featengg
-│   │   ├── evaluate.py              #   Processing entry -> backtest
-│   │   └── gate.py                  #   ACCEPTANCE GATE (Euler only — has an independent yardstick)
-│   ├── mahindra/  bajaj/  piaggio/  montra/   # {pipeline,preprocess,evaluate}.py
+│   ├── euler/                       # ← END-TO-END with OUR real model (the ported OEM)
+│   │   ├── load_featengg.py         #   Processing: unload the euler_featengg feature store -> parquet
+│   │   ├── train.py                 #   Training: OUR euler_model (rate+traj+LOVO) via src/euler_train
+│   │   ├── pipeline.py              #   LoadFeatengg -> Train -> RegisterModel
+│   │   └── gate.py                  #   ACCEPTANCE GATE (optional ConditionStep — coulomb yardstick)
+│   ├── mahindra/  bajaj/  piaggio/  montra/   # generic scaffold: {pipeline,preprocess,evaluate}.py
 └── tests/test_pipelines.py          # unit tests for common/ (no AWS needed)
 ```
 
-## The DAG (per OEM)
+## Two shapes
 
-`preprocess (Processing)` → `train (Training)` → `evaluate (Processing)` →
-**`[acceptance gate → ConditionStep]`** → `RegisterModel`
+- **Euler — end-to-end, our real model (`euler/`).** Preprocessing lives in the Glue job
+  (`../glue/euler_featengg_incremental.py` → the `euler_featengg` feature store), so the pipeline is the
+  consuming side: **`LoadFeatengg → Train → RegisterModel`**. `train.py` calls our
+  `src/euler_model` / `euler_backtest` / `euler_train` (shipped via the estimator's `dependencies=[src]`) —
+  it reproduces the deployed model *exactly* (offline: split 71/23/26, errors `{0.1933, 0.8478, 0.7453}` =
+  `models/euler/diagnostics.json`). The point-in-time cohort selection + stratified train/val/test split
+  happen in `train.py`, at run time — not baked into the feature store.
 
-The gate + `ConditionStep` are added **only when `config.<oem>.has_gate`** is true (today: Euler). On the
-Euler DAG the gate scores the candidate SoH target against a physically-independent coulomb yardstick on the
-decliner cohort and registers the model `Approved` only on PASS; every other OEM registers with the
-`ModelApprovalStatus` parameter (manual approval in Studio).
+- **Other OEMs — generic scaffold (`common/` factory).** `preprocess → train → evaluate → [gate] →
+  register` with the reference forecaster, until each is ported to its real model like Euler.
+
+The acceptance gate + `ConditionStep` apply only where `config.<oem>.has_gate` is true (today: Euler); it
+scores the candidate SoH target against a physically-independent coulomb yardstick on the decliner cohort and
+registers `Approved` only on PASS.
 
 ## Onboarding a new OEM
 
