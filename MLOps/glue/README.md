@@ -1,56 +1,74 @@
-# Glue preprocessing — incremental
+# Glue preprocessing — incremental & cost-optimised
 
-`euler_preprocessing_incremental.py` is the production-incremental version of the third party's static
-prototype (the `DataPreproccessing job` built against the small static sample we shared —
-`year=2025/month=01/day=01..05`). Same cleaning + feature logic (**21 output columns unchanged**), made
-incremental in read, state, and write.
+`euler_preprocessing_incremental.py` is the production version of the third party's static prototype (the
+`DataPreproccessing job`, built against the small static sample we shared: `year=2025/month=01/day=01..05`).
+Same cleaning + feature logic, **21-column output reproduced exactly** — but every daily run costs
+**O(new data + touched vehicles)**, never O(full history).
 
-## What changed vs the prototype
+## The cost design in one idea
 
-| Prototype (static) | This job (incremental) |
-|---|---|
-| Hardcoded `RAW_YEAR/MONTH/DAYS` window | `--process_date` job param (scheduler passes the new day) |
-| `spark.read.parquet(fixed paths)` | reads only the new day's partition (or catalog + bookmark option) |
-| Trend features over the 5-day read | trend features over each touched VIN's **full history** (lifetime-correct) |
-| Training write = overwrite of the window | daily rows **MERGE-upserted** into Iceberg `euler_daily` (idempotent) |
-| — | features **MERGE-upserted** into Iceberg `euler_features` |
-| Training snapshot = current window only | training snapshot = **full durable table** (overwrite, complete + idempotent) |
-| Inference = latest within the window | inference = latest per VIN over the **full table** (silent vehicles keep their real snapshot) |
+The prototype (and my first incremental cut) reintroduced full-history work in three places: it rewrote the
+whole training snapshot each run, full-scanned for latest-per-VIN, and — because the two VIN-level
+degradation rates were stored on *every* per-date row — a new day rewrote historical rows across every month
+partition (write amplification). The fix is to **normalise**:
 
-The `append` dedupe problem they hit is gone: `MERGE ON (vin, event_date)` makes re-running a day a no-op.
+| Table | Grain | Written each run |
+|---|---|---|
+| `euler_daily` | (vin, event_date) | today's rows only (current-month partition) |
+| `euler_vin_stats` | **vin** (1 row) | touched vins only — holds `soh_degradation_per_day/_per_km`, first-date, counters |
+| `euler_features_daily` | (vin, event_date) | today's rows only; historical rows are **immutable** |
+| `euler_latest` | **vin** (1 row) | touched vins only — the inference snapshot |
 
-## Job configuration diffs (from their `DataPreproccessing job.json`)
+Because the degradation rates live in `euler_vin_stats` (not on every row), a new day **never rewrites
+historical feature rows** → no cross-month write amplification. The original 21-column shape is rebuilt by a
+read-time join `euler_features_daily ⋈ euler_vin_stats`.
 
-- `bookmark`: `job-bookmark-disable` → **`job-bookmark-enable`** (only needed if you switch `_read_new_days`
-  to the catalogued bookmarked read; the parameterised-partition read is already incremental without it).
-- Add job parameters:
-  - `--datalake-formats = iceberg`
-  - `--process_date = 2025-01-05` (scheduler overrides per run)
-  - `--raw_bucket`, `--warehouse`, `--training_output`, `--inference_output` (defaults baked in; override as needed)
-  - `--conf spark.sql.extensions=org.apache.iceberg.spark.extensions.IcebergSparkSessionExtensions --conf spark.sql.catalog.glue_catalog=org.apache.iceberg.spark.SparkCatalog --conf spark.sql.catalog.glue_catalog.catalog-impl=org.apache.iceberg.aws.glue.GlueCatalog --conf spark.sql.catalog.glue_catalog.warehouse=s3://rcs-mlops-data/iceberg/ --conf spark.sql.catalog.glue_catalog.io-impl=org.apache.iceberg.aws.s3.S3FileIO`
-  - (their existing `spark.sql.catalog.glue_catalog.glue.skip-name-validation=true` confirms `glue_catalog`
-    was already intended as an Iceberg catalog — keep it.)
+## What each run does (all O(new + touched))
 
-> **Verify the bucket:** the prototype reads `s3://oem-iot-data/...`; your pipeline elsewhere uses
-> `oem-data-iot`. Confirm which is correct for account `894429711714` and set `--raw_bucket` accordingly.
+1. Read **only** the new day's partition (`--process_date`); skip the run entirely if it's empty/absent.
+2. Clean + daily-aggregate → `MERGE` into `euler_daily` (current-month partition, merge-on-read).
+3. `euler_vin_stats`: aggregate the **touched** vins' history → 1 row/VIN, `MERGE` upsert.
+4. `euler_features_daily`: compute **today's** row from `vin_stats` (expanding features) + a bounded N-day
+   window (rolling features); `MERGE` today's rows only.
+5. `euler_latest`: today's row + rates → `MERGE` per touched VIN; JSON written with **dynamic partition
+   overwrite** so silent vehicles' snapshots are untouched.
+6. Training snapshot: **not** written on the daily path. Consumers read `euler_features_daily ⋈
+   euler_vin_stats`; a Parquet export runs only with `--emit_training_snapshot=true` (i.e. when a training
+   run needs fresh data).
 
-## Durable tables (created automatically on first run)
+The only remaining history-scaled operation is the *read* in step 3 (touched vins' history for exact
+soh_max/min) — a cheap aggregation with a tiny write. All full-table **scans and rewrites are gone.**
 
-- `glue_catalog.turno_ml.euler_daily` — one row per (vin, event_date), Sections 1–4 daily aggregates.
-- `glue_catalog.turno_ml.euler_features` — one row per (vin, event_date), Section 5–6 trend features.
+## Job configuration
 
-Both partitioned by `months(event_date)`. Training reads a Parquet snapshot of `euler_features`; models can
-also read the Iceberg table directly.
+- `bookmark`: leave disabled (the parameterised read is already incremental); enable only if you switch
+  `read_new_day` to the catalogued bookmarked read.
+- **Enable Glue FLEX execution** — this is a non-SLA daily batch, so spare-capacity pricing applies cleanly.
+- Keep the cluster small (2× G.1X); auto-scaling optional.
+- Job parameters: `--datalake-formats iceberg`, `--process_date`, and the Iceberg catalog `--conf`s (your
+  existing `glue_catalog.glue.skip-name-validation=true` confirms `glue_catalog` was already meant to be
+  Iceberg). Optional: `--rolling_window_days` (default 7), `--emit_training_snapshot` (default false),
+  `--raw_bucket`, `--warehouse`, `--training_output`, `--inference_output`.
+- Add a **weekly Iceberg compaction** job (`CALL glue_catalog.system.rewrite_data_files` +
+  `expire_snapshots`) — merge-on-read writes small delete/data files that compaction folds back for cheap reads.
+
+> **Verify the bucket:** prototype reads `s3://oem-iot-data/...`; the rest of the stack uses `oem-data-iot`.
+> Set `--raw_bucket` for account `894429711714`.
+
+## Idempotency & ordering (important)
+
+- `euler_daily` and `euler_vin_stats` are **order-independent** (MERGE / pure aggregation) — re-running any day
+  is safe and self-healing.
+- The per-date **expanding** features (`cumulative_distance`, `avg_daily_distance`) are computed as *as-of the
+  latest day in history*, which is correct **only when days are processed in chronological order**. Forward
+  daily runs satisfy this automatically; **backfill must run oldest→newest** (the loop below). Re-running the
+  *latest* day is idempotent. To correct a *mid-history* day, reprocess that day **and all following days in
+  order** (or rebuild the affected vins).
 
 ## Bootstrap / backfill
 
-The lifetime features are only correct once history exists in `euler_daily`. To seed it, run the job once
-per historical day in order (a simple loop over dates, or a Glue workflow) before switching to daily
-incremental. Because writes are MERGE-idempotent, re-running any day is safe.
-
 ```bash
-# backfill example
-for d in 2025-01-01 2025-01-02 2025-01-03 2025-01-04 2025-01-05; do
+for d in 2025-01-01 2025-01-02 2025-01-03 2025-01-04 2025-01-05; do   # oldest -> newest
   aws glue start-job-run --job-name euler-preprocessing-incremental \
     --arguments '{"--process_date":"'"$d"'"}'
 done
@@ -58,16 +76,6 @@ done
 
 ## Schedule (production)
 
-EventBridge Scheduler → `start-job-run` daily with `--process_date` = yesterday. Each run parses one new
-day, upserts it, recomputes trend features for the vehicles that moved, and refreshes the training +
-inference snapshots.
-
-## Notes / limitations
-
-- `first_vehicle_date`/`vehicle_age_days` use the earliest **observed** day in `euler_daily`. If a true
-  registration date is available, join it in for exact age (same caveat as the prototype, now over full
-  history instead of a 5-day window).
-- Cross-day boundary: a SoC change spanning midnight isn't counted in `estimated_cycle_count` (daily grain).
-  Negligible and identical to the prototype's behaviour.
-- Generalises to the other OEMs by parameterising `OEM`, the sensor range table, and the SoH column — the
-  same per-OEM registry idea as `../model-build/pipelines/common/config.py`.
+EventBridge Scheduler → `start-job-run` daily with `--process_date=yesterday`. Generalises to the other OEMs
+by parameterising `OEM`, the sensor-range table, and the SoH column — same registry idea as
+`../model-build/pipelines/common/config.py`.
