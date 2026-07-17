@@ -3,7 +3,7 @@
 **Audience:** an engineer standing up the production MLOps stack for this project on AWS SageMaker.
 **Scope:** how the existing local pipeline (`src/*.py`, `models/<oem>/`, the dashboards) maps onto
 SageMaker services — data → SoH target → features → training → **acceptance gate** → registry →
-scoring → monitoring — with the multi-OEM (Euler · Mahindra · Bajaj · Piaggio · Montra · JBM-next)
+scoring → monitoring — with the multi-OEM (Euler · Mahindra · Bajaj · Piaggio · Montra)
 fan-out baked in.
 
 > Read [`README.md`](../README.md) first (the preprocessing/feature-generation runbook) and
@@ -227,8 +227,8 @@ so the default is **batch, not real-time**:
 One `Pipeline` definition, **`ParameterString("oem")`** + the per-OEM knobs (`module`, `eol`, `warr_yr`,
 `has_gate`, `soh_method`). Steps: `Process(features)` → `FeatureStoreIngest` → `Train` → `Process(backtest)` →
 `Process(gate)` → `ConditionStep` → `RegisterModel`. Trigger once per OEM (a thin loop or a Step Functions Map),
-so adding **JBM** is *"add a parameter set"*, not new pipeline code — the same scaling property `oem_train.CFG`
-gives you today.
+so onboarding a new OEM is *"add a parameter set"*, not new pipeline code — the same scaling property
+`oem_train.CFG` gives you today. The concrete per-OEM parameter sets are in §10.
 
 ### 4.9 Monitoring — Model Monitor + CloudWatch
 
@@ -337,6 +337,81 @@ Adding an OEM = audit its feed → pick `soh_method` → add a parameter set →
 - **Cold-start fleets are placeholders** — don't over-trust (or alarm on) a flat new-fleet model.
 - **At-risk % is an upper bound** — aged-vehicle scarcity biases the training signal toward early failures;
   communicate the forecast with its P10/P90 band, never as a point estimate.
+
+---
+
+## 10 · Per-OEM implementation flows
+
+One parameterised pipeline, **five parameter sets**. The steps are identical for every OEM; what changes is the
+*feed audit → SoH method → whether the acceptance gate applies → whether the fleet is mature enough to deploy a
+real model*. The audit decides everything downstream:
+
+```mermaid
+flowchart TD
+  A["Audit the OEM feed"] --> B{"signed current?"}
+  B -->|"yes + cheap to build a<br/>full-charge yardstick"| C["coulomb SoH + GATE<br/>(Euler)"]
+  B -->|"yes, yardstick too costly"| D["coulomb SoH, no gate<br/>(Mahindra both-feed · Piaggio)"]
+  B -->|"no — remaining-capacity present"| E["BMS remaining-capacity SoH<br/>(Euler target · Montra)"]
+  B -->|"no — reported SoH only"| F["reported SoH, non-increasing<br/>(Bajaj)"]
+  B -->|"no sensors at all (native-only)"| G["Bayesian behaviour SoH<br/>from age + km (Mahindra native)"]
+```
+
+### 10.0 · Parameter sets & deltas
+
+| OEM | Extraction | SoH method | Model module (EoL / warranty) | Gate | Fleet | Dominant gotcha |
+|---|---|---|---|---|---|---|
+| **Euler** | dense batch | BMS-capacity → recovery-aware clean → **hybrid** | `euler_model` (80 % / 3 y·80k) | **YES** | mature (120 veh, 74 degraders) | SoH artifacts → *needs* the clean+gate |
+| **Mahindra** | two-feed: native (~70M tiny files) + intellicar (signed I) | coulomb (intellicar); **native-only → Bayesian behaviour SoH** | `model` (80 % / 3 y·120k) | no | large, ~98 % native-only | 70M tiny files; odometer logged late |
+| **Bajaj** | dense native | **reported** BMS SoH, non-increasing | `bajaj_model` (70 % / 5 y·120k) | no | young (~10 mo) | no I/V → cycles/temp/eff features; odo in metres |
+| **Piaggio** | intellicar (SoH) + native (features) | coulomb (intellicar) | `model` (80 % / 3 y·100k) | no | noisy low-util | 308k tiny intellicar files; native V 100 % null |
+| **Montra** | day-sampled 10-veh POC | BMS-capacity (current **unsigned**) | `model` (80 % / 3 y·100k) | no | **new POC — placeholder** | unsigned current → no coulomb; flat fleet |
+
+### 10.1 · Euler — the full path (the only OEM that activates the gate)
+
+`Extract (dense batch)` → **two** SoH computations: the deployed target (`euler_bms_soh` → recovery-aware clean →
+**hybrid** `soh_target`) *and* the physically-independent coulomb yardstick (`euler_full_charge_soh`) →
+`Features → Feature Store` → `Train euler_model` (rate + trajectory + P10/P90 band) → `LOVO backtest` →
+**`Gate` (`euler_accept_gate`** scores candidate vs incumbent on the coulomb-confirmed decliner cohort) →
+**`ConditionStep`**: register `Approved` only on PASS → `Batch score`.
+Deploys a real model (`euler_20260707`). This is the only fleet where model-quality alarms are immediately
+meaningful — it has genuine decliners.
+
+### 10.2 · Mahindra — two-tier, no gate
+
+Two ingest paths. **Intellicar** (signed current → coulomb SoH → isotonic) covers the ~224 both-feed vehicles;
+the **native** feed (the 70M-tiny-files problem → *compaction is mandatory*) covers the ~98 % with no sensors,
+scored by the **Bayesian behaviour model** (`bayes_degradation`, validated MAE ~1.5 pp). No gate — the coulomb
+yardstick is too sparse (~18 usable vehicles) and the `soh` target is already isotonic-clean. Register the
+forecaster with its honest caveat (it does not beat persistence on the noisy cohort); the behaviour model carries
+native-only coverage. Monitor: odometer availability + behaviour-model inputs (age, km).
+
+### 10.3 · Bajaj — reported SoH, young fleet
+
+`Dense ingest` → SoH = monthly-median of the reported `essBmsSohcEstPercValue`, kept non-increasing → features
+**without** current/voltage (charge-cycles, pack temp, ambient temp, drive-efficiency, odometer ÷ 1000) →
+`Train bajaj_model` → `Backtest` (this one **beats** persistence on decliners, 1.40 vs 1.85) → `Register` →
+`Score`. No gate (no current at all → no independent yardstick). Warranty-risk uses the **km-effective deadline**
+(120k usually binds before 5 years). Monitor: suppress premature drift alarms while the fleet is young.
+
+### 10.4 · Piaggio — coulomb via intellicar, no gate
+
+Intellicar ingest (**308k tiny files → compaction is the #1 cost lever**) for signed-current coulomb SoH; the
+native feed supplies thermal/usage features + a distance-per-SoC cross-check (native voltage is 100 % null).
+`Train model` → `Backtest` (does **not** beat persistence, 3.69 vs 2.93 → register but flag low-confidence,
+communicate with wide bands). No gate — building the yardstick would mean re-scanning all 308k files.
+
+### 10.5 · Montra — new-fleet placeholder
+
+Day-sampled 10-vehicle extract (`montra_sample`) → SoH via BMS remaining-capacity (current is **unsigned** →
+coulomb impossible) → features (has real pack temperature, a plus) → `Train model` → **flat placeholder** (0
+decliners) → register as `PendingManualApproval` / tagged placeholder → score with a wide caveat. No gate.
+Monitor: **cold-start — suppress "perfect-fit / no-drift" alarms**; the model becomes real as the fleet ages or
+more vehicles are onboarded via `montra_sample`.
+
+### 10.6 · Onboarding the next OEM
+
+Audit its feed → drop it into the §10 decision tree to pick `soh_method` → add a parameter set (`model_module`,
+`eol_pct`, `warr_years/km`, `has_gate`) → run the same pipeline. No new pipeline code.
 
 ---
 
