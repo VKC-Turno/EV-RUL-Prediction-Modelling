@@ -1,93 +1,86 @@
 # Glue preprocessing — incremental & cost-optimised
 
-`euler_preprocessing_incremental.py` is the production version of the third party's static prototype (the
-`DataPreproccessing job`, built against the small static sample we shared: `year=2025/month=01/day=01..05`).
-Same cleaning + feature logic, **21-column output reproduced exactly** — but every daily run costs
-**O(new data + touched vehicles)**, never O(full history).
+Two jobs, both on the third party's incremental Glue/Iceberg **architecture** (parameterised read, `MERGE`
+upserts, cost-bounded, SageMaker-ready outputs). They differ in whose **logic** runs:
 
-## The cost design in one idea
+| Job | Logic | Output | Status |
+|---|---|---|---|
+| **`euler_featengg_incremental.py`** | **Ours** — calls `src/euler_features.py` (bms-capacity SoH + our features) | our deployed **25-col monthly featengg** | **canonical — deploy this** |
+| `euler_preprocessing_incremental.py` | Third party's (as received) | their 21-col daily table | reference only |
 
-The prototype (and my first incremental cut) reintroduced full-history work in three places: it rewrote the
-whole training snapshot each run, full-scanned for latest-per-VIN, and — because the two VIN-level
-degradation rates were stored on *every* per-date row — a new day rewrote historical rows across every month
-partition (write amplification). The fix is to **normalise**:
+> Decision (recorded): base SoH in Glue (bms_capacity → isotonic); the recovery-aware clean label, hybrid
+> target, and coulomb acceptance gate stay in the SageMaker/model-build layer. Grain = monthly featengg.
 
-| Table | Grain | Written each run |
-|---|---|---|
-| `euler_daily` | (vin, event_date) | today's rows only (current-month partition) |
-| `euler_vin_stats` | **vin** (1 row) | touched vins only — holds `soh_degradation_per_day/_per_km`, first-date, counters |
-| `euler_features_daily` | (vin, event_date) | today's rows only; historical rows are **immutable** |
-| `euler_latest` | **vin** (1 row) | touched vins only — the inference snapshot |
+---
 
-Because the degradation rates live in `euler_vin_stats` (not on every row), a new day **never rewrites
-historical feature rows** → no cross-month write amplification. The original 21-column shape is rebuilt by a
-read-time join `euler_features_daily ⋈ euler_vin_stats`.
+## `euler_featengg_incremental.py` — our methodology (canonical)
 
-## What each run does (all O(new + touched))
+**All logic is ours, in one place.** The per-vehicle work calls `src/euler_features.py`
+(`load_clean` / `bms_soh_monthly` / `monthly_features`) via `applyInPandas` — the *same* functions our models
+and dashboards already consume, so there is no second implementation to drift. Output is our deployed
+**25-column monthly featengg** (`vin, ymd, soh, ah_throughput, cur_abs_mean, …, cum_ah, cum_km`), with
+`soh` = BMS remaining-capacity → isotonic.
 
-1. Read **only** the new day's partition (`--process_date`); skip the run entirely if it's empty/absent.
-2. Clean + daily-aggregate → `MERGE` into `euler_daily` (current-month partition, merge-on-read).
-3. `euler_vin_stats`: aggregate the **touched** vins' history → 1 row/VIN, `MERGE` upsert.
-4. `euler_features_daily`: compute **today's** row from `vin_stats` (expanding features) + the last **N daily
-   rows** per vin (rows-based rolling, matching the prototype's `.rolling(N)` — correct for gappy vehicles);
-   `MERGE` today's rows only.
-5. `euler_latest`: today's row + rates → `MERGE` per touched VIN; JSON written with **dynamic partition
-   overwrite** so silent vehicles' snapshots are untouched.
-6. Training snapshot: **not** written on the daily path. Consumers read `euler_features_daily ⋈
-   euler_vin_stats`; a Parquet export runs only with `--emit_training_snapshot=true` (i.e. when a training
-   run needs fresh data).
+### What each run does
+1. Read **only** the new day's raw partition (`--process_date`); skip if absent. Rename the raw lowercase
+   columns to the camelCase our module expects.
+2. `MERGE` the day's events into Iceberg **`euler_clean_events`** (idempotent on `(vin, eventAt)`).
+3. For **touched** vehicles: read their full clean-event history back from `euler_clean_events`, run our
+   `vin_featengg` per vehicle (`groupBy("vin").applyInPandas`), and `MERGE` into **`euler_featengg`** on
+   `(vin, ymd)`.
+4. `euler_latest`: latest month per touched vehicle → `MERGE` (+ JSON, dynamic partition overwrite) for
+   inference.
+5. Training snapshot only with `--emit_training_snapshot=true`; otherwise consumers read `euler_featengg`.
 
-The only remaining history-scaled operation is the *read* in step 3 (touched vins' history for exact
-soh_max/min) — a cheap aggregation with a tiny write. All full-table **scans and rewrites are gone.**
+### Cost model (honest)
+Incremental at ingest — only the new day's raw is parsed and appended. featengg is recomputed for **touched
+vehicles only**, over their full clean-event history read from a durable **columnar Iceberg** store (not the
+tiny S3 raw files). Our SoH uses a per-vehicle **adaptive capacity window + isotonic fit + first-6-months
+baseline**, which are *not* additively-incremental (a new reading can shift the vehicle's global median and
+the isotonic fit), so recomputing a touched vehicle over its full history is the **exact-correct floor** — far
+below full-fleet/full-history, but not O(1). *Optional further optimisation:* keep a per-`(vin, month)`
+`full_cap`/aggregate table and refresh the global median periodically, so only the affected month re-reads
+events; adds a second table and a small approximation window. Ship the exact version first.
 
-## Job configuration
+### Packaging (job parameters)
+- `--datalake-formats iceberg`
+- `--additional-python-modules scikit-learn` (`bms_soh_monthly` uses `IsotonicRegression`)
+- `--extra-py-files s3://…/euler_features.py` — our module, importable on the executors
+- `--process_date`, the Iceberg catalog `--conf`s, optional `--reg_table` (for exact `age_months`),
+  `--emit_training_snapshot`, `--raw_bucket`, `--warehouse`, `--training_output`, `--inference_output`
+- Enable **Glue Flex** (spare-capacity pricing) — non-SLA daily batch.
 
-- `bookmark`: leave disabled (the parameterised read is already incremental); enable only if you switch
-  `read_new_day` to the catalogued bookmarked read.
-- **Enable Glue FLEX execution** — this is a non-SLA daily batch, so spare-capacity pricing applies cleanly.
-- Keep the cluster small (2× G.1X); auto-scaling optional.
-- Job parameters: `--datalake-formats iceberg`, `--process_date`, and the Iceberg catalog `--conf`s (your
-  existing `glue_catalog.glue.skip-name-validation=true` confirms `glue_catalog` was already meant to be
-  Iceberg). Optional: `--rolling_window_days` (default 7), `--emit_training_snapshot` (default false),
-  `--raw_bucket`, `--warehouse`, `--training_output`, `--inference_output`.
-- Add a **weekly Iceberg compaction** job (`CALL glue_catalog.system.rewrite_data_files` +
-  `expire_snapshots`) — merge-on-read writes small delete/data files that compaction folds back for cheap reads.
+> `src/euler_features.py` does an `os.chdir` at import (harmless here — we call only the pure functions,
+> which don't use the working directory). Verify `--raw_bucket` for account `894429711714`
+> (`oem-iot-data` vs `oem-data-iot`).
 
-> **Verify the bucket:** prototype reads `s3://oem-iot-data/...`; the rest of the stack uses `oem-data-iot`.
-> Set `--raw_bucket` for account `894429711714`.
+---
 
-## Idempotency & ordering (important)
+## Offline equivalence checks (no Spark/Glue/S3)
 
-- `euler_daily` and `euler_vin_stats` are **order-independent** (MERGE / pure aggregation) — re-running any day
-  is safe and self-healing.
-- The per-date **expanding** features (`cumulative_distance`, `avg_daily_distance`) are computed as *as-of the
-  latest day in history*, which is correct **only when days are processed in chronological order**. Forward
-  daily runs satisfy this automatically; **backfill must run oldest→newest** (the loop below). Re-running the
-  *latest* day is idempotent. To correct a *mid-history* day, reprocess that day **and all following days in
-  order** (or rebuild the affected vins).
+Both are validated against **local `data/euler/`** only — never a Glue run or an S3 scan.
 
-## Bootstrap / backfill
+- **`local_featengg_equivalence.py`** (our-methodology port) — proves, using our *actual* `euler_features`
+  functions, that **incremental == batch** *and* the output **== `data/euler/features/feature_table.parquet`**.
+  Latest run: 3 vehicles, 84 rows, **both 0.0 diff, PASS**.
+- **`local_equivalence_check.py`** (as-received job) — proves incremental == batch for the third party's logic.
 
 ```bash
-for d in 2025-01-01 2025-01-02 2025-01-03 2025-01-04 2025-01-05; do   # oldest -> newest
-  aws glue start-job-run --job-name euler-preprocessing-incremental \
-    --arguments '{"--process_date":"'"$d"'"}'
-done
-```
-
-## Offline equivalence check
-
-`local_equivalence_check.py` proves — **offline, on a slice of `data/euler/dense/`, no Spark/Glue/S3** — that
-the day-by-day normalised computation reproduces a full-history batch recompute, byte-for-byte on the
-21-column output. It's a pandas mirror of the job's algorithm (the Glue script implements the same steps in
-Spark). Latest run: 4 vehicles, gappy history → **max abs diff 1e-16, PASS**.
-
-```bash
+.venv/bin/python MLOps/glue/local_featengg_equivalence.py
 .venv/bin/python MLOps/glue/local_equivalence_check.py
 ```
 
-## Schedule (production)
+## Bootstrap / backfill & schedule
 
-EventBridge Scheduler → `start-job-run` daily with `--process_date=yesterday`. Generalises to the other OEMs
-by parameterising `OEM`, the sensor-range table, and the SoH column — same registry idea as
-`../model-build/pipelines/common/config.py`.
+featengg needs history for the isotonic/baseline to be meaningful — backfill **oldest → newest**, then
+schedule daily with `--process_date=yesterday` (EventBridge → `start-job-run`). Because writes are
+`MERGE`-idempotent, re-running a day is safe.
+
+```bash
+for d in 2025-01-01 2025-01-02 2025-01-03 2025-01-04 2025-01-05; do   # oldest -> newest
+  aws glue start-job-run --job-name euler-featengg-incremental --arguments '{"--process_date":"'"$d"'"}'
+done
+```
+
+Generalises to the other OEMs by swapping the per-vehicle module (each OEM's `*_features` / SoH method) —
+same registry idea as `../model-build/pipelines/common/config.py`.
