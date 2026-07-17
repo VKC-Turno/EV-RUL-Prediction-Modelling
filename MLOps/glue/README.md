@@ -30,29 +30,43 @@ a **point-in-time selection made downstream** (SageMaker training / serving), so
 the then-current, in-service, sufficiently-labelled cohort **without any change here**. The train/val/test
 split + cohort gate live in the training step (`src/oem_train.py::_split` + `data_quality.apply_quality`).
 
-### What each run does
-1. Read **only** the new day's raw partition (`--process_date`); skip if absent. Rename the raw lowercase
-   columns to the camelCase our module expects.
-2. `MERGE` the day's events into Iceberg **`euler_clean_events`** (idempotent on `(vin, eventAt)`).
-3. For **touched** vehicles (those reporting that day), read their full clean-event history back from
-   `euler_clean_events`, run our `vin_featengg` per vehicle (`groupBy("vin").applyInPandas`), and `MERGE`
-   into **`euler_featengg`** on `(vin, ymd)`. Touched-only = which vehicles get *recomputed* this run; every
-   reporting vehicle is covered over time, and none is dropped for lacking a label.
+### Two-tier design (no full-history scan)
 
-> **Cumulative features fixed:** because FE now runs over all months, `cum_ah` / `cum_km` / `km_month`
-> cumulate across *every* month. The old labeled-only assembly (inner-join in `euler_features.main()`) skipped
-> months without a SoH reading and thus **under-counted** throughput/distance — the feature store corrects
-> this. (Per-month features + `soh` are byte-identical to `euler_features`; see the offline check.)
+Three Iceberg tables, all partitioned by **month**:
 
-### Cost model (honest)
-Incremental at ingest — only the new day's raw is parsed and appended. featengg is recomputed for **touched
-vehicles only**, over their full clean-event history read from a durable **columnar Iceberg** store (not the
-tiny S3 raw files). Our SoH uses a per-vehicle **adaptive capacity window + isotonic fit + first-6-months
-baseline**, which are *not* additively-incremental (a new reading can shift the vehicle's global median and
-the isotonic fit), so recomputing a touched vehicle over its full history is the **exact-correct floor** — far
-below full-fleet/full-history, but not O(1). *Optional further optimisation:* keep a per-`(vin, month)`
-`full_cap`/aggregate table and refresh the global median periodically, so only the affected month re-reads
-events; adds a second table and a small approximation window. Ship the exact version first.
+| Table | Grain | What it holds |
+|---|---|---|
+| `euler_clean_events` | event | cleaned raw events (ingest MERGEs the new day) |
+| `euler_monthly` | (vin, month) | month-**local** features (`monthly_features`) + that month's high-SoC `full_cap` samples (`hi_full_cap`) |
+| `euler_featengg` | (vin, month) | the 25-col feature store; cross-month SoH (`soh_from_hi_full_cap`) + cumulative/age assembly |
+
+**What each run does:**
+1. **Ingest** — read only the planned day partition(s) (`--process_date` + catch-up); `MERGE` into
+   `euler_clean_events`.
+2. **Stage B — `euler_monthly`** — recompute the **affected month(s)** for touched vehicles, reading
+   `euler_clean_events` **month-pruned** (`WHERE month IN affected`). `monthly_features` and `hi_full_cap` are
+   month-local (verified 0.0), so a month's row depends only on that month's events. `MERGE` on `(vin, month)`.
+3. **Stage C — `euler_featengg`** — recompute touched vehicles' SoH from the **small** `euler_monthly` store
+   (the persisted `full_cap` samples give the exact global-median adaptive window + isotonic fit) and assemble
+   `age_months`/`km_month`/`cum_*`. `MERGE` on `(vin, ymd, month)`. All vehicles; `soh` null where no signal.
+
+`euler_features.bms_soh_monthly` was refactored into `hi_full_cap` (month-local) ∘ `soh_from_hi_full_cap`
+(cross-month) so the split is our *exact* code — the offline check confirms **two-tier == single-pass (0.0)**.
+
+### Cost model
+
+- **No full raw scan.** Stage B reads only the **affected month** partition(s) of `euler_clean_events`
+  (month-partitioned → real pruning), not all history. The old version scanned the whole events table each
+  run to reconstruct each vehicle's history; that is gone.
+- Stage C reads the **small** `euler_monthly` store (one row per vin-month + a modest `full_cap` array),
+  not raw events. It's currently a scan of that small table filtered to touched vehicles — partition
+  `euler_monthly` by `bucket(N, vin)` if you later want that pruned too.
+- Every `MERGE` carries the partition column (`month`) in its `ON` clause, so Iceberg prunes the target
+  instead of scanning it.
+
+> **Cumulative features:** `cum_ah`/`cum_km`/`km_month` cumulate across *every* month. The old labeled-only
+> inner-join skipped months without a SoH reading and **under-counted**; the feature store fixes this.
+> Per-month features + `soh` are byte-identical to `euler_features` (offline check).
 
 ### Packaging (job parameters)
 - `--datalake-formats iceberg`
@@ -73,9 +87,9 @@ events; adds a second table and a small approximation window. Ship the exact ver
 Both are validated against **local `data/euler/`** only — never a Glue run or an S3 scan.
 
 - **`local_featengg_equivalence.py`** (our-methodology port) — proves, using our *actual* `euler_features`
-  functions, that **incremental == batch** (0.0), and that per-month features + `soh` **== `feature_table.parquet`**
-  (0.0 on labelled rows). Cumulative cols (`cum_ah`/`cum_km`/`km_month`) differ *by design* — the all-months
-  fix above. Latest run: 3 vehicles, 122 rows, **PASS**.
+  functions: **(A) incremental == batch**, **(C) two-tier (`euler_monthly` store) == single-pass**, and
+  **(B) per-month features + `soh` == `feature_table.parquet`** — all **0.0**. Cumulative cols
+  (`cum_ah`/`cum_km`/`km_month`) differ *by design* (all-months fix). Latest run: 3 vehicles, 122 rows, **PASS**.
 - **`local_equivalence_check.py`** (as-received job) — proves incremental == batch for the third party's logic.
 
 ```bash

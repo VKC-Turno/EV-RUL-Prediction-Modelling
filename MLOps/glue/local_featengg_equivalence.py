@@ -53,10 +53,48 @@ def vin_featengg(events: pd.DataFrame, vin: str, reg_date=None):
     return m[["vin", "ymd"] + FEAT_COLS].reset_index(drop=True)
 
 
-def batch(events_by_vin, reg):
+def vin_featengg_twotier(events: pd.DataFrame, vin: str, reg_date=None):
+    """Two-tier path (mirrors the Glue job): STAGE B builds a per-month store (features + a hi_full_cap
+    array) from each month's events alone; STAGE C recomputes SoH cross-month from the persisted arrays.
+    No raw events are read more than once per month -> no full-history scan. Must equal vin_featengg."""
+    df = ef.load_clean(events)
+    # STAGE B — euler_monthly rows (per-month slice; monthly_features is month-local, hi_full_cap is month-local)
+    rows = []
+    for m, g in df.groupby("month"):
+        feat = ef.monthly_features(g).iloc[0].to_dict()
+        feat["month"] = m
+        feat["fullcap_hi"] = ef.hi_full_cap(g)["full_cap"].tolist()
+        rows.append(feat)
+    mon = pd.DataFrame(rows).sort_values("month")
+    if not len(mon):
+        return None
+    # STAGE C — cross-month SoH from the concatenated persisted arrays + assembly
+    hi_all = pd.concat([pd.DataFrame({"month": r["month"], "full_cap": r["fullcap_hi"]})
+                        for _, r in mon.iterrows() if r["fullcap_hi"]], ignore_index=True) \
+        if any(len(r["fullcap_hi"]) for _, r in mon.iterrows()) else pd.DataFrame(columns=["month", "full_cap"])
+    soh = ef.soh_from_hi_full_cap(hi_all)
+    m = mon.drop(columns=["fullcap_hi"])
+    m = (m.merge(soh, on="month", how="left") if soh is not None else m.assign(soh=np.nan)).sort_values("month")
+    base = reg_date if (reg_date is not None and pd.notna(reg_date) and reg_date <= m["month"].iloc[0]) \
+        else m["month"].iloc[0]
+    m["age_months"] = ((m["month"] - base).dt.days / 30.4).round(1)
+    m["cur_chg_mean"] = m["cur_chg_mean"].fillna(0.0)
+    m["cur_dis_mean"] = m["cur_dis_mean"].fillna(0.0)
+    m["km_month"] = m["odo_max"].diff().clip(lower=0).fillna(0.0)
+    m["cum_ah"] = m["ah_throughput"].cumsum()
+    m["cum_km"] = m["km_month"].cumsum()
+    m["vin"] = vin
+    m["ymd"] = m["month"].dt.strftime("%Y-%m-%d")
+    for c in FEAT_COLS:
+        if c not in m.columns:
+            m[c] = np.nan
+    return m[["vin", "ymd"] + FEAT_COLS].reset_index(drop=True)
+
+
+def batch(events_by_vin, reg, fn=vin_featengg):
     out = []
     for vin, ev in events_by_vin.items():
-        f = vin_featengg(ev, vin, reg.get(vin))
+        f = fn(ev, vin, reg.get(vin))
         if f is not None:
             out.append(f)
     return pd.concat(out, ignore_index=True) if out else pd.DataFrame()
@@ -145,8 +183,14 @@ def main():
     i = incremental(events_by_vin, reg)
     print(f"batch rows={len(b)}  incremental rows={len(i)}")
 
+    tt = batch(events_by_vin, reg, fn=vin_featengg_twotier)
+    print(f"two-tier rows={len(tt)}")
+
     print("\n(A) incremental == batch:")
     ok_a = compare(b, i, label="incr vs batch")
+
+    print("\n(C) two-tier (euler_monthly store) == single-pass batch:")
+    ok_c = compare(b, tt, label="two-tier vs single")
 
     # (B) parity target = our euler_features.py output (feature_table.parquet). The port's vin_featengg IS
     # ef.main()'s body, so it must reproduce that exactly. (The redshift store is built by a different path.)
@@ -165,9 +209,9 @@ def main():
     else:
         print("  (feature_table.parquet not found — skipped)")
 
-    print("\n" + ("PASS — our-methodology port: incremental==batch and matches deployed featengg"
-                  if (ok_a and ok_b) else "CHECK — see diffs above"))
-    sys.exit(0 if (ok_a and ok_b) else 1)
+    print("\n" + ("PASS — incremental==batch, two-tier==single-pass, and matches euler_features"
+                  if (ok_a and ok_b and ok_c) else "CHECK — see diffs above"))
+    sys.exit(0 if (ok_a and ok_b and ok_c) else 1)
 
 
 if __name__ == "__main__":

@@ -35,14 +35,24 @@ def load_clean(fp):
     return df.sort_values("t").reset_index(drop=True)
 
 
-def bms_soh_monthly(df):
-    """Validated BMS-capacity SoH: high-SoC full_cap, isotonic decreasing, /per-vehicle nominal."""
+def hi_full_cap(df):
+    """High-SoC full-capacity readings -> [month, full_cap]. MONTH-LOCAL (no cross-month dependency), so it
+    can be computed per month and persisted (the two-tier Glue store keeps these per vin-month)."""
     d = df[(df["batterySoc"].between(95, 100)) & (df["batteryRemainingCapacity"].between(0, 500))].copy()
     d["full_cap"] = d["batteryRemainingCapacity"] / (d["batterySoc"] / 100.0)
-    med = d["full_cap"].median()
+    return d[["month", "full_cap"]]
+
+
+def soh_from_hi_full_cap(hi):
+    """The CROSS-MONTH SoH fit from ALL of a vehicle's high-SoC full_cap readings [month, full_cap]:
+    global-median adaptive window -> monthly median (n>=15) -> first-6-month nominal -> isotonic decreasing,
+    <=100. Depends on the whole series, so it runs over the (small) persisted monthly samples, not raw events."""
+    if hi is None or not len(hi):
+        return None
+    med = hi["full_cap"].median()
     if not np.isfinite(med) or med < 40:                 # broken / zero remaining-capacity for this vehicle
         return None
-    d = d[d["full_cap"].between(0.6 * med, 1.4 * med)]    # adaptive window around THIS vehicle's pack (Hiload ≠ ~133Ah cohort)
+    d = hi[hi["full_cap"].between(0.6 * med, 1.4 * med)]  # adaptive window around THIS vehicle's pack
     mon = d.groupby("month").agg(full_cap=("full_cap", "median"), n=("full_cap", "size")).reset_index()
     mon = mon[mon["n"] >= 15]
     if len(mon) < 6:
@@ -51,6 +61,13 @@ def bms_soh_monthly(df):
     fit = IsotonicRegression(increasing=False).fit_transform(np.arange(len(mon)), mon["full_cap"].to_numpy())
     mon["soh"] = np.clip(100.0 * fit / nominal, None, 100.0)
     return mon[["month", "soh"]]
+
+
+def bms_soh_monthly(df):
+    """Validated BMS-capacity SoH: high-SoC full_cap, isotonic decreasing, /per-vehicle nominal.
+    = soh_from_hi_full_cap(hi_full_cap(df)) — split so the two-tier pipeline can persist hi_full_cap
+    per month and recompute the fit without re-reading raw events (see MLOps/glue)."""
+    return soh_from_hi_full_cap(hi_full_cap(df))
 
 
 def monthly_features(df):
