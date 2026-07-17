@@ -1,0 +1,30 @@
+version: 0.2
+
+# CodeBuild spec for the model-deploy repo. Fetches each OEM's latest Approved model package and renders
+# CloudFormation parameter files; the CodePipeline that wraps this then deploys the CFN to staging -> (test)
+# -> prod. Env injected by SageMaker Projects: SAGEMAKER_PROJECT_NAME/ID, SAGEMAKER_PIPELINE_ROLE_ARN,
+# AWS_REGION, ARTIFACT_BUCKET.
+
+phases:
+  install:
+    runtime-versions:
+      python: 3.10
+    commands:
+      - pip install --upgrade --quiet pip boto3
+
+  build:
+    commands:
+      - echo "###### Rendering per-OEM CFN parameter files from Approved model packages"
+      - python build.py --region "${AWS_REGION}" --role-arn "${SAGEMAKER_PIPELINE_ROLE_ARN}"
+      - echo "###### Packaging endpoint CloudFormation template"
+      - |
+        aws cloudformation package \
+          --template-file endpoint-config-template.yml \
+          --s3-bucket "${ARTIFACT_BUCKET}" \
+          --output-template-file packaged-endpoint.yml || cp endpoint-config-template.yml packaged-endpoint.yml
+
+artifacts:
+  files:
+    - packaged-endpoint.yml
+    - "*-staging-config-export.json"
+    - "*-prod-config-export.json"

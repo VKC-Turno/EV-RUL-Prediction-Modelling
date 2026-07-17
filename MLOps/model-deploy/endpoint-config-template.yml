@@ -1,0 +1,55 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  Deploy one OEM's Approved SoH forecaster as a real-time SageMaker endpoint (for the customer app).
+  The primary scoring path is monthly Batch Transform; this endpoint serves on-demand per-VIN lookups.
+  DataCapture feeds SageMaker Model Monitor (data + model-quality drift).
+
+Parameters:
+  SageMakerProjectName: { Type: String }
+  SageMakerProjectId: { Type: String, Default: "" }
+  ModelExecutionRoleArn: { Type: String }
+  ModelPackageName: { Type: String, Description: "Approved model package ARN" }
+  OEM: { Type: String }
+  StageName: { Type: String, AllowedValues: [staging, prod] }
+  EndpointName: { Type: String }
+  EndpointInstanceType: { Type: String, Default: ml.m5.large }
+  EndpointInstanceCount: { Type: Number, Default: 1 }
+  DataCaptureUploadPath: { Type: String }
+  SamplingPercentage: { Type: Number, Default: 100 }
+
+Resources:
+  Model:
+    Type: AWS::SageMaker::Model
+    Properties:
+      ModelName: !Sub "soh-${OEM}-${StageName}"
+      ExecutionRoleArn: !Ref ModelExecutionRoleArn
+      PrimaryContainer:
+        ModelPackageName: !Ref ModelPackageName
+
+  EndpointConfig:
+    Type: AWS::SageMaker::EndpointConfig
+    Properties:
+      EndpointConfigName: !Sub "soh-${OEM}-${StageName}-cfg"
+      ProductionVariants:
+        - VariantName: AllTraffic
+          ModelName: !GetAtt Model.ModelName
+          InitialInstanceCount: !Ref EndpointInstanceCount
+          InstanceType: !Ref EndpointInstanceType
+          InitialVariantWeight: 1.0
+      DataCaptureConfig:
+        EnableCapture: true
+        InitialSamplingPercentage: !Ref SamplingPercentage
+        DestinationS3Uri: !Ref DataCaptureUploadPath
+        CaptureOptions:
+          - CaptureMode: Input
+          - CaptureMode: Output
+
+  Endpoint:
+    Type: AWS::SageMaker::Endpoint
+    Properties:
+      EndpointName: !Ref EndpointName
+      EndpointConfigName: !GetAtt EndpointConfig.EndpointConfigName
+
+Outputs:
+  EndpointName:
+    Value: !Ref EndpointName

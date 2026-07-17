@@ -1,0 +1,9 @@
+{
+  "Parameters": {
+    "StageName": "prod",
+    "EndpointInstanceType": "ml.m5.large",
+    "EndpointInstanceCount": "2",
+    "DataCaptureUploadPath": "s3://oem-data-iot/model-monitor/prod",
+    "SamplingPercentage": "100"
+  }
+}

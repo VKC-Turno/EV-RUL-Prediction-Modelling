@@ -1,0 +1,9 @@
+{
+  "Parameters": {
+    "StageName": "staging",
+    "EndpointInstanceType": "ml.m5.large",
+    "EndpointInstanceCount": "1",
+    "DataCaptureUploadPath": "s3://oem-data-iot/model-monitor/staging",
+    "SamplingPercentage": "100"
+  }
+}

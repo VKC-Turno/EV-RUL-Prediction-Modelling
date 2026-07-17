@@ -1,0 +1,15 @@
+version: 0.2
+
+# Smoke-tests each OEM's staging endpoint before the prod stage is allowed to proceed.
+
+phases:
+  install:
+    runtime-versions:
+      python: 3.10
+    commands:
+      - pip install --upgrade --quiet pip boto3
+
+  build:
+    commands:
+      - echo "###### Smoke-testing staging endpoints"
+      - python test/test.py --region "${AWS_REGION}" --stage staging

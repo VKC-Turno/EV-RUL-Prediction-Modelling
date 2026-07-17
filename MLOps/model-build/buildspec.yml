@@ -1,0 +1,30 @@
+version: 0.2
+
+# CodeBuild spec for the model-build repo. Upserts + starts one SageMaker Pipeline per OEM.
+# SageMaker Projects injects: SAGEMAKER_PROJECT_NAME, SAGEMAKER_PIPELINE_ROLE_ARN, ARTIFACT_BUCKET, AWS_REGION.
+# To build a single OEM, set OEMS to just that name.
+
+env:
+  variables:
+    OEMS: "euler mahindra bajaj piaggio montra"
+
+phases:
+  install:
+    runtime-versions:
+      python: 3.10
+    commands:
+      - pip install --upgrade --quiet pip
+      - pip install --quiet -e .
+
+  build:
+    commands:
+      - |
+        for OEM in $OEMS; do
+          echo "###### Upserting + starting pipeline for ${OEM}"
+          run-pipeline \
+            --module-name "pipelines.${OEM}.pipeline" \
+            --role-arn "${SAGEMAKER_PIPELINE_ROLE_ARN}" \
+            --tags "[{\"Key\":\"sagemaker:project-name\",\"Value\":\"${SAGEMAKER_PROJECT_NAME}\"},{\"Key\":\"oem\",\"Value\":\"${OEM}\"}]" \
+            --kwargs "{\"region\":\"${AWS_REGION}\",\"role\":\"${SAGEMAKER_PIPELINE_ROLE_ARN}\",\"default_bucket\":\"${ARTIFACT_BUCKET}\",\"pipeline_name\":\"soh-${OEM}-build\",\"model_package_group_name\":\"soh-forecaster-${OEM}\"}"
+        done
+      - echo "###### All OEM pipelines upserted and executed."
