@@ -1,15 +1,13 @@
 # Glue preprocessing — incremental & cost-optimised
 
-Two jobs, both on the third party's incremental Glue/Iceberg **architecture** (parameterised read, `MERGE`
-upserts, cost-bounded, SageMaker-ready outputs). They differ in whose **logic** runs:
-
-| Job | Logic | Output | Status |
-|---|---|---|---|
-| **`euler_featengg_incremental.py`** | **Ours** — calls `src/euler_features.py` (bms-capacity SoH + our features) | our deployed **25-col monthly featengg** | **canonical — deploy this** |
-| `euler_preprocessing_incremental.py` | Third party's (as received) | their 21-col daily table | reference only |
+Euler feature engineering on the third party's incremental Glue/Iceberg **architecture** (parameterised read,
+`MERGE` upserts, cost-bounded, SageMaker-ready outputs) but running **our** SoH/feature logic. The single
+canonical job is **`euler_featengg_incremental.py`**; it calls `src/euler_features.py` (bms-capacity SoH + our
+features) and emits our deployed **25-col monthly featengg**.
 
 > Decision (recorded): base SoH in Glue (bms_capacity → isotonic); the recovery-aware clean label, hybrid
 > target, and coulomb acceptance gate stay in the SageMaker/model-build layer. Grain = monthly featengg.
+> (The as-received third-party-logic job was removed once the port was validated — see git history if needed.)
 
 ---
 
@@ -86,15 +84,15 @@ Three Iceberg tables, all partitioned by **month**:
 
 Both are validated against **local `data/euler/`** only — never a Glue run or an S3 scan.
 
-- **`local_featengg_equivalence.py`** (our-methodology port) — proves, using our *actual* `euler_features`
-  functions: **(A) incremental == batch**, **(C) two-tier (`euler_monthly` store) == single-pass**, and
+- **`local_featengg_equivalence.py`** — proves, using our *actual* `euler_features` functions:
+  **(A) incremental == batch**, **(C) two-tier (`euler_monthly` store) == single-pass**, and
   **(B) per-month features + `soh` == `feature_table.parquet`** — all **0.0**. Cumulative cols
   (`cum_ah`/`cum_km`/`km_month`) differ *by design* (all-months fix). Latest run: 3 vehicles, 122 rows, **PASS**.
-- **`local_equivalence_check.py`** (as-received job) — proves incremental == batch for the third party's logic.
+- **`local_catchup_check.py`** — unit-tests the self-healing catch-up planner (`catchup.plan_days`).
 
 ```bash
 .venv/bin/python MLOps/glue/local_featengg_equivalence.py
-.venv/bin/python MLOps/glue/local_equivalence_check.py
+.venv/bin/python MLOps/glue/local_catchup_check.py
 ```
 
 ## Deploy
