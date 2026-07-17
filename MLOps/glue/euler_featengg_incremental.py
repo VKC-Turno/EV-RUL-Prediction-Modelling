@@ -29,7 +29,7 @@ REQUIRED JOB PARAMETERS (besides --JOB_NAME):
     --datalake-formats            iceberg
     --additional-python-modules   scikit-learn        (bms_soh_monthly uses IsotonicRegression)
     --extra-py-files              s3://.../euler_features.py   (our module, importable on the executors)
-    --process_date                2025-01-05
+    --process_date                2025-01-05   (OPTIONAL — defaults to yesterday UTC; scheduled runs omit it)
     --conf  spark.sql.extensions=org.apache.iceberg.spark.extensions.IcebergSparkSessionExtensions
             --conf spark.sql.catalog.glue_catalog=org.apache.iceberg.spark.SparkCatalog
             --conf spark.sql.catalog.glue_catalog.catalog-impl=org.apache.iceberg.aws.glue.GlueCatalog
@@ -38,7 +38,7 @@ REQUIRED JOB PARAMETERS (besides --JOB_NAME):
 OPTIONAL: --raw_bucket --warehouse --reg_table
 """
 import sys
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 
 from awsglue.utils import getResolvedOptions
 from awsglue.context import GlueContext
@@ -54,8 +54,10 @@ _present = [k for k in ARG_KEYS if f"--{k}" in sys.argv]
 args = getResolvedOptions(sys.argv, _present)
 for k, v in _defaults.items():
     args.setdefault(k, v)
-if "process_date" not in args:
-    raise ValueError("--process_date=YYYY-MM-DD is required.")
+if "process_date" not in args or not args["process_date"]:
+    # default = yesterday (UTC), so a plain daily scheduled trigger needs no dynamic argument;
+    # backfill / reprocessing passes an explicit --process_date via StartJobRun --arguments.
+    args["process_date"] = (datetime.now(timezone.utc) - timedelta(days=1)).strftime("%Y-%m-%d")
 
 sc = SparkContext()
 glueContext = GlueContext(sc)
