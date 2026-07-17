@@ -91,8 +91,9 @@ Job definition: **`euler_featengg_incremental.job.json`** — the Glue Studio co
 script in git and reference it from S3.
 
 ```bash
-# 1. upload the script + our module to the Glue assets bucket
+# 1. upload the script + our modules to the Glue assets bucket
 aws s3 cp MLOps/glue/euler_featengg_incremental.py s3://aws-glue-assets-894429711714-ap-south-1/scripts/
+aws s3 cp MLOps/glue/catchup.py                    s3://aws-glue-assets-894429711714-ap-south-1/scripts/
 aws s3 cp src/euler_features.py                    s3://aws-glue-assets-894429711714-ap-south-1/scripts/
 
 # 2. create the job — either import euler_featengg_incremental.job.json in Glue Studio, or via CLI:
@@ -105,7 +106,7 @@ aws glue create-job \
   --default-arguments '{
     "--datalake-formats":"iceberg",
     "--additional-python-modules":"scikit-learn",
-    "--extra-py-files":"s3://aws-glue-assets-894429711714-ap-south-1/scripts/euler_features.py",
+    "--extra-py-files":"s3://aws-glue-assets-894429711714-ap-south-1/scripts/euler_features.py,s3://aws-glue-assets-894429711714-ap-south-1/scripts/catchup.py",
     "--raw_bucket":"oem-iot-data",
     "--warehouse":"s3://rcs-mlops-data/iceberg/",
     "--enable-continuous-cloudwatch-log":"true","--enable-metrics":"true",
@@ -138,6 +139,34 @@ for d in 2025-01-01 2025-01-02 2025-01-03 2025-01-04 2025-01-05; do
   aws glue start-job-run --job-name euler-featengg-incremental --arguments '{"--process_date":"'"$d"'"}'
 done
 ```
+
+## Failure handling & self-healing catch-up
+
+Every write is an **idempotent, atomic Iceberg MERGE** and featengg is a pure function of the clean-event
+history, so **re-running any `--process_date` is always safe** (no dup, converges to the same state). Glue
+also auto-retries once (`maxRetries: 1`).
+
+On top of that the job is **self-healing**: a 1-row watermark table **`euler_ingest_state`** records the last
+successfully-processed day. Each run plans its ingest with `catchup.plan_days(watermark, process_date,
+lookback_days, max_catchup_days)`:
+
+- **normal day** → just `process_date`;
+- **after a failed/skipped day (or a multi-day outage)** → every day from `watermark+1` up to `process_date`,
+  so the gap is **recovered automatically on the next run** — no day silently becomes a permanent hole;
+- capped at **`max_catchup_days`** (default 14) so a long outage can't process months in one job; dropped older
+  days are **logged**, never silently skipped (backfill them explicitly);
+- **`lookback_days`** (default 1) optionally reprocesses the last N days each run to absorb late-arriving data.
+
+The watermark advances **only after a successful featengg MERGE** and only when the target partition was
+actually present, so a still-missing day is retried rather than skipped. The date logic is pure Python and
+unit-tested offline:
+
+```bash
+.venv/bin/python MLOps/glue/local_catchup_check.py
+```
+
+Remaining gaps (not yet done): **per-vehicle error isolation** (one bad vehicle's UDF still fails the run) and
+a **failure alarm** (EventBridge on Glue `FAILED` → SNS) so a run that exhausts retries isn't silent.
 
 ## Logs & run history
 

@@ -22,9 +22,11 @@
     "jobParameters": [
       {"key": "--datalake-formats", "value": "iceberg", "existing": false},
       {"key": "--additional-python-modules", "value": "scikit-learn", "existing": false},
-      {"key": "--extra-py-files", "value": "s3://aws-glue-assets-894429711714-ap-south-1/scripts/euler_features.py", "existing": false},
+      {"key": "--extra-py-files", "value": "s3://aws-glue-assets-894429711714-ap-south-1/scripts/euler_features.py,s3://aws-glue-assets-894429711714-ap-south-1/scripts/catchup.py", "existing": false},
       {"key": "--raw_bucket", "value": "oem-iot-data", "existing": false},
       {"key": "--warehouse", "value": "s3://rcs-mlops-data/iceberg/", "existing": false},
+      {"key": "--lookback_days", "value": "1", "existing": false},
+      {"key": "--max_catchup_days", "value": "14", "existing": false},
       {"key": "--enable-continuous-cloudwatch-log", "value": "true", "existing": false},
       {"key": "--enable-metrics", "value": "true", "existing": false},
       {"key": "--enable-observability-metrics", "value": "true", "existing": false},
@@ -52,7 +54,8 @@
   "usageProfileName": null,
   "_deploy_notes": [
     "process_date is intentionally NOT a static jobParameter: the script defaults it to yesterday (UTC), so the daily scheduled trigger needs no dynamic argument. Backfill/reprocessing passes --process_date via StartJobRun --arguments.",
-    "Unlike the third party's job.json this does NOT embed the script inline; upload euler_featengg_incremental.py to scriptLocation and euler_features.py to --extra-py-files (keep them versioned in git, not pasted into JSON).",
+    "Unlike the third party's job.json this does NOT embed the script inline; upload euler_featengg_incremental.py to scriptLocation and BOTH euler_features.py + catchup.py to --extra-py-files (keep them versioned in git, not pasted into JSON).",
+    "Self-healing catch-up: a 1-row Iceberg watermark table (euler_ingest_state) lets each run catch up from the last processed day to process_date (capped at max_catchup_days), so a failed/skipped day is auto-recovered next run. lookback_days>1 additionally reprocesses the last N days each run for late-arriving data.",
     "flexExecution=true uses Glue spare-capacity pricing (non-SLA daily batch). maxConcurrentRuns=1 avoids concurrent Iceberg MERGE conflicts; maxRetries=1 is safe because the MERGE is idempotent.",
     "Bump workerType to G.2X (or numberOfWorkers up) if a busy vehicle's full-history applyInPandas group OOMs.",
     "Verify raw_bucket for this account (oem-iot-data vs oem-data-iot)."

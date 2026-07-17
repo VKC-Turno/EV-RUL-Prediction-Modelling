@@ -28,14 +28,19 @@ not additively-incremental, so the touched-vehicle recompute is the exact-correc
 REQUIRED JOB PARAMETERS (besides --JOB_NAME):
     --datalake-formats            iceberg
     --additional-python-modules   scikit-learn        (bms_soh_monthly uses IsotonicRegression)
-    --extra-py-files              s3://.../euler_features.py   (our module, importable on the executors)
+    --extra-py-files              s3://.../euler_features.py,s3://.../catchup.py   (our modules, on executors)
     --process_date                2025-01-05   (OPTIONAL — defaults to yesterday UTC; scheduled runs omit it)
     --conf  spark.sql.extensions=org.apache.iceberg.spark.extensions.IcebergSparkSessionExtensions
             --conf spark.sql.catalog.glue_catalog=org.apache.iceberg.spark.SparkCatalog
             --conf spark.sql.catalog.glue_catalog.catalog-impl=org.apache.iceberg.aws.glue.GlueCatalog
             --conf spark.sql.catalog.glue_catalog.warehouse=s3://rcs-mlops-data/iceberg/
             --conf spark.sql.catalog.glue_catalog.io-impl=org.apache.iceberg.aws.s3.S3FileIO
-OPTIONAL: --raw_bucket --warehouse --reg_table
+OPTIONAL: --raw_bucket --warehouse --reg_table --lookback_days (default 1) --max_catchup_days (default 14)
+
+Self-healing: a 1-row Iceberg watermark table (euler_ingest_state) records the last successfully-processed
+day. Each run catches up from watermark+1 to process_date (capped at max_catchup_days), so a failed/skipped
+day is picked up automatically on the next run — no day silently becomes a permanent gap. Reprocessing is a
+no-op (MERGE is idempotent). Catch-up date logic is in catchup.plan_days (unit-tested by local_catchup_check.py).
 """
 import sys
 from datetime import datetime, timedelta, timezone
@@ -44,12 +49,15 @@ from awsglue.utils import getResolvedOptions
 from awsglue.context import GlueContext
 from awsglue.job import Job
 from pyspark.context import SparkContext
-from pyspark.sql.utils import AnalysisException
 from pyspark.sql import functions as F
-from pyspark.sql.types import StructType, StructField, StringType, DoubleType, LongType
+from pyspark.sql.types import StructType, StructField, StringType, DoubleType, LongType, DateType
 
-ARG_KEYS = ["JOB_NAME", "process_date", "raw_bucket", "warehouse", "reg_table"]
-_defaults = dict(raw_bucket="oem-iot-data", warehouse="s3://rcs-mlops-data/iceberg/", reg_table="")
+from catchup import plan_days                # self-healing catch-up planner (shipped via --extra-py-files)
+
+ARG_KEYS = ["JOB_NAME", "process_date", "raw_bucket", "warehouse", "reg_table",
+            "lookback_days", "max_catchup_days"]
+_defaults = dict(raw_bucket="oem-iot-data", warehouse="s3://rcs-mlops-data/iceberg/", reg_table="",
+                 lookback_days="1", max_catchup_days="14")
 _present = [k for k in ARG_KEYS if f"--{k}" in sys.argv]
 args = getResolvedOptions(sys.argv, _present)
 for k, v in _defaults.items():
@@ -69,7 +77,10 @@ job.init(args["JOB_NAME"], args)
 OEM, CATALOG, DB = "euler", "glue_catalog", "turno_ml"
 EVENTS_TABLE = f"{CATALOG}.{DB}.{OEM}_clean_events"
 FEATENGG_TABLE = f"{CATALOG}.{DB}.{OEM}_featengg"           # the ONLY output: the feature store
+STATE_TABLE = f"{CATALOG}.{DB}.{OEM}_ingest_state"          # 1-row watermark (last processed day)
 PROCESS_DATE = datetime.strptime(args["process_date"], "%Y-%m-%d").date()
+LOOKBACK_DAYS = int(args["lookback_days"])
+MAX_CATCHUP_DAYS = int(args["max_catchup_days"])
 
 for k, v in {f"spark.sql.catalog.{CATALOG}": "org.apache.iceberg.spark.SparkCatalog",
              f"spark.sql.catalog.{CATALOG}.catalog-impl": "org.apache.iceberg.aws.glue.GlueCatalog",
@@ -161,15 +172,45 @@ def merge_upsert(df, table, keys):
               f"WHEN MATCHED THEN UPDATE SET * WHEN NOT MATCHED THEN INSERT *")
 
 
-# ── 1) ingest the new day's raw -> euler_clean_events ─────────────────────────────────────
-path = (f"s3://{args['raw_bucket']}/battery-oem-data/parquet/{OEM}/vehicle-data/"
-        f"year={PROCESS_DATE.year}/month={PROCESS_DATE.month:02d}/day={PROCESS_DATE.day:02d}/")
-try:
-    raw = spark.read.parquet(path)
-except AnalysisException:
-    logger.warn(f"partition absent: {path} — nothing to do")
+def read_watermark():
+    if spark.catalog.tableExists(STATE_TABLE):
+        rows = spark.table(STATE_TABLE).collect()
+        if rows and rows[0]["last_processed_date"] is not None:
+            return rows[0]["last_processed_date"]
+    return None
+
+
+def write_watermark(d):
+    schema = StructType([StructField("last_processed_date", DateType())])
+    spark.createDataFrame([(d,)], schema=schema).writeTo(STATE_TABLE).using("iceberg").createOrReplace()
+
+
+def day_path(d):
+    return (f"s3://{args['raw_bucket']}/battery-oem-data/parquet/{OEM}/vehicle-data/"
+            f"year={d.year}/month={d.month:02d}/day={d.day:02d}/")
+
+
+def day_exists(d):
+    p = spark._jvm.org.apache.hadoop.fs.Path(day_path(d))
+    return p.getFileSystem(sc._jsc.hadoopConfiguration()).exists(p)
+
+
+# ── 1) self-healing catch-up ingest: watermark..process_date -> euler_clean_events ─────────
+# Every run catches up from the last successfully-processed day, so a failed/skipped day is picked up
+# automatically (no permanent gap). Reprocessing is a no-op (MERGE is idempotent on vin+eventAt).
+wm = read_watermark()
+plan = plan_days(wm, PROCESS_DATE, LOOKBACK_DAYS, MAX_CATCHUP_DAYS)
+if plan["clamped"]:
+    logger.warn(f"catch-up clamped to {MAX_CATCHUP_DAYS}d; days before {plan['days'][0]} need an explicit "
+                f"--process_date backfill (watermark={wm})")
+present = [d for d in plan["days"] if day_exists(d)]
+logger.info(f"watermark={wm} process_date={PROCESS_DATE} -> plan {plan['days'][0]}..{plan['days'][-1]} "
+            f"({len(plan['days'])} day(s)); {len(present)} partition(s) present")
+if not present:
+    logger.warn("no raw partitions present in the planned window — nothing to ingest")
     job.commit(); sys.exit(0)
 
+raw = spark.read.parquet(*[day_path(d) for d in present])
 raw = raw.filter(F.col("vin").isNotNull() & (F.trim(F.col("vin")) != ""))
 for lo, cc in RENAME.items():
     if lo in raw.columns and cc not in raw.columns:
@@ -178,11 +219,11 @@ events = (raw.select([F.col(c) for c in NEEDED if c in raw.columns])
              .withColumn("eventAt", F.col("eventAt").cast("long"))
              .withColumn("month", F.date_trunc("month", F.to_timestamp(F.col("eventAt") / 1000))))
 if len(events.take(1)) == 0:
-    logger.warn("no valid rows for the day"); job.commit(); sys.exit(0)
+    logger.warn("no valid rows in the planned window"); job.commit(); sys.exit(0)
 
 ensure_table(events, EVENTS_TABLE, partition="month")
 merge_upsert(events, EVENTS_TABLE, keys=["vin", "eventAt"])
-logger.info(f"MERGED new-day events into {EVENTS_TABLE}")
+logger.info(f"MERGED events for {len(present)} day(s) into {EVENTS_TABLE}")
 
 # ── 2) recompute featengg for TOUCHED vehicles over their full clean-event history ────────
 # (touched-only = which vehicles get RECOMPUTED this run; every reporting vehicle is covered over time.
@@ -200,6 +241,13 @@ featengg = featengg.filter(F.col("ymd").isNotNull())
 ensure_table(featengg, FEATENGG_TABLE)
 merge_upsert(featengg, FEATENGG_TABLE, keys=["vin", "ymd"])
 logger.info(f"MERGED featengg into {FEATENGG_TABLE} (feature store — all vehicles, soh nullable)")
+
+# ── 3) advance the ingest watermark — ONLY after a successful featengg MERGE, and only on a forward run
+# whose target partition was actually present. If the target is still missing, the watermark stays put so
+# the next run retries it (a missing day is never silently skipped).
+if plan["advance_to"] is not None and PROCESS_DATE in present:
+    write_watermark(PROCESS_DATE)
+    logger.info(f"watermark advanced to {PROCESS_DATE}")
 
 # Downstream (NOT here): the SageMaker training step selects the cohort from euler_featengg at run time
 # (in-service + labelled + data-quality gate) and does the train/val/test split; serving reads latest-per-vin.
