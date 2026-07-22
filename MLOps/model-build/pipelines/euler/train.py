@@ -27,6 +27,16 @@ import euler_backtest as eb
 import euler_train as et
 import data_quality
 
+try:
+    from . import inference as _inference
+except ImportError:
+    import inference as _inference
+
+input_fn = _inference.input_fn
+model_fn = _inference.model_fn
+output_fn = _inference.output_fn
+predict_fn = _inference.predict_fn
+
 
 def _read_parquet_dir(channel):
     files = glob.glob(os.path.join(channel, "**", "*.parquet"), recursive=True)

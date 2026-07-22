@@ -25,8 +25,7 @@ import numpy as np, pandas as pd
 from scipy.stats import theilslopes
 
 warnings.filterwarnings("ignore")
-os.chdir(Path(__file__).resolve().parent.parent)
-sys.path.insert(0, str(Path(__file__).resolve().parent))
+sys.path.insert(0, str(Path(__file__).resolve().parent))   # chdir moved into main() so this imports cleanly
 import euler_model as em
 import data_quality
 
@@ -56,11 +55,11 @@ def _forecast_at(train_m, hist, ages_abs, anchor_age, tgt):
     return np.interp(np.clip(ages_abs - anchor_age, xs[0], xs[-1]), xs, p50)
 
 
-def _frame(candidate):
-    m = pd.read_parquet(FEAT)
+def _frame(candidate, feat=FEAT, bms=BMS):
+    m = pd.read_parquet(feat)
     m["vin"] = m["vin"].astype(str); m["month"] = pd.to_datetime(m["month"])
     m = data_quality.apply_quality(m, "Euler")
-    lab = pd.read_parquet(BMS)[list(dict.fromkeys(["vin", "month", "soh_target", candidate]))].copy()
+    lab = pd.read_parquet(bms)[list(dict.fromkeys(["vin", "month", "soh_target", candidate]))].copy()
     lab["vin"] = lab["vin"].astype(str); lab["month"] = pd.to_datetime(lab["month"])
     m = m.merge(lab, on=["vin", "month"], how="inner")
     m = m[m[candidate].notna()].sort_values(["vin", "month"]).reset_index(drop=True)
@@ -68,10 +67,11 @@ def _frame(candidate):
     return m
 
 
-def run_gate(candidate="soh_target", holdout=HOLDOUT, ckpt=None, log=print):
-    """LOVO-score `candidate` vs production against the independent coulomb yardstick; return a verdict dict."""
-    m = _frame(candidate)
-    C = pd.read_parquet(COUL)[["vin", "age_months", "soh_full"]].copy()
+def run_gate(candidate="soh_target", holdout=HOLDOUT, ckpt=None, log=print, feat=FEAT, bms=BMS, coul=COUL):
+    """LOVO-score `candidate` vs production against the independent coulomb yardstick; return a verdict dict.
+    Paths default to the local data/euler/ layout; SageMaker passes them as processing-input channels."""
+    m = _frame(candidate, feat, bms)
+    C = pd.read_parquet(coul)[["vin", "age_months", "soh_full"]].copy()
     C["vin"] = C["vin"].astype(str)
     C["coul"] = np.clip(pd.to_numeric(C["soh_full"], errors="coerce"), None, 100.0)
     C = C.dropna(subset=["age_months", "coul"])
@@ -124,6 +124,7 @@ def run_gate(candidate="soh_target", holdout=HOLDOUT, ckpt=None, log=print):
 
 
 def main():
+    os.chdir(Path(__file__).resolve().parent.parent)       # CLI: resolve the default data/euler/ paths
     cand = "soh_target"; holdout = HOLDOUT; ckpt = None
     a = sys.argv[1:]
     for i, x in enumerate(a):
